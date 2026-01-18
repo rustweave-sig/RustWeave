@@ -1,0 +1,13 @@
+cd translation/blockfinder && cargo build && cd ../../
+cd translation/block_symbol_extractor && cargo build && cd ../../
+cd translation/contextextractor && cargo build && cd ../../
+cd translation/empty_fn_filter && cargo build && cd ../../
+cd translation/extract_rust_definitions && cargo build && cd ../../
+cd translation/extract_rust_functions && cargo build && cd ../../
+cd translation/function_structure && cargo build && cd ../../   
+cd translation/outputextractor && cargo build && cd ../../
+cd translation/ruststub && cargo build && cd ../../
+cd translation/rust_escape_normalizer && cargo build && cd ../../
+cd translation/global_symbol_filter && cargo build && cd ../../
+cd translation/rust_verifier && cargo build && cd ../../
+cd translation/rust_fixer && cargo build && cd ../../    

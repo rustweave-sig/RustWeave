@@ -1,0 +1,15 @@
+compiler: gcc
+model: default
+feature: default
+models:
+  default:
+    provider: openai
+    model_name: gpt-4
+features:
+  default:
+    clean: make clean
+    clean_dir: .
+    build: make build
+    build_dir: .
+    test: make test
+    test_dir: build

@@ -1,1 +1,27 @@
 /.git/
+
+# ignore all json files
+*.json
+
+# ignore all txt files
+*.txt
+# ignore all log files
+*.log
+*.log.*
+# ignore all intermediate files
+save_intermediate_file/
+
+# ignore all output files
+*_output/
+
+# ignore all rust files in root dir
+/*.rs
+
+# ignore files buided in runtime 
+/*llm-pro*
+
+*target/
+*Cargo.lock
+tests/
+
+c2rustxw_cli.egg-info
