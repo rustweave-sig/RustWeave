@@ -1,0 +1,10 @@
+# Configuration for the main translation agent
+translator:
+    model: "glm-4.6"
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "sk-18dca314ef334a719da9edd950b2a0b9"
+    temperature: 0
+    top_p: 1
+    seed: 42
+    max_retries: 10
+    timeout: 500
