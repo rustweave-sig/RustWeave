@@ -10,9 +10,9 @@
 - `init`: 在当前目录创建`.c2rust`目录, 有冲突则失败.
 - `config`: 持久保存依赖的大模型和构建命令配置数据, 也提供翻译过程生成的程序分析数据的增删改查功能, 所有内容都保存在`init`创建的`.c2rust`目录下.
 - `clean`:  执行原C构建工程相关的命令`make clean`，执行目录和具体命令利用`config`保存.
-- `build`:  执行原C构建工程相关的命令`make all`，执行目录和具体命令利用`config`保存, 还有过程中提取的待翻译的C文件及其编译参数(`-I`和`-D`).
+- `build`:  执行原C构建工程相关的命令`make all`，执行目录和具体命令利用`config`保存, 完成待翻译的C文件的预处理.
 - `test`:  执行原C构建工程相关的命令`make test`，执行目录和具体命令利用`config`保存.
-- `translate`: 获取`build`提取的每个此文件，经过预处理进行代码翻译相关.
+- `translate`: 获取`build`创建的预处理文件，实现逐函数翻译，混合编译和测试.
 - `export`: 利用`translate`的信息生成C或者Rust代码.
 
 每个工具都应该遵循几个基本原则:
@@ -54,41 +54,23 @@ test = "make test"
 # 相对工程根目录，即.c2rust所在目录的相对路径
 build.dir = "build"
 build = "make"
-
-# build过程中提取的待翻译的目标文件及其编译参数
-# 可能不同文件有不同的编译参数，因此这里按编译参数归类存储.
-
-# 一次构建同时生成debug/release二进制.
-build.options = [ "-I../3rd/include -DDEBUG=1", "-I../3rd/include"]
-
-# files.x中的序号x代表options中的序号，代表某个文件列表和一个编译参数一一对应.
-build.files.0 = ["main.c", "debug.c", "common.c"]
-build.files.1 = ["main.c", "release.c", "common.c"]
 ```
 
 ### 命令行接口.
 
-`c2rust config [--feature <feature>] <--make | --model> <--set | --unset | --add | --del | --list> <key> [values...]`
+1. `c2rust config --model <--set | --unset | --add | --del | --list> <key> [values...]`
+2. `c2rust config [--feature <feature>] --make <--set | --unset | --add | --del | --list> <key> [values...]`
 
+说明:
+
+- `--model`: 对应模型相关的信息, 和`feature`无关的全局配置.
 - `--feature <feature>`: 不存在对应`default`.
 - `--make`: 对应构建(`clean`, `build`, `test`)相关的信息
-- `--model`: 对应模型相关的信息.
 - `--set`: 设置key-value, 如果value多个表示数组存储.
 - `--unset`: 删除key-value
 - `--add`: 为数组类的key增加一个或者多个value
 - `--del`: 为数组类的key删除一个或者多个value
 - `--list`: 查询全部的valus，数组元素分行显示.
-
-以`c2rust build`为例, 上面样例文件中的数据通过下面的命令完成写入:
-
-```shell
-$ c2rust config --make --set build.dir "build"
-$ c2rust config --make --set build "make"
-$ c2rust config --make --add build.options "-I../3rdinclude -DDEBUG=1"
-$ c2rust config --make --add build.files.0 "main.c" "debug.c" "common.c"
-$ c2rust config --make --add build.options "-I../3rdinclude"
-$ c2rust config --make --add build.files.1 "main.c" "release.c" "common.c"
-```
 
 ## `clean`
 
@@ -123,49 +105,118 @@ $ c2rust config --make --set build.dir "build"
 $ c2rust config --make --set build "make"
 ```
 
-还需要跟踪其过程提取待翻译的目标文件，将目标文件信息按下面的命令保存到`config`中.
+最终重要的在跟踪过程中针对每个C文件完成预处理， 预处理命令如下: `$C2RUST_CLANG -I<...> -D<...> <C文件的绝对路径> -o <预处理后文件的存储路径>`
 
-```shell
-$ c2rust config --make --add build.options "-I../3rdinclude -DDEBUG=1"
-$ c2rust config --make --add build.files.0 "main.c" "debug.c" "common.c"
-$ c2rust config --make --add build.options "-I../3rdinclude"
-$ c2rust config --make --add build.files.1 "main.c" "release.c" "common.c"
+- 利用`clang`进行预处理，从环境变量`C2RUST_CLANG`获取`clang`的路径，如果此环境变量不存在，则直接调用`clang`.
+- `-I`和`-D`同编译C文件的命令行参数.
+- 需要将C文件转换为绝对路径，这样预处理后内部符号也会保存为绝对路径，便于后续程序分析的处理.
+- 预处理后的文件保存在`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c`目录下，保证和原目录结构相同. 比如`$C2RUST_PROJECT_ROOT/src/a/b.c`其预处理后的文件为`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c/src/a/b.c`.
+
+## `translate`
+
+`c2rust translate --feature <feature>`
+
+翻译的过程如下:
+1. 找到当前所在的工程目录，即`.c2rust`所在目录, 设置为环境变量`C2RUST_PROJECT_ROOT`.
+1. 遍历当前`feature`对应的预处理文件, 即`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c/`目录下的所有C文件.
+1. 提取预处理文件中的类型，变量和函数信息, 后持久化存储到预处理文件同目录下, 文件名格式为`<C文件名>.c2rust.json`.
+1. 提取所有的类型信息和全局变量声明利用`bindgen`集中转换为Rust代码，写入Rust工程的`lib.rs`入口文件.
+1. 逐文件逐函数变量翻译.
+> 1. 每翻译一个函数或者变量，更新Rust代码文件，编译，修复知道全部通过. 生成Rust动态库.
+> 1. 保存到对应文件的JSON文件中.
+> 1. 重新生成被翻译文件对应的C文件代码，不包含已经翻译的变量和函数. 此文件同样在预处理文件同目录下，文件名格式为`<文件名>.c2rust.c`.
+> 1. 获取`clean`参数，清空编译环境.
+> 1. 获取`build`参数，跟踪构建的时候让文件重定向到新生成的C文件, 如果不存在，则读取预处理后的文件. 链接到Rust动态库.
+> 1. 获取`test`参数，完成测试，如果测试不通过，则提示用户需要手工修改Rust函数. 保留当前状态并退出. 修改内容固定写在`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/fix.rs`
+> 1. 文件内全部函数翻译完毕后，重新生成的Rust文件，保留原C代码的`static`属性(无需`pub`, 无需`extern "C"`, 无需`#[no_mangle]`).
+
+重新执行`c2rust translate --feature <feature>`会根据当前状态，从`fix.rs`中读取新的内容重复编译构建和测试过程，如果通过则继续.
+
+### C和Rust代码文件映射
+
+- Rust工程固定在`$C2RUST_POJECT_ROOT/.c2rust/<featre>/rust/`.
+- `src/lib.rs`中包含全部类型和全局变量的声明.
+- 每个C文件对应`src`目录下的一个`rs`文件. 其中只包含全局变量的定义，静态变量的定义和函数的定义. 如果有多个C同名文件，则Rust文件名增加目录信息消除文件名冲突.
+
+### C文件代码分析
+
+利用`clang -Xclang -ast-dump=json -fsyntax-only <预处理后C文件>`完成，提取如下信息:
+
+- 类型定义(RecrodDecl): 名称, 区分声明还是定义，源码位置.
+- Typedef(TypedefDecl): 名称，源码位置
+- 枚举定义(EnumDecl): 名称， 区分声明还是定义，源码位置.
+- 变量(VarDecl): 名称，区分是声明还是定义，源码位置.
+- 函数(FunctionDecl): 名称, 区分是声明还是定义，源码位置.
+
+无需进一步解析函数内部以及类型内部定义的具体内容.
+
+C语言中类型都在全局名字空间中定义, 比如下面的例子, 编译器会报告`struct Bar`重复定义.
+
+```
+struct Foo {
+    struct Bar {
+        int val;
+    } bar;
+};
+
+struct Bar {}
 ```
 
-## 混合构建和命令行工具的关系
+因此利用类型名作为索引，将所有类型定义(RecordDecl, TypedefDecl)和全局变量声明, 外部函数声明, 可以都汇总到一个文件中，利用`bindgen`一次性翻译写入Rust工程的`lib.rs`.
 
-翻译过程中，混合构建的过程如下:
+`bindgen <新生成的C文件> --no-layout-tests --default-enum-style consts --disable-nested-struct-naming`.
 
-- 通过程序分析数据生成等价的C代码, 这里不在包含已经翻译为Rust的函数.
-- 将Rust代码生成动态库, 假设其名字为`librust.so`.
-- 获取执行C工程构建的环境和具体命令
-```shell
-$ c2rust config --make --list clean.dir
-build
-$ c2rust config --make --list clean
-make clean
-$ c2rust config --make --list build.dir
-build
-$ c2rust config --make --list build
-make
-$ c2rust config --make --list test.dir
-test
-$ c2rust config --make --list test
-make test
+### 消除`static`实现混合构建
+
+预处理后的C文件对应的Rust文件只需要包含变量定义和函数定义, 这部分内容可利用大模型翻译. 
+
+如果是`static`，C的预处理后会将其符号名固定增加前缀`_c2rust_`, 目的是消除和其他编译单元的全局符号名的冲突. 
+
+其生成的C代码是如下形式:
+
 ```
-- 清空构建环境.
-```shell
-$ cd build
-$ make clean
-```
-- 执行C工程构建，需要利用`LD_PRELOAD`将对应的C文件读写路径改为新生成的C文件(删除了已经转换的C函数), 以及强制链接到librust.so, 假定其库名为libhook.so.
-```shell
-$ cd build
-$ LD_PRELOAD=libhook.so C2RUST_RUST_LIB=librust.so make
-```
-- 执行C工程测试.
-```shell
-$ cd build
-$ make test
+int _c2rust_g_i = 0;
+#ifndef g_i
+#define g_i _c2rust_g_i
+#endif
 ```
 
+这样修改后的C代码可实现和Rust代码混合构建后相互调用.
+
+每个文件翻译完毕后，需要在Rust中删除这些符号的`pub`可见性.
+
+### 子工具划分
+
+`translate`组合多个子工具完成:
+
+1. 分析工具: 分析预处理文件，`static`消除, C代码和Rust代码生成.
+1. 翻译工具: 提供变量和函数的翻译动作. 
+1. 集成工具: 组合分析，翻译以及`config`中保存的构建信息完成整个流程.
+
+#### 分析工具
+
+内部完成提取信息到JSON文件以及`static`消除. 对外提供类似迭代器的功能和代码导出的功能.
+
+`code-analyse --get [--output <file>]`: 从命令行输出当前需要翻译的变量定义或者是函数, 如果指定--output则输出到文件.
+`code-analyse --next [--input <file>] [--output <file>]`: 从标准输入设置经过翻译验证的结果, 如果指定--input则从文件读取, 同时将下一个需要翻译的变量或者函数输出.
+`code-analyse --prev`: 回退最后一次设置，并输出回退后需要翻译的变量定义或者是函数.
+`code-analyse --export [--c | --rust | --all]`: 生成对应的C代码和Rust代码.
+
+输出为空表示已经翻译完毕.
+
+#### 翻译工具
+
+输入是C的变量定义和函数定义源码，输出包括两部分内容，调用的函数名和翻译之后的Rust代码，变量初始化也可能调用其他函数.
+
+建议输出的格式:
+```
+dependencies:
+<f1>
+<f2>
+code:
+<Rust代码>
+```
+
+#### 集成工具
+
+可以是shell脚本或者python等语言来实现.

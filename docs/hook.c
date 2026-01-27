@@ -119,6 +119,7 @@ static void c2rust_find_files(int argc, char* argv[], const char* output, const 
         if (nret == -1) {
                goto fail;
         }
+        lseek(outfd, 0, SEEK_END);
         for (int i = 0; i < filecnt; ++i) {
                 write_output(outfd, options, optcnt, files[i]);
                 free(files[i]);
