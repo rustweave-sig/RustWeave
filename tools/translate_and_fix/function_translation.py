@@ -57,7 +57,7 @@ if __name__ == "__main__":
     """
 
     # 加载LLM配置信息
-    config_file_path = "LLM_config.yaml"
+    config_file_path = "config.toml"
     LLM_config = load_LLM_config(config_file_path)
 
     # 创建与大模型平台的api会话实例
