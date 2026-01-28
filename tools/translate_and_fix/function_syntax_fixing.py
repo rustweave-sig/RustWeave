@@ -1,5 +1,5 @@
 from LLM_calling import call_llm_api
-from parse_LLM_output import match_rust_function, match_dependencies
+from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance # 这两个函数只用在该文件的示例中，实际项目中应在初始化阶段完成
 
 def function_syntax_fixing(rust_function_code, error_message, model, openai_instance):
@@ -18,7 +18,8 @@ def function_syntax_fixing(rust_function_code, error_message, model, openai_inst
     
     输出格式示例：
     Rust函数:
-    fn foo() {{
+    #[unsafe(no_mangle)]
+    pub extern "C" unsafe fn foo() {{
         // Rust 代码
     }}
     """
@@ -28,10 +29,9 @@ def function_syntax_fixing(rust_function_code, error_message, model, openai_inst
     # 调用大模型
     output = call_llm_api(prompt, model, openai_instance)
 
-    # 解析输出
-    rust_function = match_rust_function(output)
+    res = filter_model_response(output)
 
-    return rust_function
+    return res
 
 # 示例用法
 if __name__ == "__main__":
