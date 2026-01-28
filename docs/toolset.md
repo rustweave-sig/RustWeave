@@ -28,9 +28,13 @@
 
 在当前目录创建一个子目录`.c2rust`. 如果目录已经存在或者创建失败都提示失败.
 
+当前目录后续称为`$C2RUST_PROJECT_ROOT`.
+
 ## config
 
-`config`保存翻译工作所需的全部输入信息，包括待翻译的目标文件. 一个工程一个配置文件，固定为`.c2rust/config.toml`.
+`config`保存翻译工作所需的全部输入信息，包括待翻译的目标文件. 一个工程一个配置文件，固定为`.c2rust/config.toml`. 
+
+工具需要主动向上查找到`$C2RUST_PROJECT_ROOT`目录.
 
 其内容格式为:
 ```txt
@@ -76,6 +80,8 @@ build = "make"
 
 `c2rust clean [--feature feature] -- <make clean的具体命令>`
 
+保存基于`$C2RUST_PROJECT_ROOT`的相对目录.
+
 执行后通过如下的命令保存到`config`中.
 
 ```shell
@@ -86,6 +92,8 @@ $ c2rust config --make --set clean "make clean"
 ## `test`
 
 `c2rust test [--feature feature] -- <make test的具体命令>`
+
+保存基于`$C2RUST_PROJECT_ROOT`的相对目录.
 
 执行后通过如下的命令保存到`config`中.
 
@@ -98,6 +106,8 @@ $ c2rust config --make --set test "make test"
 
 `c2rust build [--feature feature] -- <make build的具体命令>`
 
+保存基于`$C2RUST_PROJECT_ROOT`的相对目录.
+
 执行后通过如下的命令保存到`config`中.
 
 ```shell
@@ -105,7 +115,7 @@ $ c2rust config --make --set build.dir "build"
 $ c2rust config --make --set build "make"
 ```
 
-最终重要的在跟踪过程中针对每个C文件完成预处理， 预处理命令如下: `$C2RUST_CLANG -I<...> -D<...> <C文件> -o <预处理后文件的存储路径>`
+最终重要的在跟踪过程中针对每个C文件完成预处理， 预处理命令如下: `$C2RUST_CLANG -E -I<...> -D<...> <C文件> -o <预处理后文件的存储路径>`
 
 跟踪命令中获取的C文件和`-I`命令行参数都和当前目录相关，都是预处理必须的信息，预处理之后的文件不依赖任何外部文件.
 
@@ -128,10 +138,10 @@ $ c2rust config --make --set build "make"
 > 1. 重新生成被翻译文件对应的C文件代码，不包含已经翻译的变量和函数. 此文件同样在预处理文件同目录下，文件名格式为`<文件名>.c2rust.c`.
 > 1. 获取`clean`参数，清空编译环境.
 > 1. 获取`build`参数，跟踪构建的时候让文件重定向到新生成的C文件, 如果不存在，则无需干预. 最后保证链接到Rust动态库.
-> 1. 获取`test`参数，完成测试，如果测试不通过，则提示用户需要手工修改Rust函数. 保留当前状态并退出. 修改内容固定写在`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/fix.rs`
+> 1. 获取`test`参数，完成测试，如果测试不通过，则提示用户需要手工修改当前Rust文件. 保留当前状态并退出.
 > 1. 文件内全部函数翻译完毕后，重新生成的Rust文件，保留原C代码的`static`属性(无需`pub`, 无需`extern "C"`, 无需`#[no_mangle]`).
 
-重新执行`c2rust translate --feature <feature>`会根据当前状态，从`fix.rs`中读取新的内容重复编译构建和测试过程，如果通过则继续.
+重新执行`c2rust translate --feature <feature>`会根据当前状态，检查到已经存在Rust代码，则会重复编译，测试过程，通过后才继续.
 
 ### C和Rust代码文件映射
 
@@ -198,26 +208,30 @@ int _c2rust_private_g_i = 0;
 
 内部完成提取信息到JSON文件以及`static`消除. 对外提供类似迭代器的功能和代码导出的功能.
 
-`code-analyse --get [--output <file>]`: 从命令行输出当前需要翻译的变量定义或者是函数, 如果指定--output则输出到文件.
-`code-analyse --next [--input <file>] [--output <file>]`: 从标准输入设置经过翻译验证的结果, 如果指定--input则从文件读取, 同时将下一个需要翻译的变量或者函数输出.
-`code-analyse --prev`: 回退最后一次设置，并输出回退后需要翻译的变量定义或者是函数.
-`code-analyse --export [--c | --rust | --all]`: 生成对应的C代码和Rust代码.
+1. `code-analyse --get [--output <file>]`: 从命令行输出当前需要翻译的变量定义或者是函数, 如果指定--output则输出到文件.
+1. `code-analyse --next [--input <file>] [--output <file>]`: 从标准输入设置经过翻译验证的结果, 如果指定--input则从文件读取, 同时将下一个需要翻译的变量或者函数输出.
+1. `code-analyse --prev`: 回退最后一次设置，并输出回退后需要翻译的变量定义或者是函数.
+1. `code-analyse --export [--c | --rust | --all]`: 生成对应的C代码和Rust代码.
 
 输出为空表示已经翻译完毕.
 
 #### 翻译工具
 
-输入是C的变量定义和函数定义源码，输出包括两部分内容，调用的函数名和翻译之后的Rust代码，变量初始化也可能调用其他函数.
+输入是C的变量定义和函数定义源码, 不一定只有一个，根据大模型的能力也可能多个一起提交，预期输出就是Rust代码.
 
-建议输出的格式:
+翻译的时候需要提示，如果有未认识的外部函数，自动增加FFI声明，注意，FFI声明不应该放在函数内部, 而应该在外边单独声明:
+
 ```
-dependencies:
-<f1>
-<f2>
-code:
-<Rust代码>
+#[unsafe(no_mangle)]
+pub extern "C" unsafe fn foo() {
+    unsafe { bar(); }
+}
+
+// 以下声明不能放在函数foo的内部. 因为如果它是C的static函数，后续需要删除，放在foo函数之外删除的时候更方便.
+unsafe extern "C" {
+    fn bar();
+}
 ```
 
 #### 集成工具
 
-可以是shell脚本或者python等语言来实现.
