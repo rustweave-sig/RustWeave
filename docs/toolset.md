@@ -105,12 +105,13 @@ $ c2rust config --make --set build.dir "build"
 $ c2rust config --make --set build "make"
 ```
 
-最终重要的在跟踪过程中针对每个C文件完成预处理， 预处理命令如下: `$C2RUST_CLANG -I<...> -D<...> <C文件的绝对路径> -o <预处理后文件的存储路径>`
+最终重要的在跟踪过程中针对每个C文件完成预处理， 预处理命令如下: `$C2RUST_CLANG -I<...> -D<...> <C文件> -o <预处理后文件的存储路径>`
+
+跟踪命令中获取的C文件和`-I`命令行参数都和当前目录相关，都是预处理必须的信息，预处理之后的文件不依赖任何外部文件.
 
 - 利用`clang`进行预处理，从环境变量`C2RUST_CLANG`获取`clang`的路径，如果此环境变量不存在，则直接调用`clang`.
 - `-I`和`-D`同编译C文件的命令行参数.
-- 需要将C文件转换为绝对路径，这样预处理后内部符号也会保存为绝对路径，便于后续程序分析的处理.
-- 预处理后的文件保存在`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c`目录下，保证和原目录结构相同. 比如`$C2RUST_PROJECT_ROOT/src/a/b.c`其预处理后的文件为`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c/src/a/b.c`.
+- 预处理后的文件保存在`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c`目录下，保证和原目录结构相同, 增加一个后缀`.c2rust`. 比如`$C2RUST_PROJECT_ROOT/src/a/b.c`其预处理后的文件为`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c/src/a/b.c.c2rust`.
 
 ## `translate`
 
@@ -118,7 +119,7 @@ $ c2rust config --make --set build "make"
 
 翻译的过程如下:
 1. 找到当前所在的工程目录，即`.c2rust`所在目录, 设置为环境变量`C2RUST_PROJECT_ROOT`.
-1. 遍历当前`feature`对应的预处理文件, 即`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c/`目录下的所有C文件.
+1. 遍历当前`feature`对应的预处理文件, 即`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c/`目录下的所有后缀为`.c2rust`的文件.
 1. 提取预处理文件中的类型，变量和函数信息, 后持久化存储到预处理文件同目录下, 文件名格式为`<C文件名>.c2rust.json`.
 1. 提取所有的类型信息和全局变量声明利用`bindgen`集中转换为Rust代码，写入Rust工程的`lib.rs`入口文件.
 1. 逐文件逐函数变量翻译.
@@ -126,7 +127,7 @@ $ c2rust config --make --set build "make"
 > 1. 保存到对应文件的JSON文件中.
 > 1. 重新生成被翻译文件对应的C文件代码，不包含已经翻译的变量和函数. 此文件同样在预处理文件同目录下，文件名格式为`<文件名>.c2rust.c`.
 > 1. 获取`clean`参数，清空编译环境.
-> 1. 获取`build`参数，跟踪构建的时候让文件重定向到新生成的C文件, 如果不存在，则读取预处理后的文件. 链接到Rust动态库.
+> 1. 获取`build`参数，跟踪构建的时候让文件重定向到新生成的C文件, 如果不存在，则无需干预. 最后保证链接到Rust动态库.
 > 1. 获取`test`参数，完成测试，如果测试不通过，则提示用户需要手工修改Rust函数. 保留当前状态并退出. 修改内容固定写在`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/fix.rs`
 > 1. 文件内全部函数翻译完毕后，重新生成的Rust文件，保留原C代码的`static`属性(无需`pub`, 无需`extern "C"`, 无需`#[no_mangle]`).
 
@@ -170,20 +171,20 @@ struct Bar {}
 
 预处理后的C文件对应的Rust文件只需要包含变量定义和函数定义, 这部分内容可利用大模型翻译. 
 
-如果是`static`，C的预处理后会将其符号名固定增加前缀`_c2rust_`, 目的是消除和其他编译单元的全局符号名的冲突. 
+如果是`static`，C的预处理后会将其符号名固定增加前缀`_c2rust_private_`, 目的是消除和其他编译单元的全局符号名的冲突. 
 
 其生成的C代码是如下形式:
 
 ```
-int _c2rust_g_i = 0;
+int _c2rust_private_g_i = 0;
 #ifndef g_i
-#define g_i _c2rust_g_i
+#define g_i _c2rust_private_g_i
 #endif
 ```
 
-这样修改后的C代码可实现和Rust代码混合构建后相互调用.
+基于修改后的C代码重新执行预处理以及代码分析，更新json文件内容. 此文件用于后续的混合构建.
 
-每个文件翻译完毕后，需要在Rust中删除这些符号的`pub`可见性.
+每个文件翻译完毕后，需要在Rust中删除这些前缀为`_c2rust_private_`的符号的`pub`可见性.
 
 ### 子工具划分
 
