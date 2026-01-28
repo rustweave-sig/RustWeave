@@ -228,6 +228,7 @@ pub extern "C" unsafe fn foo() {
 }
 
 // 以下声明不能放在函数foo的内部. 因为如果它是C的static函数，后续需要删除，放在foo函数之外删除的时候更方便.
+// 注: c代码中是不允许在C函数内部声明一个static的函数的，因此static函数只能在编译单元的名字空间中存在.
 unsafe extern "C" {
     fn bar();
 }
