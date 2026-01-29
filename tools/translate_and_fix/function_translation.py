@@ -17,7 +17,7 @@ def function_translation(C_function_code, model, openai_instance):
     4. 最终输出一个完整的、可编译的Rust函数，包含所有必要的FFI声明
 
     输出格式：
-    Rust函数:
+    Rust翻译结果:
     // FFI声明
     unsafe extern "C" {{
         fn external_c_function(param: *const c_char) -> c_int;

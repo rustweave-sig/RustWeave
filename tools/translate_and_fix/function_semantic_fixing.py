@@ -18,7 +18,7 @@ def function_semantic_fixing(c_function_code, rust_function_code, c_test_case_co
     修复后的Rust函数代码（严格按输出格式示例的格式输出函数代码，无需其他说明）
     
     输出格式示例：
-    Rust函数:
+    Rust翻译结果:
     #[unsafe(no_mangle)]
     pub extern "C" unsafe fn foo() {{
         // Rust 代码

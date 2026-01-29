@@ -11,10 +11,18 @@ timeout =  500
 
 #具体feature的配置
 [feature.default]
+
+# 一般无需配置.
 compiler = ["gcc"]
+
+# 相对工程根目录，即.c2rust所在目录的相对路径
 clean_dir = "build"
 clean = "make clean"
+
+# 相对工程根目录，即.c2rust所在目录的相对路径
 test_dir = "build"
 test = "make test"
+
+# 相对工程根目录，即.c2rust所在目录的相对路径
 build_dir = "build"
 build = "make"
