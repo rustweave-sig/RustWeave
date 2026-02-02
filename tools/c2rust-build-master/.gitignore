@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Test artifacts
+*.profraw
+*.profdata
+
+# c2rust artifacts (for testing)
+.c2rust/
+compile_commands.json
+
+# Hook library build artifacts
+/hook/*.so
+/hook/*.o
