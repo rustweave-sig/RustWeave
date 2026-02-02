@@ -227,6 +227,8 @@ int _c2rust_private_g_i = 0;
 1. `code-analyse --update --feature <feature>`: 执行完毕后，根据翻译结果重新生成C代码文件用于混合构建.
 1. `code-analyse --merge --feature <feature>`: 整体翻译完毕后，将原来单个变量和单个函数的翻译文件按C的编译单元合并. 这利用`syn crate`即可, 主要是将FFI声明去重，符号可见性和C代码保持一致.
 
+注: `--merge`可选，代码合并不是必须.
+
 这里关键的是Rust工程和C代码文件的对应关系.
 
 假设预处理后的C代码文件如下：
@@ -284,3 +286,20 @@ unsafe extern "C" {
 集成工具扫描`$C2RUST_PROJECT_ROOT/.c2rust/feature/rust`目录下的rust文件，如果为空，则选择对应的C文件内容，交给翻译工具，结果写入rust文件后执行编译。
 
 如果有编译错误，则根据编译错误的定位信息找到对应的Rust文件，将错误信息，对应的C代码和Rust代码一起交给翻译工具进行编译纠错.
+
+运行过程:
+
+1. 启动后首先检查`<feature>/rust`目录是否存在
+1. 如果`rust`目录不存在，则执行`code-analyse --feature <feature> --init`, 如果出错或者成功但是rust目录不存在，则打印错误信息后退出, 如果成功则需要执行`git commit -m ...`进行保存`feature`目录下的所有文件变动.
+1. 进入`rust`目录执行`cargo build`, 如果`build`失败，则走后续编译失败处理流程.
+1. 扫描`rust`目录下的空的`rs`文件，针对每个`rs`文件做如下处理
+1. 根据文件名前缀提取类型变量还是函数(`--var|--fun`).
+1. 判断同名后缀为`.c`的文件是否存在，如果不存在提示工程被破外是否需要执行`code-analyse --init`, 如果不执行退出
+1. 在工程更目录下调用翻译工具, 传递类型，c文件路径，rust文件路径.
+1. 翻译出错或者成功但是对应的rust文件内容为空，都输出错误信息后退出
+1. 执行`cargo build`, 如果有编译错误，则从错误信息中提取错误文件名，将错误信息和rust文件路径一起传递给翻译工具进行修复
+1. 修复出错或者成功但是对应的rust文件内容为空，都输出错误信息后退出, 修复成功后再重复执行上一步的`cargo build`.
+1. `cargo build`成功后执行`git commit -m ...`保存翻译的文件.
+1. 从`config`中获取构建相关命令, 执行`clean`, `build`, `test`. 如果出错提示用户手工处理后退出.
+1. 上一步混合构建时执行`build`命令时需要指定`LD_PRELOAD=<混合构建库> C2RUST_FEATURE_ROOT=<dir>`实现混合构建.
+1. 都成功后循环处理下一个空的rs文件.
