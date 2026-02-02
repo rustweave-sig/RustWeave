@@ -15,13 +15,13 @@ trait ToError<T> {
 impl<T, E: core::error::Error> ToError<T> for core::result::Result<T, E> {
     fn to_err(self) -> Result<T> {
         self.map_err(|e| {
-            eprintln!("{}", e);
+            eprintln!("Error--> {}", e);
             Error::last()
         })
     }
     fn log_err(self, info: &str) -> Result<T> {
         self.map_err(|e| {
-            eprintln!("Error: {} : {info}", e);
+            eprintln!("Error--> {} : {info}", e);
             Error::last()
         })
     }
@@ -41,9 +41,29 @@ fn get_clang() -> String {
     std::env::var("C2RUST_CLANG").unwrap_or("clang".to_string())
 }
 
+fn print_help() {
+    println!("用法: code-analyse [选项]");
+    println!();
+    println!("选项:");
+    println!("  --feature <名称>     必需：指定要处理的feature名称");
+    println!("  --init               初始化feature，创建新的Rust库项目");
+    println!("  --update             更新feature，同步C代码和Rust文件");
+    println!("  --merge              合并feature，合并分散的Rust文件");
+    println!("  -h, --help           显示此帮助信息并退出");
+    println!();
+    println!("说明:");
+    println!("  这是一个C到Rust代码转换工具的一部分，用于管理特定feature的C/Rust代码转换。");
+    println!("  必须指定 --feature 选项和 exactly one of --init, --update, or --merge。");
+    println!();
+    println!("示例:");
+    println!("  code-analyse --feature my_feature --init");
+    println!("  code-analyse --feature my_feature --update");
+    println!("  code-analyse --feature my_feature --merge");
+}
+
 fn main() -> Result<()> {
-    // 定义支持的选项: feature: 需要参数, init/update/merge 不需要参数
-    let opts = hiopt::options!["feature:", "init", "update", "merge"];
+    // 定义支持的选项: feature: 需要参数, init/update/merge 不需要参数, help/h 显示帮助
+    let opts = hiopt::options!["feature:", "init", "update", "merge", "help", "h"];
 
     // 获取命令行参数（跳过第一个程序名）
     let args: Vec<String> = std::env::args().collect();
@@ -71,6 +91,10 @@ fn main() -> Result<()> {
                     }
                     "merge" => {
                         merge_flag = true;
+                    }
+                    "help" | "h" => {
+                        print_help();
+                        return Ok(());
                     }
                     _ => unreachable!(),
                 }
