@@ -126,12 +126,11 @@ $ c2rust config --make --set build_dir "build"
 $ c2rust config --make --set build "make"
 ```
 
-最终重要的在跟踪过程中针对每个C文件完成预处理， 预处理命令如下: `$C2RUST_CLANG -E -I<...> -D<...> <C文件> -o <预处理后文件的存储路径>`
+最终重要的在跟踪过程中针对每个C文件完成预处理， 预处理命令如下: `$C2RUST_CLANG -E -I<...> -D<...> -U<...> -include <...> <C文件> -o <预处理后文件的存储路径>`
 
-跟踪命令中获取的C文件和`-I`命令行参数都和当前目录相关，都是预处理必须的信息，预处理之后的文件不依赖任何外部文件.
+跟踪命令中获取的C文件和命令行参数都和当前目录相关，都是预处理必须的信息，预处理之后的文件不依赖任何外部文件.
 
 - 利用`clang`进行预处理，从环境变量`C2RUST_CLANG`获取`clang`的路径，如果此环境变量不存在，则直接调用`clang`.
-- `-I`和`-D`同编译C文件的命令行参数.
 - 预处理后的文件保存在`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c`目录下，保证和原目录结构相同, 增加一个后缀`.c2rust`. 比如`$C2RUST_PROJECT_ROOT/src/a/b.c`其预处理后的文件为`$C2RUST_PROJECT_ROOT/.c2rust/<feature>/c/src/a/b.c2rust`.
 
 ## `translate`
