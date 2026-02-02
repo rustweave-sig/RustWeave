@@ -289,6 +289,7 @@ unsafe extern "C" {
 
 运行过程:
 
+1. 启动后通过查找.c2rust得到工程的根目录，然后保证调用以下任何工具的时候都需要设置三个环境变量: $C2RUST_PROJECT_ROOT, $C2RUST_FEATURE, $C2RUST_FEATURE_ROOT
 1. 启动后首先检查`<feature>/rust`目录是否存在
 1. 如果`rust`目录不存在，则执行`code-analyse --feature <feature> --init`, 如果出错或者成功但是rust目录不存在，则打印错误信息后退出, 如果成功则需要执行`git commit -m ...`进行保存`feature`目录下的所有文件变动.
 1. 进入`rust`目录执行`cargo build`, 如果`build`失败，则走后续编译失败处理流程.
