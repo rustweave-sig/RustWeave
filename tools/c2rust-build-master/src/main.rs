@@ -1,5 +1,6 @@
 mod config_helper;
 mod error;
+mod file_selector;
 mod git_helper;
 mod preprocessor;
 mod tracker;
@@ -28,26 +29,35 @@ struct CommandArgs {
     #[arg(long)]
     feature: Option<String>,
 
+    /// Skip interactive file selection and select all files
+    #[arg(long)]
+    no_interactive: bool,
+
     /// Build command to execute - use after '--' separator
     /// Example: c2rust-build build -- make CFLAGS="-O2" target
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, value_name = "BUILD_CMD")]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required = true,
+        value_name = "BUILD_CMD"
+    )]
     build_cmd: Vec<String>,
 }
 
 fn run(args: CommandArgs) -> Result<()> {
+    // Verify hook library is set and exists before proceeding
+    tracker::verify_hook_library()?;
     config_helper::check_c2rust_config_exists()?;
-    preprocessor::verify_clang()?;
 
     let feature = args.feature.as_deref().unwrap_or("default");
     let command = args.build_cmd;
-    
-    let current_dir = std::env::current_dir()
-        .map_err(|e| error::Error::CommandExecutionFailed(
-            format!("Failed to get current directory: {}", e)
-        ))?;
-    
+
+    let current_dir = std::env::current_dir().map_err(|e| {
+        error::Error::CommandExecutionFailed(format!("Failed to get current directory: {}", e))
+    })?;
+
     let project_root = find_project_root(&current_dir)?;
-    
+
     // Calculate build directory relative to project root, falling back to "." if needed
     let build_dir_relative = current_dir.strip_prefix(&project_root)
         .map(|p| {
@@ -67,7 +77,6 @@ fn run(args: CommandArgs) -> Result<()> {
     println!("Build directory (relative): {}", build_dir_relative);
     println!("Feature: {}", feature);
     println!("Command: {}", command.join(" "));
-    println!("Clang: {}", std::env::var("C2RUST_CLANG").unwrap_or_else(|_| "clang".to_string()));
     println!();
 
     println!("Tracking build process...");
@@ -78,18 +87,38 @@ fn run(args: CommandArgs) -> Result<()> {
         println!("Warning: No C file compilations were tracked.");
         println!("Make sure your build command actually compiles C files.");
     } else {
-        println!("\nPreprocessing C files...");
-        let preprocessed_files = preprocessor::preprocess_files(
-            &compile_entries,
-            feature,
-            &project_root,
-        )?;
-        println!("Preprocessed {} file(s)", preprocessed_files.len());
+        println!("\nNote: Preprocessing files are now generated directly by libhook.so");
+        println!("Files are located at: .c2rust/{}/c/", feature);
+        
+        // File selection step
+        let c_dir = project_root.join(".c2rust").join(feature).join("c");
+        println!("\nCollecting preprocessed files from: {}", c_dir.display());
+        
+        let preprocessed_files = file_selector::collect_preprocessed_files(&c_dir)?;
+        
+        if preprocessed_files.is_empty() {
+            println!("Warning: No preprocessed files found in {}", c_dir.display());
+            println!("Make sure libhook.so is configured to generate preprocessing files.");
+        } else {
+            let selected_files = file_selector::select_files_interactive(preprocessed_files, args.no_interactive)?;
+            
+            if !selected_files.is_empty() {
+                file_selector::save_selected_files(&selected_files, feature, &project_root)?;
+                println!("Selected {} file(s) for translation", selected_files.len());
+            } else {
+                println!("No files selected for translation.");
+            }
+        }
     }
 
     let command_str = command.join(" ");
-    config_helper::save_config(&build_dir_relative, &command_str, Some(feature), &project_root)?;
-    
+    config_helper::save_config(
+        &build_dir_relative,
+        &command_str,
+        Some(feature),
+        &project_root,
+    )?;
+
     if !compilers.is_empty() {
         println!("\nSaving detected compilers...");
         config_helper::save_compilers(&compilers, &project_root)?;
@@ -98,53 +127,34 @@ fn run(args: CommandArgs) -> Result<()> {
     // Auto-commit changes in .c2rust directory if any
     git_helper::auto_commit_if_modified(&project_root)?;
 
-    println!("\n✓ Build tracking and preprocessing completed successfully!");
+    println!("\n✓ Build tracking completed successfully!");
     println!("✓ Configuration saved.");
     println!("\nOutput structure:");
     println!("  .c2rust/");
     println!("    ├── compile_commands.json");
     println!("    ├── compile_output.txt");
     println!("    └── {}/", feature);
-    println!("        └── <path>/");
-    println!("            └── *.c2rust");
+    println!("        ├── c/");
+    println!("        │   └── <path>/");
+    println!("        │       └── *.c.c2rust (or *.i)");
+    println!("        └── selected_files.json");
     Ok(())
 }
 
 /// Find the project root directory.
-/// First checks C2RUST_PROJECT_ROOT environment variable.
-/// If not set, searches for .c2rust directory upward from start_dir.
+/// Searches for .c2rust directory upward from start_dir.
 /// If not found, returns the start_dir as root.
-/// 
+///
 /// Note: On first run, if .c2rust doesn't exist, this returns the starting directory.
 /// The .c2rust directory will be created at this location during the build process.
 /// On subsequent runs, it will find the previously created .c2rust directory.
 fn find_project_root(start_dir: &Path) -> Result<PathBuf> {
-    // Check if C2RUST_PROJECT_ROOT environment variable is set
-    // If set, it IS the project root (set by upstream tools), so use it directly
-    if let Ok(project_root) = std::env::var("C2RUST_PROJECT_ROOT") {
-        let path = PathBuf::from(project_root);
-        // Validate that the path exists and is a directory
-        match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => return Ok(path),
-            Ok(_) => {
-                return Err(error::Error::CommandExecutionFailed(
-                    format!("C2RUST_PROJECT_ROOT '{}' exists but is not a directory", path.display())
-                ));
-            }
-            Err(e) => {
-                return Err(error::Error::CommandExecutionFailed(
-                    format!("C2RUST_PROJECT_ROOT '{}' is not accessible: {}", path.display(), e)
-                ));
-            }
-        }
-    }
-    
-    // If not set, search for .c2rust directory
+    // Search for .c2rust directory
     let mut current = start_dir.to_path_buf();
-    
+
     loop {
         let c2rust_dir = current.join(".c2rust");
-        
+
         // Use metadata() instead of exists() to detect permission/IO errors
         match std::fs::metadata(&c2rust_dir) {
             Ok(metadata) if metadata.is_dir() => {
@@ -158,14 +168,21 @@ fn find_project_root(start_dir: &Path) -> Result<PathBuf> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 // Permission denied - warn and continue searching
-                eprintln!("Warning: Permission denied accessing {}, continuing search", c2rust_dir.display());
+                eprintln!(
+                    "Warning: Permission denied accessing {}, continuing search",
+                    c2rust_dir.display()
+                );
             }
             Err(e) => {
                 // Other IO errors - warn and continue searching
-                eprintln!("Warning: Error accessing {}: {}, continuing search", c2rust_dir.display(), e);
+                eprintln!(
+                    "Warning: Error accessing {}: {}, continuing search",
+                    c2rust_dir.display(),
+                    e
+                );
             }
         }
-        
+
         // Try to go up one directory
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
@@ -187,5 +204,105 @@ fn main() {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_find_project_root_with_c2rust_in_current_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let c2rust_dir = root.join(".c2rust");
+
+        fs::create_dir_all(&c2rust_dir).unwrap();
+
+        let result = find_project_root(root).unwrap();
+
+        assert_eq!(result, root);
+    }
+
+    #[test]
+    fn test_find_project_root_with_c2rust_in_parent_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let c2rust_dir = root.join(".c2rust");
+        let subdir = root.join("subdir");
+
+        fs::create_dir_all(&c2rust_dir).unwrap();
+        fs::create_dir_all(&subdir).unwrap();
+
+        let result = find_project_root(&subdir).unwrap();
+
+        assert_eq!(result, root);
+    }
+
+    #[test]
+    fn test_find_project_root_with_deeply_nested_subdirs() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let c2rust_dir = root.join(".c2rust");
+        let deep_dir = root.join("a").join("b").join("c").join("d");
+
+        fs::create_dir_all(&c2rust_dir).unwrap();
+        fs::create_dir_all(&deep_dir).unwrap();
+
+        let result = find_project_root(&deep_dir).unwrap();
+
+        assert_eq!(result, root);
+    }
+
+    #[test]
+    fn test_find_project_root_without_c2rust_fallback_to_start_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let subdir = root.join("build");
+
+        fs::create_dir_all(&subdir).unwrap();
+
+        let result = find_project_root(&subdir).unwrap();
+
+        // Should fall back to the starting directory when .c2rust is not found
+        assert_eq!(result, subdir);
+    }
+
+    #[test]
+    fn test_find_project_root_c2rust_as_file_not_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let c2rust_file = root.join(".c2rust");
+        let subdir = root.join("subdir");
+
+        // Create .c2rust as a file, not a directory
+        fs::write(&c2rust_file, "not a directory").unwrap();
+        fs::create_dir_all(&subdir).unwrap();
+
+        let result = find_project_root(&subdir).unwrap();
+
+        // Should continue searching and fall back to start dir since .c2rust is not a directory
+        assert_eq!(result, subdir);
+    }
+
+    #[test]
+    fn test_find_project_root_multiple_c2rust_dirs_finds_closest() {
+        let temp_dir = TempDir::new().unwrap();
+        let outer_root = temp_dir.path();
+        let outer_c2rust = outer_root.join(".c2rust");
+        let inner_root = outer_root.join("project");
+        let inner_c2rust = inner_root.join(".c2rust");
+        let work_dir = inner_root.join("src");
+
+        fs::create_dir_all(&outer_c2rust).unwrap();
+        fs::create_dir_all(&inner_c2rust).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let result = find_project_root(&work_dir).unwrap();
+
+        // Should find the closest .c2rust directory (inner_root, not outer_root)
+        assert_eq!(result, inner_root);
     }
 }
