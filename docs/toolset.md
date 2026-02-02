@@ -300,6 +300,8 @@ unsafe extern "C" {
 1. 执行`cargo build`, 如果有编译错误，则从错误信息中提取错误文件名，将错误信息和rust文件路径一起传递给翻译工具进行修复
 1. 修复出错或者成功但是对应的rust文件内容为空，都输出错误信息后退出, 修复成功后再重复执行上一步的`cargo build`.
 1. `cargo build`成功后执行`git commit -m ...`保存翻译的文件.
+1. 翻译的新函数和变量编译成功后执行`code-analyse --feature <feautre> --update`, 如果出错将错误信息输出后退出.
+1. `cargo build`成功后执行`git commit -m ...`保存更新的文件.
 1. 从`config`中获取构建相关命令, 执行`clean`, `build`, `test`. 如果出错提示用户手工处理后退出.
 1. 上一步混合构建时执行`build`命令时需要指定`LD_PRELOAD=<混合构建库> C2RUST_FEATURE_ROOT=<dir>`实现混合构建.
 1. 都成功后循环处理下一个空的rs文件.
