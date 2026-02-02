@@ -24,4 +24,5 @@ save_intermediate_file/
 *Cargo.lock
 tests/
 
-c2rustxw_cli.egg-info
+c2rustxw_cli.egg-info__pycache__/
+__pycache__/
