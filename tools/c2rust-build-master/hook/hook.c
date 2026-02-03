@@ -25,7 +25,7 @@ static const char* C2RUST_CC = "C2RUST_CC";
 
 static const char* cc_names[] = {"gcc", "clang", "cc"};
 
-static int is_compiler(const char* name) {
+static inline int is_compiler(const char* name) {
         const char* cc = getenv(C2RUST_CC);
         if (cc) {
                 return strcmp(cc, name) == 0;
@@ -38,7 +38,7 @@ static int is_compiler(const char* name) {
         return 0;
 }
 
-char* path_from(const char* env) {
+static inline char* path_from(const char* env) {
         const char* path = getenv(env);
         if (!path) {
                 return 0;
@@ -46,7 +46,7 @@ char* path_from(const char* env) {
         return realpath(path, 0);
 }
 
-int is_cfile(const char* file) {
+static inline int is_cfile(const char* file) {
         int len = strlen(file);
         return len > 2 && strcmp(&file[len - 2], ".c") == 0;
 }
@@ -87,7 +87,6 @@ static int parse_args(int argc, char* argv[], char* extracted[], char* cfiles[])
 }
 
 static const char* strip_prefix(const char* path, const char* prefix) {
-        int path_len = strlen(path);
         int prefix_len = strlen(prefix);
         if (strncmp(path, prefix, prefix_len)) {
                return 0;
