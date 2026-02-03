@@ -101,8 +101,8 @@ impl Feature {
         let _ = fs::rename(&rust, self.root.join("rust_old"));
         println!("Backed up existing rust directory to rust_old");
         let guard = Guard::make(|_| {
-            let _ = fs::remove_dir_all(&rust);
-            let _ = fs::rename(self.root.join("rust_old"), &rust);
+            //let _ = fs::remove_dir_all(&rust);
+            //let _ = fs::rename(self.root.join("rust_old"), &rust);
         });
         println!("Creating new Rust library project...");
         let output = Command::new("cargo")
