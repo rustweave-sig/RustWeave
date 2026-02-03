@@ -25,7 +25,7 @@ fn read_c_code(root: &Path, range: &SourceRange) -> Result<String> {
     let Some(ref end) = range.end.expansion_loc else {
         return Ok(String::new());
     };
-    read_file_range(&root.join(&*beg.file), beg.offset, end.offset + 1)
+    read_file_range(&root.join(&*beg.file), beg.offset, end.offset + end.tok_len)
 }
 
 fn line_info(loc: &SourceLocation) -> Option<String> {
@@ -36,6 +36,16 @@ fn line_info(loc: &SourceLocation) -> Option<String> {
     Some(format!("#line {} \"{}\"", loc.line, loc.file))
 }
 
+fn range_include(range: &SourceRange, included: &SourceRange) -> bool {
+    let (Some(beg1), Some(beg2)) = (range.begin.expansion_loc.as_ref(), included.begin.expansion_loc.as_ref()) else {
+        return false;
+    };
+    let (Some(end1), Some(end2)) = (range.end.expansion_loc.as_ref(), included.end.expansion_loc.as_ref()) else {
+        return false;
+    };
+    beg1.file == beg2.file && beg1.offset <= beg2.offset && end1.offset >= end2.offset
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum Kind {
     EnumDecl(EnumDecl),
@@ -44,7 +54,8 @@ pub enum Kind {
     VarDecl(VarDecl),
     TypedefDecl(TypedefDecl),
     TranslationUnitDecl(TranslationUnitDecl),
-    Other(OtherDecl),
+    CompoundStmt, // 函数需要依赖它判断是否是声明.
+    Other,
 }
 
 impl Kind {
@@ -89,6 +100,34 @@ impl Kind {
         }
     }
 
+    fn set_skip(&mut self) {
+        match self {
+            Kind::EnumDecl(ref mut item) => item.skip = true,
+            Kind::RecordDecl(ref mut item) => item.skip = true,
+            Kind::FunctionDecl(ref mut item) => item.skip = true,
+            Kind::VarDecl(ref mut item) => item.skip = true,
+            Kind::TypedefDecl(ref mut item) => item.skip = true,
+            _ => {},
+        }
+    }
+
+    fn skip(&self) -> bool {
+        // 生成代码的时候, 需要忽略__builtin_否则编译的时候会出现符号重定义.
+        if let Some(name) = self.name() {
+            if name.starts_with("__builtin_") {
+                return true;
+            }
+        }
+        match self {
+            Kind::EnumDecl(ref item) => item.skip,
+            Kind::RecordDecl(ref item) => item.skip,
+            Kind::FunctionDecl(ref item) => item.skip,
+            Kind::VarDecl(ref item) => item.skip,
+            Kind::TypedefDecl(ref item) => item.skip,
+            _ => true,
+        }
+    }
+
     pub fn name(&self) -> Option<&str> {
         match self {
             Kind::EnumDecl(ref item) => item.name.as_deref(),
@@ -104,13 +143,20 @@ impl Kind {
         line_info(self.loc()?)
     }
 
+    fn is_fun_declare(inner: &[Node]) -> bool {
+        !inner.iter().any(|e| matches!(e.kind, Kind::CompoundStmt))
+    }
+
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
-    pub fn c_code(&self, root: &Path, empty_inner: bool) -> Result<String> {
+    pub fn c_code(&self, root: &Path, inner: &[Node]) -> Result<String> {
+        if self.skip() {
+            return Ok(String::new());
+        }
         let Some(range) = self.range() else {
             return Err(Error::inval());
         };
         let mut code = read_c_code(root, range)?;
-        if empty_inner || !matches!(self, Kind::FunctionDecl(_)) {
+        if !matches!(self, Kind::FunctionDecl(_)) || Self::is_fun_declare(inner) {
             code.push(';');
         }
         if !self.is_static() {
@@ -118,12 +164,12 @@ impl Kind {
         }
 
         let Some(global_name) = self.global_name() else {
-            eprintln!("empty global name");
+            eprintln!("empty global name: {:?}", self);
             return Err(Error::general());
         };
 
-        let (beg, _) = name_range(self.loc().unwrap(), self.range().unwrap());
-        code.insert_str(beg, global_name);
+        let (beg, end) = name_range(self.loc().unwrap(), self.range().unwrap());
+        code.replace_range(beg..end, global_name);
 
         let re = regex::Regex::new(r"^static\s|\sstatic\s").map_err(|_| Error::inval())?;
         if let Some(m) = re.find(&code) {
@@ -144,7 +190,7 @@ impl Kind {
             return None;
         }
         let Some(global_name) = self.global_name() else {
-            eprintln!("empty global name");
+            eprintln!("empty global name: {:?}", self);
             return None;
         };
         let name = self.name()?;
@@ -196,13 +242,6 @@ impl Kind {
         }
     }
 
-    pub fn md5(&self) -> Option<&str> {
-        let Kind::TranslationUnitDecl(ref unit) = self else {
-            return None;
-        };
-        unit.md5.as_deref()
-    }
-
     pub fn is_extern(&self) -> bool {
         let storage_class = match self {
             Kind::VarDecl(ref item) => &item.storage_class,
@@ -232,17 +271,6 @@ impl Kind {
         match self {
             Kind::VarDecl(ref item) => item.init.is_some(),
             _ => false,
-        }
-    }
-
-    fn is_implicit(&self) -> bool {
-        match self {
-            Kind::EnumDecl(ref item) => item.is_implicit,
-            Kind::RecordDecl(ref item) => item.is_implicit,
-            Kind::FunctionDecl(ref item) => item.is_implicit,
-            Kind::VarDecl(ref item) => item.is_implicit,
-            Kind::TypedefDecl(ref item) => item.is_implicit,
-            _ => true,
         }
     }
 }
@@ -311,6 +339,8 @@ pub struct TypedefDecl {
     ty: MyClangType,
     #[serde(default, rename = "isImplicit")]
     is_implicit: bool,
+    #[serde(default)]
+    skip: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -322,6 +352,8 @@ pub struct EnumDecl {
     is_definition: bool,
     #[serde(default, rename = "isImplicit")]
     is_implicit: bool,
+    #[serde(default)]
+    skip: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -335,6 +367,8 @@ pub struct RecordDecl {
     is_definition: bool,
     #[serde(default, rename = "isImplicit")]
     is_implicit: bool,
+    #[serde(default)]
+    skip: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -352,6 +386,8 @@ pub struct VarDecl {
     #[serde(default)]
     git_commit: bool,
     global_name: Option<String>,
+    #[serde(default)]
+    skip: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -370,6 +406,8 @@ pub struct FunctionDecl {
     #[serde(default)]
     git_commit: bool,
     global_name: Option<String>,
+    #[serde(default)]
+    skip: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -411,9 +449,7 @@ impl File {
 
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     fn remove_static(root: &Path, path: &Path, mut node: Node) -> Result<Node> {
-        let Some(md5) = node.kind.md5() else {
-            return Ok(node);
-        };
+        let md5 = Self::md5_file(&path.with_extension("c2rust"))?;
         let mut has_static = false;
         for node in &mut node.inner {
             if !node.kind.is_static() {
@@ -432,6 +468,7 @@ impl File {
         let new_c_file = higuard::Guard::new(path.with_extension("c"), |p| {
             let _ = fs::remove_file(p);
         });
+        fs::write(&*new_c_file, code.as_bytes()).to_err()?;
         fs::write(&*new_c_file, code.as_bytes()).to_err()?;
         let output = Command::new(get_clang())
             .arg("-xc")
@@ -474,7 +511,7 @@ impl File {
         let json = String::from_utf8_lossy(&output.stdout);
         let mut node = serde_json::from_str(&json).to_err()?;
         Self::init_line_info(&mut node);
-        Self::clean_vars(&mut node);
+        Self::init_vars(&mut node);
         Self::remove_static(root, path, node)
     }
 
@@ -514,11 +551,14 @@ impl File {
             let target = node.inner[n].kind.range_mut();
             if let (Some(target), Some(src)) = (target, src) {
                 init_range(target, &src);
+                if range_include(target, &src) {
+                    node.inner[n - 1].kind.set_skip();
+                }
             }
         }
     }
 
-    fn clean_vars(node: &mut Node) {
+    fn init_vars(node: &mut Node) {
         // 每个变量都必须有个init标志.
         let mut inited_vars = HashMap::new();
         for node in &mut node.inner {
@@ -537,7 +577,6 @@ impl File {
         for (_, var) in inited_vars {
             var.init = Some("c".to_string());
         }
-        node.inner.retain(|item| !item.kind.is_implicit());
     }
 
     pub fn iter(&self) -> &[Node] {
@@ -563,11 +602,14 @@ impl File {
             if node.kind.has_committed() {
                 continue;
             }
-            if let Some(line) = node.kind.line_info() {
-                content.push_str(&line);
-                content.push('\n');
-            }
-            let code = node.kind.c_code(root, node.inner.is_empty())?;
+            
+            let Some(line) = node.kind.line_info() else {
+                continue;
+            };
+            content.push_str(&line);
+            content.push('\n');
+            
+            let code = node.kind.c_code(root, &node.inner)?;
             content.push_str(&code);
             content.push('\n');
 

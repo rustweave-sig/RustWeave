@@ -39,7 +39,7 @@ impl Feature {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if !path.is_file() && path.extension() != Some(OsStr::new("c2rust")) {
+            if !path.is_file() || path.extension() != Some(OsStr::new("c2rust")) {
                 continue;
             }
             self.files.push(File::new(&c_root, path)?);
@@ -306,7 +306,7 @@ impl Feature {
             mod_items.push_str(&prefixed_name);
             mod_items.push_str(";\n");
             fs::File::create(mod_dir.join(&prefixed_name).with_extension("rs")).to_err()?;
-            let c_code = node.kind.c_code(&c_root, node.inner.is_empty())?;
+            let c_code = node.kind.c_code(&c_root, &node.inner)?;
             fs::write(mod_dir.join(&prefixed_name).with_extension("c"), c_code.as_bytes()).to_err()?;
         }
         fs::write(mod_dir.join("mod.rs"), mod_items.as_bytes()).to_err()?;
@@ -349,7 +349,7 @@ impl Feature {
                 if !is_type {
                     continue;
                 }
-                let code = node.kind.c_code(&c_root, node.inner.is_empty())?;
+                let code = node.kind.c_code(&c_root, &node.inner)?;
                 content.push_str(&code);
                 content.push('\n');
             }
@@ -365,7 +365,7 @@ impl Feature {
             .arg("-o")
             .arg("rust/src/types.rs")
             .arg("--no-layout-tests")
-            .arg("--default-enum-stype")
+            .arg("--default-enum-style")
             .arg("consts")
             .arg("--disable-nested-struct-naming")
             .output()
