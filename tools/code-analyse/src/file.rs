@@ -213,7 +213,7 @@ impl Kind {
         line_info(self.loc()?)
     }
 
-    fn is_fun_declare(inner: &[Node]) -> bool {
+    pub fn is_fun_declare(&self, inner: &[Node]) -> bool {
         !inner.iter().any(|e| matches!(e.kind, Kind::CompoundStmt))
     }
 
@@ -237,7 +237,7 @@ impl Kind {
         };
 
         let mut code = read_c_code(root, range)?;
-        if !matches!(self, Kind::FunctionDecl(_)) || Self::is_fun_declare(inner) {
+        if !matches!(self, Kind::FunctionDecl(_)) || self.is_fun_declare(inner) {
             code.push(';');
         }
         if !self.is_static() {
@@ -661,7 +661,9 @@ impl File {
             }
         }
         for (_, var) in inited_vars {
-            var.init = Some("c".to_string());
+            if var.storage_class.as_deref() != Some("extern") {
+                var.init = Some("c".to_string());
+            }
         }
     }
 

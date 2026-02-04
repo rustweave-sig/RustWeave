@@ -75,7 +75,7 @@ impl Feature {
     // 检查节点是否为需要处理的定义（函数或变量定义）
     fn is_node_definition(node: &crate::Node) -> bool {
         match node.kind {
-            crate::Kind::FunctionDecl(_) => !node.inner.is_empty(),
+            crate::Kind::FunctionDecl(_) => !node.kind.is_fun_declare(&node.inner),
             crate::Kind::VarDecl(_) => !node.kind.is_extern() || node.kind.is_inited(),
             _ => false,
         }
