@@ -88,7 +88,7 @@ static void redirect_cfile(int argc, char* argv[]) {
     char* project_root = 0;
     char* feature_root = 0;
     char new_path[MAX_PATH_LEN];
-    char* new_argv[argc + 1];
+    char* new_argv[argc + 2];
 
     project_root = path_from(C2RUST_PROJECT_ROOT);
     if (!project_root) return;
@@ -124,7 +124,9 @@ out:
     if (should_reboot) {
         // 避免重复进入此流程.
         unsetenv(C2RUST_PROJECT_ROOT);
-        new_argv[argc] = 0;
+        // static消除时可能不存在独立的函数声明，无条件添加.
+        new_argv[argc] = "-Wno-missing-prototypes";
+        new_argv[argc + 1] = 0;
         execvp(new_argv[0], new_argv);
     }
 }

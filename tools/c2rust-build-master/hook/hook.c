@@ -55,7 +55,7 @@ static inline int is_cfile(const char* file) {
 // 输入保证extracted, cfiles最少可以保存argc个输入参数.
 static int parse_args(int argc, char* argv[], char* extracted[], char* cfiles[]) {
     int cnt = 0;
-    for (int i = 0; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         char* arg = argv[i];
         if (arg[0] != '-') {
                 if (is_cfile(arg) && access(arg, R_OK) == 0) {
@@ -64,6 +64,7 @@ static int parse_args(int argc, char* argv[], char* extracted[], char* cfiles[])
                 }
                 continue;
         }
+        // 这里提取会影响预处理结果的所有参数
         if (arg[1] == 'I' || arg[1] == 'D' || arg[1] == 'U') {
                 if (arg[2]) {
                         extracted[cnt++] = arg;
@@ -80,6 +81,8 @@ static int parse_args(int argc, char* argv[], char* extracted[], char* cfiles[])
                 if (i < argc) {
                     extracted[cnt++] = arg;
                 }
+        } else if (strncmp(&arg[1], "std=", 4) == 0) {
+                extracted[cnt++] = arg;
         }
     }
 
@@ -119,8 +122,9 @@ static void preprocess_cfile(int argc, char* argv[], const char* cfile, const ch
         system(cmd);
         *filename = '/'; //恢复文件名.
 
-        // 预处理命令
-        cmd_len = snprintf(cmd, sizeof(cmd), "clang -E \"%s\" -o \"%s\"", cfile, full_path);
+        // 预处理命令, gcc和clang有差异, clang不能处理gcc生成的预处理文件, 后续bindgen都依赖clang，必须用clang生成
+        // -P避免生成行号信息,混合构建时定位信息指向新生成的文件.
+        cmd_len = snprintf(cmd, sizeof(cmd), "clang -E \"%s\" -o \"%s\" -P", cfile, full_path);
         if (cmd_len >= sizeof(cmd)) return;
 
         for (int i = 0; i < argc; ++i) {

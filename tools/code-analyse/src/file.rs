@@ -14,7 +14,7 @@ fn read_file_range(path: &Path, start: usize, end: usize) -> Result<String> {
     if start >= mmap.len() || end <= start {
         return Ok(String::new());
     }
-    let bytes = &mmap[start..end.min(mmap.len())];
+    let bytes = mmap[start..end.min(mmap.len())].trim_ascii();
     Ok(String::from_utf8_lossy(bytes).to_string())
 }
 
@@ -28,6 +28,58 @@ fn read_c_code(root: &Path, range: &SourceRange) -> Result<String> {
     read_file_range(&root.join(&*beg.file), beg.offset, end.offset + end.tok_len)
 }
 
+fn read_before(root: &Path, pos: &SourceRange) -> Result<String> {
+    let Some(ref pos) = pos.begin.expansion_loc else {
+        return Ok(String::new());
+    };
+    read_file_range(&root.join(&*pos.file), 0, pos.offset)
+}
+
+fn read_after(root: &Path, pos: &SourceRange) -> Result<String> {
+    let Some(ref pos) = pos.end.expansion_loc else {
+        return Ok(String::new());
+    };
+    read_file_range(&root.join(&*pos.file), pos.offset + pos.tok_len, usize::MAX)
+}
+
+fn read_between(root: &Path, beg: &SourceRange, end: &SourceRange) -> Result<String> {
+    let Some(ref beg_loc) = beg.end.expansion_loc else {
+        return read_before(root, end);
+    };
+    let Some(ref end_loc) = end.begin.expansion_loc else {
+        return read_after(root, beg);
+    };
+    if end_loc.file == beg_loc.file {
+        return read_file_range(
+            &root.join(&*beg_loc.file),
+            beg_loc.offset + beg_loc.tok_len,
+            end_loc.offset,
+        );
+    } else {
+        Ok(read_after(root, beg)? + &read_before(root, end)?)
+    }
+}
+
+fn read_code_between(
+    root: &Path,
+    beg: Option<&SourceRange>,
+    end: Option<&SourceRange>,
+) -> Result<String> {
+    let code = match (beg, end) {
+        (Some(beg), Some(end)) => read_between(root, beg, end),
+        (None, Some(end)) => read_before(root, end),
+        (Some(beg), None) => read_after(root, beg),
+        _ => return Ok(String::new()),
+    };
+    code.map(|mut content| {
+        if content.as_bytes().get(0) == Some(&b';') {
+            content.drain(..1);
+            content.trim();
+        }
+        content
+    })
+}
+
 fn line_info(loc: &SourceLocation) -> Option<String> {
     let loc = loc.expansion_loc.as_ref()?;
     if let (Some(file), Some(line)) = (loc.presumed_file.as_ref(), loc.presumed_line) {
@@ -37,10 +89,16 @@ fn line_info(loc: &SourceLocation) -> Option<String> {
 }
 
 fn range_include(range: &SourceRange, included: &SourceRange) -> bool {
-    let (Some(beg1), Some(beg2)) = (range.begin.expansion_loc.as_ref(), included.begin.expansion_loc.as_ref()) else {
+    let (Some(beg1), Some(beg2)) = (
+        range.begin.expansion_loc.as_ref(),
+        included.begin.expansion_loc.as_ref(),
+    ) else {
         return false;
     };
-    let (Some(end1), Some(end2)) = (range.end.expansion_loc.as_ref(), included.end.expansion_loc.as_ref()) else {
+    let (Some(end1), Some(end2)) = (
+        range.end.expansion_loc.as_ref(),
+        included.end.expansion_loc.as_ref(),
+    ) else {
         return false;
     };
     beg1.file == beg2.file && beg1.offset <= beg2.offset && end1.offset >= end2.offset
@@ -55,7 +113,12 @@ pub enum Kind {
     TypedefDecl(TypedefDecl),
     TranslationUnitDecl(TranslationUnitDecl),
     CompoundStmt, // 函数需要依赖它判断是否是声明.
-    Other,
+    Other(OtherDecl),
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct OtherDecl {
+    kind: Option<String>,
 }
 
 impl Kind {
@@ -107,17 +170,24 @@ impl Kind {
             Kind::FunctionDecl(ref mut item) => item.skip = true,
             Kind::VarDecl(ref mut item) => item.skip = true,
             Kind::TypedefDecl(ref mut item) => item.skip = true,
-            _ => {},
+            _ => {}
         }
     }
 
-    fn skip(&self) -> bool {
-        // 生成代码的时候, 需要忽略__builtin_否则编译的时候会出现符号重定义.
-        if let Some(name) = self.name() {
-            if name.starts_with("__builtin_") {
-                return true;
-            }
+    fn kind(&self) -> &str {
+        match self {
+            Kind::EnumDecl(_) => "EnumDecl",
+            Kind::RecordDecl(_) => "RecrodDecl",
+            Kind::FunctionDecl(_) => "FunctionDecl",
+            Kind::VarDecl(_) => "VarDecl",
+            Kind::TypedefDecl(_) => "TypedefDecl",
+            Kind::CompoundStmt => "CompoundStmt",
+            Kind::Other(ref item) => item.kind.as_deref().unwrap_or("unknown kind"),
+            _ => "TranslationUnitDecl",
         }
+    }
+
+    pub fn skip(&self) -> bool {
         match self {
             Kind::EnumDecl(ref item) => item.skip,
             Kind::RecordDecl(ref item) => item.skip,
@@ -152,9 +222,20 @@ impl Kind {
         if self.skip() {
             return Ok(String::new());
         }
+        // 生成代码的时候, 需要忽略__builtin_否则编译的时候会出现符号重定义.
+        if let Some(name) = self.name() {
+            if name.starts_with("__builtin_") {
+                return Ok(String::new());
+            }
+            // TO DO: cJSON临时修改.
+            if name.starts_with("_Float") {
+                return Ok(String::new());
+            }
+        }
         let Some(range) = self.range() else {
             return Err(Error::inval());
         };
+
         let mut code = read_c_code(root, range)?;
         if !matches!(self, Kind::FunctionDecl(_)) || Self::is_fun_declare(inner) {
             code.push(';');
@@ -164,7 +245,7 @@ impl Kind {
         }
 
         let Some(global_name) = self.global_name() else {
-            eprintln!("empty global name: {:?}", self);
+            eprintln!("empty global name: {}", code);
             return Err(Error::general());
         };
 
@@ -173,7 +254,7 @@ impl Kind {
 
         let re = regex::Regex::new(r"^static\s|\sstatic\s").map_err(|_| Error::inval())?;
         if let Some(m) = re.find(&code) {
-            code.replace_range(m.start()..m.start() + m.len(), " extern ");
+            code.replace_range(m.start()..m.start() + m.len(), " ");
         }
         if !self.is_inline() {
             return Ok(code);
@@ -190,7 +271,7 @@ impl Kind {
             return None;
         }
         let Some(global_name) = self.global_name() else {
-            eprintln!("empty global name: {:?}", self);
+            eprintln!("empty global name: {:?}", self.name());
             return None;
         };
         let name = self.name()?;
@@ -410,9 +491,6 @@ pub struct FunctionDecl {
     skip: bool,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct OtherDecl {}
-
 pub struct File {
     node: Node,
     path: PathBuf,
@@ -421,7 +499,7 @@ pub struct File {
 impl File {
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     pub fn new(root: &Path, path: &Path) -> Result<Self> {
-        Self::with_json_file(path).or(Self::with_c_file(root, path))
+        Self::with_c_file(root, path)
     }
 
     pub fn save_json(&self) -> Result<()> {
@@ -458,7 +536,8 @@ impl File {
             let Some(name) = node.kind.name() else {
                 continue;
             };
-            node.kind.set_global_name(format!("_c2rust_private_{md5}_{name}"));
+            node.kind
+                .set_global_name(format!("_c2rust_private_{md5}_{name}"));
             has_static = true;
         }
         if !has_static {
@@ -466,13 +545,14 @@ impl File {
         }
         let code = Self::generate_c_code(root, &node.inner)?;
         let new_c_file = higuard::Guard::new(path.with_extension("c"), |p| {
-            let _ = fs::remove_file(p);
+            // 不删除方便定位，后续执行会无条件覆盖.
+            // let _ = fs::remove_file(p);
         });
-        fs::write(&*new_c_file, code.as_bytes()).to_err()?;
         fs::write(&*new_c_file, code.as_bytes()).to_err()?;
         let output = Command::new(get_clang())
             .arg("-xc")
             .arg("-E")
+            .arg("-P") //去除行号, 混合构建需要调试应该直接定位到这里生成的文件而不是原文件.
             .arg(&*new_c_file)
             .arg("-o")
             .arg(&*new_c_file)
@@ -510,6 +590,12 @@ impl File {
         }
         let json = String::from_utf8_lossy(&output.stdout);
         let mut node = serde_json::from_str(&json).to_err()?;
+        let js = path.with_extension("js");
+        if js.exists() {
+            let _ = fs::write(path.with_extension("js2"), json.as_bytes());
+        } else {
+            let _ = fs::write(path.with_extension("js"), json.as_bytes());
+        }
         Self::init_line_info(&mut node);
         Self::init_vars(&mut node);
         Self::remove_static(root, path, node)
@@ -598,18 +684,32 @@ impl File {
 
     fn generate_c_code(root: &Path, nodes: &[Node]) -> Result<String> {
         let mut content = String::new();
+        let mut last = None;
         for node in nodes {
+            if !node.kind.skip() {
+                let current = node.kind.range();
+                let code = read_code_between(root, last, current)?;
+                last = current;
+                if !code.is_empty() {
+                    content.push('\n');
+                    content.push_str(&code);
+                    content.push('\n');
+                }
+            }
             if node.kind.has_committed() {
                 continue;
             }
-            
+
             let Some(line) = node.kind.line_info() else {
                 continue;
             };
             content.push_str(&line);
             content.push('\n');
-            
+
             let code = node.kind.c_code(root, &node.inner)?;
+            if code.is_empty() {
+                continue;
+            }
             content.push_str(&code);
             content.push('\n');
 
@@ -617,6 +717,12 @@ impl File {
                 content.push_str(&mac);
                 content.push('\n');
             }
+            content.push('\n');
+        }
+        let code = read_code_between(root, last, None)?;
+        if !code.is_empty() {
+            content.push('\n');
+            content.push_str(&code);
             content.push('\n');
         }
         Ok(content)
