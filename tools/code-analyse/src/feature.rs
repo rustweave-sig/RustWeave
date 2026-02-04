@@ -157,9 +157,8 @@ impl Feature {
             }
 
             // 收集需要更新的节点及其新状态
-            let mut updates: Vec<(String, bool)> = Vec::new();
-
-            for node in file.iter() {
+            let mut is_updated = false;
+            for node in file.iter_mut() {
                 // 只处理函数和变量定义
                 if !Self::is_node_definition(node) {
                     continue;
@@ -185,32 +184,24 @@ impl Feature {
                 // 检查状态是否一致
                 if has_committed && is_file_empty {
                     // 已标记为翻译但文件为空，需要重置状态为未翻译
-                    updates.push((name.to_string(), false));
+                    node.kind.set_git_commit(false);
+                    is_updated = true;
                 } else if !has_committed && !is_file_empty {
                     // 未标记为翻译但文件非空，需要标记为已翻译
-                    updates.push((name.to_string(), true));
+                    println!("{name} git commit");
+                    node.kind.set_git_commit(true);
+                    is_updated = true;
                 }
                 // 其他情况（状态一致）不需要处理
             }
 
             // 应用更新到file的节点
-            if !updates.is_empty() {
+            if is_updated {
                 changed = true;
-                println!("Updating {} nodes in file: {}", updates.len(), mod_name);
-                for (name, committed) in updates {
-                    // 在file中找到对应的node并更新状态
-                    for node in file.iter_mut() {
-                        if let Some(node_name) = node.kind.name() {
-                            if node_name == name {
-                                node.kind.set_git_commit(committed);
-                                break;
-                            }
-                        }
-                    }
-                }
                 // 保存file的JSON状态
                 file.save_json()?;
-                file.export_c_code(&c_root)?;
+                let code = file.export_c_code(&c_root)?;
+                fs::write(file.path().with_extension("c"), code.as_bytes()).to_err()?;
                 println!(
                     "Saved JSON state and exported C code for file: {}",
                     mod_name
