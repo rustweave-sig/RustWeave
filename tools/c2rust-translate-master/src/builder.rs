@@ -113,14 +113,38 @@ fn execute_command_in_dir(
     }
     
     // Set LD_PRELOAD for build command if requested
-    if set_ld_preload {
-        if let Ok(hybrid_lib) = env::var("C2RUST_HYBRID_BUILD_LIB") {
-            let c2rust_dir = project_root.join(".c2rust");
-            let feature_root = c2rust_dir.join(feature);
-            command.env("LD_PRELOAD", hybrid_lib);
-            command.env("C2RUST_FEATURE_ROOT", feature_root);
+    let hybrid_lib = if set_ld_preload {
+        env::var("C2RUST_HYBRID_BUILD_LIB").ok()
+    } else {
+        None
+    };
+    
+    let feature_root = if let Some(ref lib_path) = hybrid_lib {
+        let c2rust_dir = project_root.join(".c2rust");
+        let feature_root_path = c2rust_dir.join(feature);
+        let rust_lib_path = feature_root_path.join("rust").join("target").join("debug").join("librust.a");
+        command.env("LD_PRELOAD", lib_path);
+        command.env("C2RUST_PROJECT_ROOT", &project_root);
+        command.env("C2RUST_FEATURE_ROOT", &feature_root_path);
+        command.env("C2RUST_RUST_LIB", &rust_lib_path);
+        Some(feature_root_path)
+    } else {
+        None
+    };
+    
+    // Print the command being executed, showing LD_PRELOAD and C2RUST_FEATURE_ROOT if set
+    // The output uses shell-like quoting to ensure it can be safely copy/pasted
+    println!("Executing command:");
+    print!("  ");
+    if let Some(ref lib_path) = hybrid_lib {
+        print!("LD_PRELOAD={} ", shell_words::quote(lib_path));
+        if let Some(ref feature_root) = feature_root {
+            print!("C2RUST_FEATURE_ROOT={} ", shell_words::quote(&feature_root.display().to_string()));
         }
     }
+    // Print the actual command that will be executed (after shell-words parsing)
+    println!("{}", shell_words::join(&parts));
+    println!("  Working directory: {}", exec_dir.display());
     
     let output = command
         .output()
@@ -199,8 +223,11 @@ pub fn run_hybrid_build(feature: &str) -> Result<()> {
     }
 
     // Execute commands
+    println!("Try to clean c project");
     c2rust_clean(feature)?;
+    println!("Try to build c project");
     c2rust_build(feature)?;
+    println!("Try to test c project");
     c2rust_test(feature)?;
 
     Ok(())

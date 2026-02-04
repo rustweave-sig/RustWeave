@@ -93,6 +93,8 @@ pub fn translate_feature(feature: &str) -> Result<()> {
         println!("Found {} empty .rs file(s) to process", empty_rs_files.len());
 
         for rs_file in empty_rs_files {
+            println!("Running hybrid build tests...");
+            builder::run_hybrid_build(feature)?;
             process_rs_file(feature, &rs_file)?;
         }
     }
@@ -146,9 +148,9 @@ fn process_rs_file(feature: &str, rs_file: &std::path::Path) -> Result<()> {
     }
 
     // Step 2.2.5 & 2.2.6: Build and fix errors in a loop (max 5 attempts)
-    const MAX_FIX_ATTEMPTS: usize = 5;
+    const MAX_FIX_ATTEMPTS: usize = 1;
     for attempt in 1..=MAX_FIX_ATTEMPTS {
-        println!("Building after translation (attempt {}/{})", attempt, MAX_FIX_ATTEMPTS);
+        println!("Building Rust Project after translation (attempt {}/{})", attempt, MAX_FIX_ATTEMPTS);
         match builder::cargo_build(feature) {
             Ok(_) => {
                 println!("Build successful!");
@@ -193,10 +195,6 @@ fn process_rs_file(feature: &str, rs_file: &std::path::Path) -> Result<()> {
 
     // Step 2.2.9: Save update result
     git::git_commit(&format!("Update code analysis for {}", feature), feature)?;
-
-    // Step 2.2.10 & 2.2.11: Hybrid build testing
-    println!("Running hybrid build tests...");
-    builder::run_hybrid_build(feature)?;
 
     Ok(())
 }
