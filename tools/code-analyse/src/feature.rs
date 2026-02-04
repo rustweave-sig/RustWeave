@@ -98,11 +98,14 @@ impl Feature {
     pub fn reinit(&self) -> Result<()> {
         println!("Starting reinitialization for feature '{}'", self.name);
         let rust = self.root.join("rust");
-        let _ = fs::rename(&rust, self.root.join("rust_old"));
+        let rust_old = self.root.join("rust_old");
+        let _ = fs::remove_dir_all(&rust_old);
+        let _ = fs::rename(&rust, &rust_old);
         println!("Backed up existing rust directory to rust_old");
         let guard = Guard::make(|_| {
-            //let _ = fs::remove_dir_all(&rust);
-            //let _ = fs::rename(self.root.join("rust_old"), &rust);
+            // 不删除，方便定位，后续重复执行会无条件覆盖.
+            // let _ = fs::remove_dir_all(&rust);
+            // let _ = fs::rename(&rust_old, &rust);
         });
         println!("Creating new Rust library project...");
         let output = Command::new("cargo")
@@ -111,7 +114,7 @@ impl Feature {
             .arg("--lib")
             .arg("rust")
             .output()
-            .log_err("cargo new failed")?;
+            .log_err("cargo")?;
 
         if !output.status.success() {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
@@ -128,7 +131,7 @@ impl Feature {
         self.generate_types()?;
         println!("Type information generated");
         guard.discard();
-        let _ = fs::remove_dir_all(self.root.join("rust_old"));
+        let _ = fs::remove_dir_all(rust_old);
         println!("Cleaned up backup directory");
         println!("Feature '{}' reinitialized successfully", self.name);
         Ok(())
@@ -328,6 +331,9 @@ impl Feature {
         let c_root = self.root.join("c");
         for file in &self.files {
             for node in file.iter() {
+                if node.kind.skip() {
+                    continue;
+                }
                 let id = node
                     .kind
                     .name()
@@ -367,9 +373,10 @@ impl Feature {
             .arg("--no-layout-tests")
             .arg("--default-enum-style")
             .arg("consts")
+            .arg("--no-prepend-enum-name")
             .arg("--disable-nested-struct-naming")
             .output()
-            .to_err()?;
+            .log_err("bindgen")?;
         if !output.status.success() {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return Err(Error::last());
@@ -686,7 +693,7 @@ impl Feature {
             .current_dir(self.root.join("rust"))
             .arg("build")
             .output()
-            .to_err()?;
+            .log_err("cargo")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
