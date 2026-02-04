@@ -135,19 +135,17 @@ static void link_rust_lib(int argc, char* argv[]) {
         char* rust_lib = getenv(C2RUST_RUST_LIB);
         if (!rust_lib) return;
 
-        // 已经添加了rust_lib直接返回.
         char* new_argv[argc + 2];
         for (int i = 0; i < argc; ++i) {
-            if (strcmp(argv[argc - 1], rust_lib) == 0) {
-                    return;
-            }
-            new_argv[i] = argv[i];
+	    new_argv[i] = argv[i];
         }
-        new_argv[argc] = (char*)rust_lib;
+
+	//dprintf(2, "link_rust_lib: %s lib = %s, target %s \n",  argv[0], rust_lib, target);
+        new_argv[argc] = rust_lib;
         new_argv[argc + 1] = 0;
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
-        execvp(argv[0], new_argv);
+        execvp(new_argv[0], new_argv);
 }
 
 __attribute__((constructor)) static void c2rust_hook(int argc, char* argv[]) {

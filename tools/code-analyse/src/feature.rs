@@ -122,7 +122,7 @@ impl Feature {
         }
         println!("Rust project created successfully");
         println!("Setting crate type to cdylib...");
-        self.set_cdylib()?;
+        self.set_staticlib()?;
         println!("Crate type configured");
         println!("Creating file directory structure...");
         self.create_file_directories()?;
@@ -243,14 +243,14 @@ impl Feature {
         Ok(())
     }
 
-    fn set_cdylib(&self) -> Result<()> {
+    fn set_staticlib(&self) -> Result<()> {
         // TODO: 后续通过toml文件操作API实现读写
         // 当前简单追加写实现
         let mut file = fs::File::options()
             .append(true)
             .open(self.root.join("rust/Cargo.toml"))
             .to_err()?;
-        file.write(b"\n[lib]\ncrate-type = [\"cdylib\"]\n")
+        file.write(b"\n[lib]\ncrate-type = [\"staticlib\"]\n")
             .to_err()?;
         Ok(())
     }
@@ -334,12 +334,17 @@ impl Feature {
                 if node.kind.skip() {
                     continue;
                 }
-                let id = node
+                let Some(id) = node.kind.name().map(|s| s.to_string()).or(node
                     .kind
-                    .name()
-                    .map(|s| s.to_string())
-                    .or(node.kind.line_info())
-                    .unwrap();
+                    .c_code(&c_root, &node.inner)
+                    .ok()
+                    .map(|code| {
+                        let digest = md5::compute(code.as_bytes());
+                        format!("__{digest:?}")
+                    }))
+                else {
+                    continue;
+                };
                 let mut is_var = false;
                 let is_type = match node.kind {
                     Kind::RecordDecl(_) | Kind::EnumDecl(_) => {

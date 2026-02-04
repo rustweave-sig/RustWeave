@@ -237,6 +237,10 @@ impl Kind {
         };
 
         let mut code = read_c_code(root, range)?;
+        if code.is_empty() {
+            return Ok(code);
+        }
+
         if !matches!(self, Kind::FunctionDecl(_)) || self.is_fun_declare(inner) {
             code.push(';');
         }
@@ -543,17 +547,18 @@ impl File {
         if !has_static {
             return Ok(node);
         }
-        let code = Self::generate_c_code(root, &node.inner)?;
+        let code = Self::generate_c_code(root, &node.inner, true)?;
         let new_c_file = higuard::Guard::new(path.with_extension("c"), |p| {
             // 不删除方便定位，后续执行会无条件覆盖.
             // let _ = fs::remove_file(p);
         });
-        fs::write(&*new_c_file, code.as_bytes()).to_err()?;
+        let new_c2rust_file = path.with_extension("c2rust_2");
+        fs::write(&*new_c2rust_file, code.as_bytes()).to_err()?;
         let output = Command::new(get_clang())
             .arg("-xc")
             .arg("-E")
             .arg("-P") //去除行号, 混合构建需要调试应该直接定位到这里生成的文件而不是原文件.
-            .arg(&*new_c_file)
+            .arg(&*new_c2rust_file)
             .arg("-o")
             .arg(&*new_c_file)
             .output()
@@ -681,10 +686,10 @@ impl File {
 
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     pub fn export_c_code(&self, root: &Path) -> Result<String> {
-        Self::generate_c_code(root, &self.node.inner)
+        Self::generate_c_code(root, &self.node.inner, false)
     }
 
-    fn generate_c_code(root: &Path, nodes: &[Node]) -> Result<String> {
+    fn generate_c_code(root: &Path, nodes: &[Node], has_line: bool) -> Result<String> {
         let mut content = String::new();
         let mut last = None;
         for node in nodes {
@@ -698,20 +703,35 @@ impl File {
                     content.push('\n');
                 }
             }
-            if node.kind.has_committed() {
-                continue;
+
+            if has_line {
+                let Some(line) = node.kind.line_info() else {
+                    continue;
+                };
+                content.push_str(&line);
+                content.push('\n');
             }
 
-            let Some(line) = node.kind.line_info() else {
-                continue;
-            };
-            content.push_str(&line);
-            content.push('\n');
-
-            let code = node.kind.c_code(root, &node.inner)?;
+            let mut code = node.kind.c_code(root, &node.inner)?;
             if code.is_empty() {
                 continue;
             }
+
+            if node.kind.has_committed() {
+                // 需要声明
+                let deli = match node.kind {
+                    Kind::FunctionDecl(_) => '{',
+                    Kind::VarDecl(_) => '=',
+                    _ => '\0',
+                };
+                if deli != '\0' {
+                    if let Some(pos) = code.find(deli) {
+                        code.drain(pos..);
+                        code.push(';');
+                    }
+                }
+            }
+
             content.push_str(&code);
             content.push('\n');
 
