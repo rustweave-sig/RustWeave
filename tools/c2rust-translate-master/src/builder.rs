@@ -118,11 +118,12 @@ fn execute_command_in_dir(
     } else {
         None
     };
-    
+
+    let c2rust_dir = project_root.join(".c2rust");
+    let feature_root_path = c2rust_dir.join(feature);
+    let rust_lib_path = feature_root_path.join("rust").join("target").join("debug").join("librust.a");
+
     let feature_root = if let Some(ref lib_path) = hybrid_lib {
-        let c2rust_dir = project_root.join(".c2rust");
-        let feature_root_path = c2rust_dir.join(feature);
-        let rust_lib_path = feature_root_path.join("rust").join("target").join("debug").join("librust.a");
         command.env("LD_PRELOAD", lib_path);
         command.env("C2RUST_PROJECT_ROOT", &project_root);
         command.env("C2RUST_FEATURE_ROOT", &feature_root_path);
@@ -141,6 +142,8 @@ fn execute_command_in_dir(
         if let Some(ref feature_root) = feature_root {
             print!("C2RUST_FEATURE_ROOT={} ", shell_words::quote(&feature_root.display().to_string()));
         }
+        print!("C2RUST_PROJECT_ROOT={} ", shell_words::quote(&project_root.display().to_string()));
+        print!("C2RUST_RUST_LIB={} ", shell_words::quote(&rust_lib_path.display().to_string()));
     }
     // Print the actual command that will be executed (after shell-words parsing)
     println!("{}", shell_words::join(&parts));
