@@ -79,18 +79,26 @@ def filter_model_response(response):
     if final_response.startswith("Rust翻译结果:"):
         final_response = final_response[len("Rust翻译结果:"):].strip()
 
+    # 过滤掉任何地方的```rust和```标记
+    # 移除任何位置的```rust或```开头标记
+    final_response = re.sub(r'```\s*(?:rust|rs)?\s*\n', '', final_response)
+    # 移除任何位置的```结尾标记
+    final_response = re.sub(r'\n\s*```\s*', '\n', final_response)
+    # 移除行内可能存在的```标记
+    final_response = re.sub(r'```\s*', '', final_response)
+
     # 在开头添加 use crate::*\n\n
     if final_response.startswith("use crate::*"):
         return final_response
-    final_response = "use crate::*\n\n" + final_response
+    final_response = "use crate::*;\n\n" + final_response
 
     return final_response
 
 # 使用示例
 if __name__ == "__main__":
     # 示例1：带有```标记和"Rust翻译结果:"前缀的回复
-    example1 = """```
-Rust翻译结果:
+    example1 = """Rust翻译结果:
+```rust
 fn my_function() {
     extern "C" {
         fn printf(format: *const c_char, ...);
