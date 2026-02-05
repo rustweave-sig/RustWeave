@@ -23,6 +23,7 @@ def var_translation(C_var_code, model, openai_instance):
     - 对于C静态变量(static)，翻译结果应该添加static关键字
     - 对于指针类型，使用*mut或*const；对于数组，使用固定大小数组
     - 对于未初始化的变量，使用unsafe {{std::mem::zeroed() }}进行初始化
+    - 对于静态变量的全局变量，必须用Mutex来包装
     - 如果C变量的初始化值是一个表达式，那么翻译结果也应该通过翻译该表达式来赋值，来确保可维护性
     - 如果输入的C变量有注释，那么翻译结果应该将这些注释翻译为与Rust翻译结果对应的注释
     """
@@ -244,6 +245,18 @@ impl Flags {
 
 pub static mut status_flags: Flags = Flags::new();
             """
+        },
+
+        # 测试用例17：静态变量的全局变量
+        {
+            "name": "静态变量的全局变量",
+            "c_code": """
+                static int call_count = 0;
+                """,
+            "explanation": "静态变量的全局变量，Rust应用Mutex包装",
+            "expected": """
+                static CALL_COUNT: LazyLock<Mutex<i32>> = LazyLock::new(|| Mutex::new(0));
+                """
         }
     ]
 

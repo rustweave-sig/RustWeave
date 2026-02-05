@@ -55,7 +55,7 @@ def filter_model_response(response):
     if not final_response.strip():
         return response  # 如果过滤后为空，返回原始内容
 
-    # ====== 新增代码：专门去掉回复中的"Rust翻译结果:"这几个字符 ======
+    # 去掉回复中的"Rust翻译结果:"这几个字符
     # 第一次处理：移除开头的"Rust翻译结果:"（可能前面有空格或换行）
     final_response = re.sub(r'^\s*Rust翻译结果:\s*', '', final_response, count=1)
 
@@ -87,10 +87,19 @@ def filter_model_response(response):
     # 移除行内可能存在的```标记
     final_response = re.sub(r'```\s*', '', final_response)
 
-    # 在开头添加 use crate::*\n\n
-    if final_response.startswith("use crate::*"):
-        return final_response
-    final_response = "use crate::*;\n\n" + final_response
+    # 替换 #[no_mangle] 为 #[unsafe(no_mangle)]
+    final_response = final_response.replace("#[no_mangle]", "#[unsafe(no_mangle)]")
+
+    # use crate::* 处理
+    if final_response.startswith("use crate::*;"):
+        # 情况1：已正确包含分号，保持不变
+        pass
+    elif final_response.startswith("use crate::*"):
+        # 情况2：有 use crate::* 但缺少分号，在其后精确添加一个分号（不添加空格或换行）
+        final_response = "use crate::*;" + final_response[len("use crate::*"):]
+    else:
+        # 情况3：完全缺失 use crate::*，在开头添加完整语句和两个换行
+        final_response = "use crate::*;\n\n" + final_response
 
     return final_response
 
@@ -99,6 +108,9 @@ if __name__ == "__main__":
     # 示例1：带有```标记和"Rust翻译结果:"前缀的回复
     example1 = """Rust翻译结果:
 ```rust
+use crate::*
+
+#[no_mangle]
 fn my_function() {
     extern "C" {
         fn printf(format: *const c_char, ...);
@@ -114,6 +126,9 @@ fn my_function() {
     example2 = """好的，我已经完成了翻译。以下是结果：
 
 Rust翻译结果:
+use crate::*;
+
+#[unsafe(no_mangle)]
 fn calculate_sum(arr: *const i32, len: usize) -> i32 {
     extern "C" {
         fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
