@@ -256,6 +256,9 @@ impl Kind {
         let (beg, end) = name_range(self.loc().unwrap(), self.range().unwrap());
         code.replace_range(beg..end, global_name);
 
+        // 构建工具可能控制缺省可见性，这里需要显示增加
+        code.insert_str(0, "__attribute__((visibility(\"default\"))) ");
+
         let re = regex::Regex::new(r"^static\s|\sstatic\s").map_err(|_| Error::inval())?;
         if let Some(m) = re.find(&code) {
             code.replace_range(m.start()..m.start() + m.len(), " ");
