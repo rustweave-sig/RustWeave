@@ -1,8 +1,11 @@
 # 大模型相关的配置
 [model]
-model = "glm-4.6"
+#model = "glm-4.6"
+#base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+#api_key = "sk-18dca314ef334a719da9edd950b2a0b9"
+model = "qwen3-max"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-api_key = "sk-18dca314ef334a719da9edd950b2a0b9"
+api_key = "sk-a13cfdc30e5b451fb76e2ca96549dcb4"
 temperature = 0
 top_p = 1
 seed = 42
