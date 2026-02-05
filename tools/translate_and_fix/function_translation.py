@@ -11,11 +11,12 @@ def function_translation(C_function_code, model, openai_instance):
     {C_function_code}
 
     输出要求：
-    1. 如果C函数依赖了外部C函数，必须在Rust代码中使用unsafe extern块声明这些外部函数
-    2. 在调用外部C函数时，必须使用unsafe块包裹
-    3. 确保类型转换正确，特别是指针和字符串处理
-    4. 最终输出一个完整的、可编译的Rust函数，包含所有必要的FFI声明
-    5. 所有函数必须使用 #[unsafe(no_mangle)] 属性和 unsafe extern "C" ABI
+    1. 所有函数必须使用 #[unsafe(no_mangle)] 属性和 unsafe extern "C" ABI
+    2. 所有类型都通过use crate::*引用，不要重复定义，且名字和C类型名字完全相同
+    3. 如果C函数依赖了外部C函数，必须在Rust代码中使用unsafe extern块声明这些外部函数
+    4. 在调用外部C函数时，必须使用unsafe块包裹
+    5. 确保类型转换正确，特别是指针和字符串处理
+    6. 你的环境不完整，无需编译验证，而是交给我来编译
 
     输出格式：
     Rust翻译结果:
@@ -35,8 +36,9 @@ def function_translation(C_function_code, model, openai_instance):
     }}
 
     注意：
-    - 严格按输出格式输出，无需其他任何内容
+    - 严格按输出格式输出，无需其他任何内容，你的环境不完整，不要进行编译验证
     - 如果没有外部依赖，只输出纯Rust实现的函数，但仍需使用 #[unsafe(no_mangle)] 和 unsafe extern "C"
+    - 所有类型都从crate::*引用，不要重复定义
     - 如果使用了Rust库的任何内容，必须添加与之相关的导入语句
     - 使用标准的Rust FFI实践，如必要的use语句（如std::os::raw::*）
     - 函数签名必须使用#[unsafe(no_mangle)]和unsafe extern "C"以保持C ABI兼容性
