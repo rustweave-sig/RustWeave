@@ -148,7 +148,7 @@ static void link_rust_lib(int argc, char* argv[]) {
         }
 
         const char* ld_target = getenv(C2RUST_LD_TARGET);
-        if (ld_target && strcmp(ld_target, target) != 0) {
+        if (ld_target && (!target || strcmp(ld_target, target) != 0)) {
                 // 如果设置了C2RUST_LD_TARGET环境变量，必须匹配上才链接Rust静态库.
                 return;
         }
