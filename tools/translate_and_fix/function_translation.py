@@ -47,6 +47,7 @@ def function_translation(C_function_code, model, openai_instance):
     - 确保C函数与翻译后的Rust函数的名称是完全一致的（特别注意大小写）
     - 确保代码格式正确，包括缩进和括号匹配
     - 确保Rust翻译结果中的各参数与变量的类型是正确的（可通过Rust编译的），并且是与C函数中各参数与变量的类型是对应的
+    - C的 struct.member_function(args) 应该翻译为 Rust 的 struct.member_function.unwrap()(args). 特别注意函数指针通常包装在 Option 中，需要 .unwrap() 来解包. 同样的规则适用于所有结构体成员函数指针的调用
     """
 
     # 调用大模型
