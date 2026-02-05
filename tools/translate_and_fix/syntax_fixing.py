@@ -34,6 +34,7 @@ def syntax_fixing(rust_code, error_message, model, openai_instance):
     - 对于输入的Rust函数，你的修复结果必须使用 #[unsafe(no_mangle)] 属性和 pub unsafe extern "C" fn
     - 保持原有的函数逻辑不变，只修复语法错误
     - 对于Rust函数用到的任何外部函数与定义，除了报错信息中明确提到没有找到的符号以外，你都可以认为是已经正确导入了的，无需添加导入语句；但对于报错信息中明确提到的没有找到的符号，则需要在修复结果中添加导入语句，这些导入语句单独写在必须在函数外（应在函数后面），并必须用unsafe extern "C" {{ }} 块包裹
+    - 输出的Rust代码必须符合Rust 1.89版本要求
     """
 
     # 调用大模型
