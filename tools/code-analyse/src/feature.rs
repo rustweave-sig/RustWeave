@@ -268,12 +268,7 @@ impl Feature {
     }
 
     fn create_file_mod(&self, file: &File) -> Result<String> {
-        let file_path = file.path();
-        let rel_path = file_path
-            .strip_prefix(&self.prefix)
-            .unwrap()
-            .with_extension("");
-        let mod_name = rel_path.display().to_string().replace("/", "_");
+        let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
         let mod_dir = self.root.join("rust/src").join(&mod_name);
         fs::create_dir_all(&mod_dir).to_err()?;
 
@@ -410,7 +405,7 @@ impl Feature {
             .strip_prefix(prefix)
             .map_err(|_| Error::general())?
             .with_extension("");
-        Ok(rel_path.display().to_string().replace("/", "_"))
+        Ok("mod_".to_string() + &rel_path.display().to_string().replace("/", "_"))
     }
 
     // 合并单个File对应的Rust文件
