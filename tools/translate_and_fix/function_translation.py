@@ -16,7 +16,7 @@ def function_translation(C_function_code, model, openai_instance):
     3. 如果C函数依赖了外部C函数，必须通过use crate::引用，不要在extern "C"中去声明
     4. 在调用外部C函数时，必须使用unsafe块包裹
     5. 确保类型转换正确，特别是指针和字符串处理
-    6. C的基本数据类型都对应::std::os::raw中的类型定义，不要使用libc定义的类型
+    6. C的基本数据类型优先使用::std::os::raw中已定义类型，不要使用libc定义的类型, 其中size_t对应usize, isize_t对应isize
     7. 函数内部的静态变量都包装到std::sync::Mutex中
     8. 你的环境不完整，无需编译验证，而是交给我来编译
 
