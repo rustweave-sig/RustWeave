@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 
 /// Main translation workflow for a feature
-pub fn translate_feature(feature: &str, allow_all: bool) -> Result<()> {
+pub fn translate_feature(feature: &str, allow_all: bool, max_fix_attempts: usize, show_full_output: bool) -> Result<()> {
     let msg = format!("Starting translation for feature: {}", feature);
     println!("{}", msg.bright_cyan().bold());
     logger::log_message(&msg);
@@ -82,7 +82,7 @@ pub fn translate_feature(feature: &str, allow_all: bool) -> Result<()> {
     loop {
         // Step 2.1: Try to build first
         println!("\n{}", "Building project...".bright_blue().bold());
-        match builder::cargo_build(feature) {
+        match builder::cargo_build(feature, show_full_output) {
             Ok(_) => {
                 println!("{}", "✓ Build successful!".bright_green().bold());
             }
@@ -164,7 +164,7 @@ pub fn translate_feature(feature: &str, allow_all: bool) -> Result<()> {
             );
             logger::log_message(&progress_msg);
             
-            process_rs_file(feature, rs_file, file_name, current_position, total_count)?;
+            process_rs_file(feature, rs_file, file_name, current_position, total_count, max_fix_attempts, show_full_output)?;
             
             // Mark file as processed and save progress
             progress_state.mark_processed(rs_file, &rust_dir)?;
@@ -176,7 +176,7 @@ pub fn translate_feature(feature: &str, allow_all: bool) -> Result<()> {
 }
 
 /// Process a single .rs file through the translation workflow
-fn process_rs_file(feature: &str, rs_file: &std::path::Path, file_name: &str, current_position: usize, total_count: usize) -> Result<()> {
+fn process_rs_file(feature: &str, rs_file: &std::path::Path, file_name: &str, current_position: usize, total_count: usize, max_fix_attempts: usize, show_full_output: bool) -> Result<()> {
     use constants::MAX_TRANSLATION_ATTEMPTS;
     
     for attempt_number in 1..=MAX_TRANSLATION_ATTEMPTS {
@@ -192,7 +192,7 @@ fn process_rs_file(feature: &str, rs_file: &std::path::Path, file_name: &str, cu
         };
         
         // Translate C to Rust
-        translate_file(feature, file_type, rs_file, &format_progress)?;
+        translate_file(feature, file_type, rs_file, &format_progress, show_full_output)?;
         
         // Build and fix errors
         let build_successful = build_and_fix_loop(
@@ -202,7 +202,9 @@ fn process_rs_file(feature: &str, rs_file: &std::path::Path, file_name: &str, cu
             file_name, 
             &format_progress,
             is_last_attempt,
-            attempt_number
+            attempt_number,
+            max_fix_attempts,
+            show_full_output
         )?;
         
         if build_successful {
@@ -261,7 +263,7 @@ fn check_c_file_exists(rs_file: &std::path::Path) -> Result<()> {
 }
 
 /// Translate C file to Rust
-fn translate_file<F>(feature: &str, file_type: &str, rs_file: &std::path::Path, format_progress: &F) -> Result<()> 
+fn translate_file<F>(feature: &str, file_type: &str, rs_file: &std::path::Path, format_progress: &F, show_full_output: bool) -> Result<()> 
 where
     F: Fn(&str) -> String
 {
@@ -272,7 +274,7 @@ where
     println!("│");
     println!("│ {}", format_progress("Translation").bright_magenta().bold());
     println!("│ {}", format!("Translating {} to Rust...", file_type).bright_blue().bold());
-    translator::translate_c_to_rust(feature, file_type, &c_file, rs_file)?;
+    translator::translate_c_to_rust(feature, file_type, &c_file, rs_file, show_full_output)?;
 
     let metadata = fs::metadata(rs_file)?;
     if metadata.len() == 0 {
@@ -292,33 +294,35 @@ fn build_and_fix_loop<F>(
     format_progress: &F,
     is_last_attempt: bool,
     attempt_number: usize,
+    max_fix_attempts: usize,
+    show_full_output: bool,
 ) -> Result<bool>
 where
     F: Fn(&str) -> String
 {
-    use constants::MAX_FIX_ATTEMPTS;
     
-    for attempt in 1..=MAX_FIX_ATTEMPTS {
+    for attempt in 1..=max_fix_attempts {
         println!("│");
         println!("│ {}", format_progress("Build").bright_magenta().bold());
-        println!("│ {}", format!("Building Rust project (attempt {}/{})", attempt, MAX_FIX_ATTEMPTS).bright_blue().bold());
+        println!("│ {}", format!("Building Rust project (attempt {}/{})", attempt, max_fix_attempts).bright_blue().bold());
         
-        match builder::cargo_build(feature) {
+        match builder::cargo_build(feature, show_full_output) {
             Ok(_) => {
                 println!("│ {}", "✓ Build successful!".bright_green().bold());
                 return Ok(true);
             }
             Err(build_error) => {
-                if attempt == MAX_FIX_ATTEMPTS {
+                if attempt == max_fix_attempts {
                     return handle_max_fix_attempts_reached(
                         build_error,
                         file_name,
                         rs_file,
                         is_last_attempt,
-                        attempt_number
+                        attempt_number,
+                        max_fix_attempts
                     );
                 } else {
-                    apply_error_fix(feature, file_type, rs_file, &build_error, format_progress)?;
+                    apply_error_fix(feature, file_type, rs_file, &build_error, format_progress, show_full_output)?;
                 }
             }
         }
@@ -334,48 +338,54 @@ fn handle_max_fix_attempts_reached(
     rs_file: &std::path::Path,
     is_last_attempt: bool,
     attempt_number: usize,
+    max_fix_attempts: usize,
 ) -> Result<bool> {
     use std::io::{self, Write};
-    use constants::{MAX_FIX_ATTEMPTS, MAX_TRANSLATION_ATTEMPTS};
+    use constants::MAX_TRANSLATION_ATTEMPTS;
     
     println!("│");
     println!("│ {}", "⚠ Maximum fix attempts reached!".red().bold());
-    println!("│ {}", format!("File {} still has build errors after {} fix attempts.", file_name, MAX_FIX_ATTEMPTS).yellow());
+    println!("│ {}", format!("File {} still has build errors after {} fix attempts.", file_name, max_fix_attempts).yellow());
     println!("│");
     
     if !is_last_attempt {
         let remaining_retries = MAX_TRANSLATION_ATTEMPTS - attempt_number;
         println!("│ {}", format!("Do you want to retry translating this file from scratch? ({} retries remaining)", remaining_retries).bright_yellow());
         println!("│ {} Type 'retry' to retry, or press Enter to skip:", "→".bright_yellow());
-        print!("│ ");
-        io::stdout().flush()?;
         
-        let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
-        
-        let input_trimmed = user_input.trim();
-        if input_trimmed.eq_ignore_ascii_case("retry") {
-            println!("│ {}", "Retrying translation...".bright_cyan());
-            println!("│ {}", "Note: The translator will overwrite the existing file content.".bright_blue());
-            println!("│ {}", "✓ Retry scheduled".bright_green());
-            Ok(false) // Signal retry
-        } else {
-            if !input_trimmed.is_empty() {
-                println!("│ {}", format!("Invalid input '{}'. Only 'retry' will retry the translation.", input_trimmed).yellow());
+        loop {
+            print!("│ ");
+            io::stdout().flush()?;
+            
+            let mut user_input = String::new();
+            io::stdin().read_line(&mut user_input)?;
+            
+            let input_trimmed = user_input.trim();
+            if input_trimmed.eq_ignore_ascii_case("retry") {
+                println!("│ {}", "Retrying translation...".bright_cyan());
+                println!("│ {}", "Note: The translator will overwrite the existing file content.".bright_blue());
+                println!("│ {}", "✓ Retry scheduled".bright_green());
+                return Ok(false); // Signal retry
+            } else if input_trimmed.is_empty() {
+                // User pressed Enter to skip
+                println!("│ {}", "Skipping file due to build errors.".yellow());
+                return Err(build_error).context(format!(
+                    "Build failed after {} fix attempts for file {}",
+                    max_fix_attempts,
+                    rs_file.display()
+                ));
+            } else {
+                // Invalid input, prompt user to try again
+                println!("│ {}", format!("Invalid input '{}'. Please type 'retry' to retry, or press Enter to skip.", input_trimmed).yellow());
+                continue;
             }
-            println!("│ {}", "Skipping file due to build errors.".yellow());
-            Err(build_error).context(format!(
-                "Build failed after {} fix attempts for file {}",
-                MAX_FIX_ATTEMPTS,
-                rs_file.display()
-            ))
         }
     } else {
         let total_retries = MAX_TRANSLATION_ATTEMPTS - 1;
         println!("│ {}", format!("All {} attempts exhausted (1 initial + {} retries). Cannot retry further.", MAX_TRANSLATION_ATTEMPTS, total_retries).red());
         Err(build_error).context(format!(
             "Build failed after {} fix attempts and {} retries for file {}",
-            MAX_FIX_ATTEMPTS,
+            max_fix_attempts,
             total_retries,
             rs_file.display()
         ))
@@ -389,6 +399,7 @@ fn apply_error_fix<F>(
     rs_file: &std::path::Path,
     build_error: &anyhow::Error,
     format_progress: &F,
+    show_full_output: bool,
 ) -> Result<()>
 where
     F: Fn(&str) -> String
@@ -398,7 +409,7 @@ where
     println!("│ {}", "⚠ Build failed, attempting to fix errors...".yellow().bold());
     println!("│");
     println!("│ {}", format_progress("Fix").bright_magenta().bold());
-    translator::fix_translation_error(feature, file_type, rs_file, &build_error.to_string())?;
+    translator::fix_translation_error(feature, file_type, rs_file, &build_error.to_string(), show_full_output)?;
 
     let metadata = fs::metadata(rs_file)?;
     if metadata.len() == 0 {
