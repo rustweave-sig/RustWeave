@@ -135,17 +135,28 @@ static void link_rust_lib(int argc, char* argv[]) {
         char* rust_lib = getenv(C2RUST_RUST_LIB);
         if (!rust_lib) return;
 
-	int is_shared = 0;
-        char* new_argv[argc + 2];
+	    int is_shared = 0;
+        int pos = 0;
+        char* new_argv[argc + 4];
+        // 静态库加到任何一个动态库之前，否则其中依赖外部动态库的符号可能找不到.
         for (int i = 0; i < argc; ++i) {
-	    new_argv[i] = argv[i];
-	    if (strcmp(argv[i], "-shared") == 0) is_shared = 1;
+	        if (strcmp(argv[i], "-shared") == 0) is_shared = 1;
+            if (pos == i && strncmp(argv[i], "-l", 2) == 0) {
+                    new_argv[pos++] = rust_lib;
+                    new_argv[pos++] = "-lpthread"; //rust可能带入
+                    new_argv[pos++] = "-ldl"; //rust可能带入
+            }
+	        new_argv[pos++] = argv[i];
         }
-	if (!is_shared) return;
+	    if (!is_shared) return;
 
 	//dprintf(2, "link_rust_lib: %s lib = %s, target %s \n",  argv[0], rust_lib, target);
-        new_argv[argc] = rust_lib;
-        new_argv[argc + 1] = 0;
+        if (pos == argc) {
+            new_argv[pos++] = rust_lib;
+            new_argv[pos++] = "-lpthread"; //rust可能带入
+            new_argv[pos++] = "-ldl"; //rust可能带入
+        }
+        new_argv[pos++] = 0;
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
         execvp(new_argv[0], new_argv);
