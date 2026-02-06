@@ -136,7 +136,7 @@ static void link_rust_lib(int argc, char* argv[]) {
         if (!rust_lib) return;
 
 	int is_shared = 0;
-        char* new_argv[argc + 4];
+        char* new_argv[argc + 2];
         for (int i = 0; i < argc; ++i) {
 	    new_argv[i] = argv[i];
 	    if (strcmp(argv[i], "-shared") == 0) is_shared = 1;
@@ -144,10 +144,8 @@ static void link_rust_lib(int argc, char* argv[]) {
 	if (!is_shared) return;
 
 	//dprintf(2, "link_rust_lib: %s lib = %s, target %s \n",  argv[0], rust_lib, target);
-        new_argv[argc] = "--whole-archive",
-        new_argv[argc + 1] = rust_lib;
-        new_argv[argc + 2] = "--no-whole-archive",
-        new_argv[argc + 3] = 0;
+        new_argv[argc] = rust_lib;
+        new_argv[argc + 1] = 0;
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
         execvp(new_argv[0], new_argv);
