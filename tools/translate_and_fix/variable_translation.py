@@ -10,6 +10,11 @@ def var_translation(C_var_code, model, openai_instance):
     输入的C全局变量：
     {C_var_code}
 
+    输出要求：
+    1. 所有变量必须使用 #[unsafe(no_mangle)] 属性
+    2. 所有变量可见性必须是pub
+    2. 所有依赖的类型，变量和函数都通过use crate::*引用，不要重复定义，且名字和C中名字完全相同
+
     输出格式：
     Rust翻译结果:
     // 在这里写出翻译出的Rust全局变量

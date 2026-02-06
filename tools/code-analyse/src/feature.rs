@@ -393,22 +393,21 @@ impl Feature {
         let output = Command::new("bindgen")
             .current_dir(&self.root)
             .arg("rust/src/types.h")
-            //.arg("-o")
-            //.arg("rust/src/types.rs")
+            .arg("-o")
+            .arg("rust/src/types.rs")
             .arg("--no-layout-tests")
             .arg("--default-enum-style")
             .arg("consts")
             .arg("--no-prepend-enum-name")
             .arg("--disable-nested-struct-naming")
+            .arg("--")
+            .arg("-fno-builtin")
             .output()
             .log_err("bindgen")?;
         if !output.status.success() {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return Err(Error::last());
         }
-
-        let content = String::from_utf8_lossy(&output.stdout).replace("::std::os::raw::c_ulong", "usize");
-        fs::write(self.root.join("rust/src/types.rs"), content).to_err()?;
         Ok(())
     }
 
