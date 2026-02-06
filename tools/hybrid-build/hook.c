@@ -25,7 +25,6 @@ static const char* C2RUST_FEATURE_ROOT = "C2RUST_FEATURE_ROOT";
 static const char* C2RUST_RUST_LIB = "C2RUST_RUST_LIB";
 static const char* C2RUST_CC = "C2RUST_CC";
 static const char* C2RUST_LD = "C2RUST_LD";
-static const char* C2RUST_LD_TARGET = "C2RUST_LD_TARGET";
 
 static const char* cc_names[] = {"gcc", "clang", "cc"};
 static const char* ld_names[] = {"ld", "lld"};
@@ -136,26 +135,19 @@ static void link_rust_lib(int argc, char* argv[]) {
         char* rust_lib = getenv(C2RUST_RUST_LIB);
         if (!rust_lib) return;
 
-        char* new_argv[argc + 2];
-        char* target = 0;
+	int is_shared = 0;
+        char* new_argv[argc + 4];
         for (int i = 0; i < argc; ++i) {
 	    new_argv[i] = argv[i];
-            if (strcmp(argv[i], "-o") == 0) {
-                if (i < argc - 1) {
-                    target = argv[i + 1];
-                }
-            }
+	    if (strcmp(argv[i], "-shared") == 0) is_shared = 1;
         }
-
-        const char* ld_target = getenv(C2RUST_LD_TARGET);
-        if (ld_target && (!target || strcmp(ld_target, target) != 0)) {
-                // 如果设置了C2RUST_LD_TARGET环境变量，必须匹配上才链接Rust静态库.
-                return;
-        }
+	if (!is_shared) return;
 
 	//dprintf(2, "link_rust_lib: %s lib = %s, target %s \n",  argv[0], rust_lib, target);
-        new_argv[argc] = rust_lib;
-        new_argv[argc + 1] = 0;
+        new_argv[argc] = "--whole-archive",
+        new_argv[argc + 1] = rust_lib;
+        new_argv[argc + 2] = "--no-whole-archive",
+        new_argv[argc + 3] = 0;
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
         execvp(new_argv[0], new_argv);
