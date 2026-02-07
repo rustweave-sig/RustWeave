@@ -5,52 +5,33 @@ from LLM_calling import load_LLM_config, init_openai_instance
 def function_translation(C_function_code, model, openai_instance):
     # 构建 prompt - 已修改输出格式要求
     prompt = f"""
-    你是一个代码翻译专家，请将以下的C函数翻译为Rust函数。在翻译过程中，如果识别到C函数依赖了外部C库函数和变量（包括C标准库、第三方库或项目自定义的函数和变量），请自动生成相应的FFI（Foreign Function Interface）调用代码，并将这些FFI声明与Rust函数代码整合在一起输出。
+    你是一个Rust语言专家，同时也是C语言专家. 请将以下包含一个或者多个C语言函数或者是C语言全局变量的定义, 请将其转换为安全,高效，符合Rust惯用用法的Rust代码.
+    输入只是C语言代码片段，因此转换后的Rust代码也是一个片段，不能进行编译验证，转换后的代码只能由我执行编译,且我的编译器版本和你的环境不同.
+    你必须严格遵循以下转换策略，才能保证转换后代码的正确性.
 
     输入的C函数：
     {C_function_code}
 
-    输出要求：
-    1. 所有函数必须使用 #[unsafe(no_mangle)] 属性和 unsafe extern "C" ABI
-    2. 所有类型都通过use crate::*引用，不要重复定义，且名字和C类型名字完全相同
-    3. 如果C函数依赖了外部C函数，必须通过use crate::引用，不要在extern "C"中去声明
-    4. 在调用外部C函数时，必须使用unsafe块包裹
-    5. 确保类型转换正确，特别是指针和字符串处理
-    6. C的基本数据类型优先使用::std::os::raw中已定义类型，不要使用libc定义的类型, 其中size_t对应usize, isize_t对应isize
-    7. 函数内部的静态变量都包装到std::sync::Mutex中
-    8. 使用Rust的宏需要遵循宏的卫生性要求，外部变量必须通过宏参数传递，在宏的内部无法直接访问外部资源 
-    8. 你的环境不完整，无需编译验证，而是交给我来编译
-
-    输出格式：
-    Rust翻译结果:
-    // FFI声明（如果有）
-    unsafe extern "C" {{
-        // 外部C库函数和变量
-    }}
-
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn your_function_name() {{
-        ...
-        
-        // 如果需要调用外部函数，应按如下格式调用
-        unsafe {{
-            let result = external_c_function(ptr);
-        }}
-    }}
-
-    注意：
-    - 严格按输出格式输出，无需其他任何内容，你的环境不完整，不要进行编译验证
-    - 如果没有外部依赖，只输出纯Rust实现的函数，但仍需使用 #[unsafe(no_mangle)] 和 unsafe extern "C"
-    - 所有类型都从crate::*引用，不要重复定义
-    - 如果使用了Rust库的任何内容，必须添加与之相关的导入语句
-    - 使用标准的Rust FFI实践，如必要的use语句（如std::os::raw::*）
-    - 函数签名必须使用#[unsafe(no_mangle)]和unsafe extern "C"以保持C ABI兼容性
-    - 对于C标准库函数，使用std::os::raw::*中的类型
-    - Rust翻译结果中，对于裸指针的任何操作，都必须在unsafe块中进行
-    - 确保C函数与翻译后的Rust函数的名称是完全一致的（特别注意大小写）
-    - 确保代码格式正确，包括缩进和括号匹配
-    - 确保Rust翻译结果中的各参数与变量的类型是正确的（可通过Rust编译的），并且是与C函数中各参数与变量的类型是对应的
-    - C的 struct.member_function(args) 应该翻译为 Rust 的 struct.member_function.unwrap()(args). 特别注意函数指针通常包装在 Option 中，需要 .unwrap() 来解包. 同样的规则适用于所有结构体成员函数指针的调用
+    ## 转换策略
+    - C语言中的size_t对应到Rust的usize, C语言的isize_t对应到Rust的isize.
+    - C语言中的基本数据类型都对应到::core::os::raw下的定义
+    - C语言中的类型，变量和函数必须转换为Rust中同名的类型，变量和函数, 他们一一对应.
+    - C语言中的函数和全局变量转换后必须添加#[unsafe(no_mangle)]属性，且可见性为pub.
+    - C语言中的函数转换后的Rust函数必须是unsafe, 且ABI为extern "C".
+    - C函数内部的静态变量如果只读，可以直接按照常量初始化.
+    - C函数内部的静态变量如果写入的都是同样的常量，可以直接按照常量初始化.
+    - C函数内部的静态变量如果只会写入一次, 或者每次都写入相同的内容，可以用std::sync::OnceLock来包装.
+    - C函数内部的静态变量如果每次写入不同，可以用std::sync::Mutex来包装.
+    - C函数中出现但未看到具体定义以及声明的类型，变量，常量和函数，都需要从crate引入,比如crate::<函数>形式引入, 绝对不可以自己定义或者声明.
+    - C语言中调用函数语句转换后必须单独包含在unsafe语句块.
+    - C语言中的函数指针类型总是对应到Rust中用Option包装的函数指针.
+    - 不要引入任何外部crate，包括libc crate.
+    - 不要在全局空间增加任何函数，变量，常量，类型等C代码中没有的内容.
+    - Rust代码可新生成宏或者函数保证可重用的代码，他们都必须定义在C函数对应的Rust函数内部.
+    - 如果使用了Rust的声明宏, 必须保证声明宏内部访问的变量都应该应该宏参数传递，因为在宏内部无法直接访问宏外部的变量.
+    - 对于C语言中的指针，尽可能在判断非空后转换为引用类型进行操作.
+    - 对于C语言中的指针数据，如果C语言中没有进行非空判断就进行解引用操作，则Rust中可以转换为引用类型.
+    - 对于C语言中的函数指针，如果C语言中没有进行非空判断就执行函数调用，则Rust中可以直接调用Option的unwrap操作获取函数指针进行调用.
     """
 
     # 调用大模型
