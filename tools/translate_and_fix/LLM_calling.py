@@ -1,6 +1,9 @@
 import openai
 import httpx
-import toml
+try:
+    import tomllib  # Python 3.11+ 可用
+except ImportError:
+    import tomli as tomllib
 import os
 
 class LLM_config:
@@ -20,6 +23,20 @@ class LLM_config:
                 f"top_p={self.top_p}, seed={self.seed}, max_retries={self.max_retries}, "
                 f"timeout={self.timeout})")
 
+def clean_toml_file(file_path):
+    """清除 TOML 文件中的 BOM 和零宽字符"""
+    with open(file_path, 'r', encoding='utf-8-sig') as f:  # 自动去除 BOM
+        content = f.read()
+
+    # 移除零宽字符（U+200B, U+200C, U+200D, U+FEFF）
+    content = content.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '')
+
+    # 修复值末尾多余空格（可选但推荐）
+    import re
+    content = re.sub(r'=\s*"([^"]*)\s+"', r'="\1"', content)  # 移除引号内末尾空格
+
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(content)
 
 def load_LLM_config(file_path):
     """
@@ -33,18 +50,27 @@ def load_LLM_config(file_path):
 
     Raises:
         FileNotFoundError: 如果文件不存在
-        toml.TomlDecodeError: 如果TOML格式解析失败
+        tomlib.TOMLDecodeError: 如果TOML格式解析失败
         KeyError: 如果缺少必要的配置项
     """
     # 检查文件是否存在
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"配置文件不存在: {file_path}")
 
+    # 清理toml文件中可能存在的非法字符（不清理会导致后续读取与解析失败）
+    try:
+        clean_toml_file(file_path)
+    except Exception as e:
+        raise RuntimeError(f"清理{file_path}中的非法字符报错: {e}") from e
+
     try:
         # 读取并解析TOML文件
-        with open(file_path, 'r', encoding='utf-8') as f:
-            config_data = toml.load(f)
+        with open(file_path, 'rb') as f:
+            config_data = tomllib.load(f)
+    except Exception as e:
+        raise RuntimeError(f"读取配置文件时出错: {e}") from e
 
+    try:
         # 检查是否存在model配置段
         if 'model' not in config_data:
             raise KeyError("配置文件中缺少[model]字段")
@@ -63,12 +89,6 @@ def load_LLM_config(file_path):
         max_retries = int(model_config.get('max_retries', 10))
         timeout = int(model_config.get('timeout', 500))
 
-        # 检查必要配置项是否缺失
-        required_fields = ['model', 'base_url', 'api_key']
-        missing_fields = [field for field in required_fields if not locals()[field]]
-        if missing_fields:
-            raise KeyError(f"缺少必要的配置项: {', '.join(missing_fields)}")
-
         # 创建并返回LLM_config对象
         return LLM_config(
             model=model,
@@ -81,10 +101,8 @@ def load_LLM_config(file_path):
             timeout=timeout
         )
 
-    except toml.TomlDecodeError as e:
-        raise ValueError(f"TOML文件格式错误: {e}") from e
     except Exception as e:
-        raise RuntimeError(f"读取配置文件时出错: {e}") from e
+        raise RuntimeError(f"解析配置文件时出错: {e}") from e
 
 # return a new openai instance
 def init_openai_instance(LLM_config):
