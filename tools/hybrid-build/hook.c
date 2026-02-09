@@ -140,24 +140,26 @@ out:
 static void link_rust_lib_if_shared(int argc, char* argv[], char* rust_lib) {
 	    int is_shared = 0;
         int pos = 0;
-        char* new_argv[argc + 4];
+        char* new_argv[argc + 6];
         // 静态库加到任何一个动态库之前，否则其中依赖外部动态库的符号可能找不到.
         for (int i = 0; i < argc; ++i) {
 	        if (strcmp(argv[i], "-shared") == 0) is_shared = 1;
             if (pos == i && strncmp(argv[i], "-l", 2) == 0) {
+                    new_argv[pos++] = "--whole-archive";
                     new_argv[pos++] = rust_lib;
-                    new_argv[pos++] = "-lpthread"; //rust可能带入
-                    new_argv[pos++] = "-ldl"; //rust可能带入
+                    new_argv[pos++] = "--no-whole-archive";
             }
 	        new_argv[pos++] = argv[i];
         }
 	    if (!is_shared) return;
 
         if (pos == argc) {
+            new_argv[pos++] = "--whole-archive";
             new_argv[pos++] = rust_lib;
-            new_argv[pos++] = "-lpthread"; //rust可能带入
-            new_argv[pos++] = "-ldl"; //rust可能带入
+            new_argv[pos++] = "--no-whole-archive";
         }
+        new_argv[pos++] = "-lpthread"; //rust可能带入
+        new_argv[pos++] = "-ldl"; //rust可能带入
         new_argv[pos++] = 0;
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
@@ -175,17 +177,19 @@ static inline int match_target(const char* arg, const char* target_lib) {
  // 和目标静态库始终一起被链接
 static void link_rust_lib_with_static(int argc, char* argv[], char* rust_lib, const char* target_lib) {
         int pos = 0;
-        char* new_argv[argc + 4];
+        char* new_argv[argc + 6];
         for (int i = 0; i < argc; ++i) {
 	        new_argv[pos++] = argv[i];
             if ((pos == i + 1) && match_target(argv[i], target_lib)) {
+                new_argv[pos++] = "--whole-archive";
                 new_argv[pos++] = rust_lib;
-                new_argv[pos++] = "-lpthread"; //rust可能带入
-                new_argv[pos++] = "-ldl"; //rust可能带入
+                new_argv[pos++] = "--no-whole-archive";
             }
         }
         if (pos == argc) return;
 
+        new_argv[pos++] = "-lpthread"; //rust可能带入
+        new_argv[pos++] = "-ldl"; //rust可能带入
         new_argv[pos++] = 0;
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
@@ -196,12 +200,12 @@ static void link_rust_lib_with_static(int argc, char* argv[], char* rust_lib, co
 static void link_rust_lib_with_target(int argc, char* argv[], char* rust_lib, const char* target) {
         int pos = 0;
         int is_the_target = 0;
-        char* new_argv[argc + 4];
+        char* new_argv[argc + 6];
         for (int i = 0; i < argc; ++i) {
             if (pos == i && strncmp(argv[i], "-l", 2) == 0) {
+                new_argv[pos++] = "--whole-archive";
                 new_argv[pos++] = rust_lib;
-                new_argv[pos++] = "-lpthread"; //rust可能带入
-                new_argv[pos++] = "-ldl"; //rust可能带入
+                new_argv[pos++] = "--no-whole-archive";
             }
 	        new_argv[pos++] = argv[i];
             if (strcmp(argv[i], "-o") == 0) {
@@ -210,10 +214,12 @@ static void link_rust_lib_with_target(int argc, char* argv[], char* rust_lib, co
         }
         if (!is_the_target) return;
         if (pos == argc) {
+            new_argv[pos++] = "--whole-archive";
             new_argv[pos++] = rust_lib;
-            new_argv[pos++] = "-lpthread"; //rust可能带入
-            new_argv[pos++] = "-ldl"; //rust可能带入
+            new_argv[pos++] = "--no-whole-archive";
         }
+        new_argv[pos++] = "-lpthread"; //rust可能带入
+        new_argv[pos++] = "-ldl"; //rust可能带入
         new_argv[pos++] = 0;
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
