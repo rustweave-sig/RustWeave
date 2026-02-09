@@ -169,16 +169,16 @@ static inline const char* get_file(const char* arg) {
     return deli ? (deli + 1) : arg;
 }
 
-static inline int match_static_lib(const char* arg, const char* target_lib) {
+static inline int match_target(const char* arg, const char* target_lib) {
     return strcmp(get_file(arg), target_lib) == 0;
 }
- // 和目标静态库始终一起被链接, 后缀匹配
+ // 和目标静态库始终一起被链接
 static void link_rust_lib_with_static(int argc, char* argv[], char* rust_lib, const char* target_lib) {
         int pos = 0;
         char* new_argv[argc + 4];
         for (int i = 0; i < argc; ++i) {
 	        new_argv[pos++] = argv[i];
-            if ((pos == i + 1) && match_static_lib(argv[i], target_lib)) {
+            if ((pos == i + 1) && match_target(argv[i], target_lib)) {
                 new_argv[pos++] = rust_lib;
                 new_argv[pos++] = "-lpthread"; //rust可能带入
                 new_argv[pos++] = "-ldl"; //rust可能带入
@@ -190,12 +190,6 @@ static void link_rust_lib_with_static(int argc, char* argv[], char* rust_lib, co
         // 避免重复进入此流程.
         unsetenv(C2RUST_RUST_LIB);
         execvp(new_argv[0], new_argv);
-}
-
-static inline int match_target(const char* arg, const char* target) {
-    const char* file = get_file(arg);
-    int len = strlen(target);
-    return strncmp(file, target, len) == 0; 
 }
 
 // 只有构建指定目标才链接rust静态库
