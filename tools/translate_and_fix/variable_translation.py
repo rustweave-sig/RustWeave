@@ -2,46 +2,51 @@ from LLM_calling import call_llm_api
 from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
 
-def var_translation(C_var_code, model, openai_instance):
-    # 构建 prompt
-    prompt = f"""
-    你是一个代码翻译专家，请将以下的C全局变量翻译为Rust全局变量。
-
-    输入的C全局变量：
-    {C_var_code}
-
-    输出要求：
-    1. 所有变量必须使用 #[unsafe(no_mangle)] 属性
-    2. 所有变量可见性必须是pub
-    2. 所有依赖的类型，变量和函数都通过use crate::*引用，不要重复定义，且名字和C中名字完全相同
-
-    输出格式：
-    Rust翻译结果:
-    // 在这里写出翻译出的Rust全局变量
-
-    注意：
-    - 严格按输出格式输出，无需其他任何内容
-    - 初始化依赖的外部符号都从crate::*引入
-    - C的基本数据类型优先使用::std::os::raw中已定义类型，不要使用libc定义的类型, 其中size_t对应usize, isize_t对应isize
-    - 函数内部的静态变量都包装到std::sync::Mutex中
-    - 确保C全局变量与翻译后的Rust全局变量的名称是完全一致的（特别注意大小写）
-    - 确保Rust全局变量的类型是正确的（可通过Rust编译的），并且是与C全局变量的类型是对应的
-    - 确保Rust全局变量添加了pub关键字，但是对于C静态变量(static)，翻译结果不应添加pub关键字
-    - 如果C全局变量有const关键字，那么翻译结果也应添加const关键字；否则，翻译结果应添加mut关键字
-    - 对于C静态变量(static)，翻译结果应该添加static关键字
-    - 对于指针类型，使用*mut或*const；对于数组，使用固定大小数组
-    - 对于未初始化的变量，使用unsafe {{std::mem::zeroed() }}进行初始化
-    - 对于静态变量的全局变量，必须用Mutex来包装
-    - 如果C变量的初始化值是一个表达式，那么翻译结果也应该通过翻译该表达式来赋值，来确保可维护性
-    - 如果输入的C变量有注释，那么翻译结果应该将这些注释翻译为与Rust翻译结果对应的注释
+def var_translation(C_var_code, model, openai_instance, prompt_file='./prompts/var_translation.txt'):
     """
+    将C全局变量翻译为Rust全局变量（使用外部prompt模板）
 
-    # 调用大模型
+    Args:
+        C_var_code (str): C变量代码
+        model (str): LLM模型名称
+        openai_instance: OpenAI客户端实例
+        prompt_file (str|None): Prompt模板文件路径。若为None，自动查找默认位置
+
+    Returns:
+        str: 过滤后的Rust代码
+
+    Raises:
+        FileNotFoundError: 模板文件不存在
+        ValueError: 模板格式错误
+    """
+    # 读取模板文件
+    try:
+        with open(prompt_file, 'r', encoding='utf-8') as f:
+            prompt_template = f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Prompt模板文件不存在: {prompt_file}")
+    except UnicodeDecodeError:
+        # 尝试UTF-8-SIG（处理BOM问题）
+        with open(prompt_file, 'r', encoding='utf-8-sig') as f:
+            prompt_template = f.read()
+    except Exception as e:
+        raise RuntimeError(f"读取prompt文件失败 ({prompt_file}): {e}")
+
+    # 安全替换占位符
+    try:
+        # .format() 会自动处理 {{ → {, }} → } 的转义
+        prompt = prompt_template.format(C_var_code=C_var_code)
+    except KeyError as e:
+        raise ValueError(
+            f"Prompt模板缺少必需的占位符 {{{e}}}。\n"
+            "模板中必须包含 '{C_var_code}'（注意大小写）"
+        )
+    except Exception as e:
+        raise RuntimeError(f"格式化prompt时出错: {e}")
+
+    # 调用LLM并过滤
     output = call_llm_api(prompt, model, openai_instance)
-
-    res = filter_model_response(output)
-
-    return res
+    return filter_model_response(output)
 
 # ====================== 测试用例 ======================
 def run_all_tests():

@@ -1,48 +1,87 @@
 from LLM_calling import call_llm_api
 from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
+from semantic_fixing import safe_read_file
 
-def syntax_fixing(rust_code, error_message, model, openai_instance):
-    # 构建 prompt
-    prompt = f"""
-    你是一个代码修复专家，请根据以下的Rust代码以及编译报错信息，修复Rust代码中的语法错误。
-
-    出错的Rust代码：
-    {rust_code}
-
-    编译报错信息：
-    {error_message}
-
-    输出要求：
-    1. 修复且只修复编译报错信息指出的所有语法错误，例如类型不匹配、缺少unsafe块、缺少分号等问题
-    2. 保持函数签名不变，必须保持 #[unsafe(no_mangle)] 和 pub unsafe extern "C" fn 不变
-    3. 你的环境不完整，无需编译验证，而是交给我来编译
-    4. C的基本数据类型都对应::std::os::raw中的类型定义，不要使用libc定义的类型
-    5. 如果涉及C标准库函数，确保正确的FFI声明和类型转换
-    6. 对于未改动的那些Rust代码，严格按原有布局与内容输出
-
-    输出格式：
-    Rust翻译结果:
-    // 修复后的 Rust 代码
-
-    注意：
-    - 严格按输出要求与输出格式输出，无需其他任何内容
-    - 确保代码格式正确，特别是括号匹配
-    - 必须保持原有的缩进布局不变
-    - 修复所有报错信息中指出的问题，如果报错信息对于某个语法错误给出了修复建议（note或help)，你必须按照这些建议来进行修复
-    - 对于报错信息中没有提到的部分，严格按原有布局与内容输出，不要做出任何修改
-    - 由于Rust版本不同，某些特性在不同版本有不同的用法，因此只有那些报错信息里提到的问题才是真正的语法错误。提供给你的编译报错信息是完整的且符合我本地的Rust环境的，因此你必须严格按照报错信息来修复语法错误。
-    - 对于输入的Rust函数，你的修复结果必须使用 #[unsafe(no_mangle)] 属性和 pub unsafe extern "C" fn
-    - 保持原有的函数逻辑不变，只修复语法错误
-    - 任何外部函数以及函数指针，优先从crate::*中导入，如果报告crate::*中也没有，则需要在修复结果中添加导入语句，这些导入语句单独写在必须在函数外（应在函数后面），并必须用unsafe extern "C" {{ }} 块包裹
+def syntax_fixing(c_code, rust_code, error_message, model, openai_instance, suggestion_file_path='./suggestion.txt', prompt_file='./prompts/syntax_fixing.txt'):
     """
+    修复Rust代码中的语法错误（使用外部prompt模板）
 
-    # 调用大模型
-    output = call_llm_api(prompt, model, openai_instance)
+    Args:
+        rust_code (str): 出错的Rust代码
+        error_message (str): 编译器报错信息
+        model (str): LLM模型名称
+        openai_instance: OpenAI客户端实例
+        prompt_file (str|None): Prompt模板文件路径。若为None，自动查找默认位置
 
-    res = filter_model_response(output)
+    Returns:
+        str: 修复后的Rust代码
 
-    return res
+    Raises:
+        FileNotFoundError: 模板文件不存在
+        ValueError: 模板格式错误
+        RuntimeError: 读取/格式化/LLM调用失败
+    """
+    # 读取修复建议文件
+    suggestion = ""
+    try:
+        suggestion = safe_read_file(suggestion_file_path, context="修复建议文件")
+        # 清理建议内容：移除首尾空白，但保留内部格式
+        suggestion = suggestion.strip()
+    except FileNotFoundError as e:
+        print(f"Warning: 未找到修复建议文件 '{suggestion_file_path}'")
+    except Exception as e:
+        raise RuntimeError(f"处理修复建议文件时出错: {e}") from e
+
+    # 读取prompt模板
+    prompt_template = safe_read_file(prompt_file, context="prompt模板")
+
+    # 安全替换占位符（双变量）
+    try:
+        # .format() 会自动处理 {{ → {, }} → } 的转义
+        prompt = prompt_template.format(
+            c_code=c_code,
+            rust_code=rust_code,
+            error_message=error_message,
+            suggestion=suggestion
+        )
+    except KeyError as e:
+        missing_key = str(e).strip("'")
+        valid_keys = ["rust_code", "error_message"]
+        suggestion_text = f"（有效占位符: {{{', '.join(valid_keys)}}}）" if missing_key not in valid_keys else ""
+        raise ValueError(
+            f"Prompt模板缺少必需的占位符 {{{missing_key}}}{suggestion_text}。\n"
+            f"模板中必须包含 '{{rust_code}}' 和 '{{error_message}}'\n"
+            f"模板文件: {prompt_file}"
+        )
+    except IndexError:
+        raise ValueError(
+            "Prompt模板包含非法的格式化占位符（如 {} 未命名）。\n"
+            "请确保所有花括号都是双花括号 {{ }} 或命名占位符 {rust_code}/{error_message}"
+        )
+    except Exception as e:
+        # 附加调试信息
+        raise RuntimeError(
+            f"格式化prompt时出错。可能原因:\n"
+            f"  - rust_code 长度: {len(rust_code)} 字符\n"
+            f"  - error_message 长度: {len(error_message)} 字符\n"
+            f"  - 模板长度: {len(prompt_template)} 字符\n"
+            f"原始错误: {e}"
+        ) from e
+
+    # 调用LLM并过滤（带超时保护）
+    try:
+        output = call_llm_api(prompt, model, openai_instance)
+        return filter_model_response(output)
+    except Exception as e:
+        # 附加上下文便于调试
+        raise RuntimeError(
+            f"LLM调用或响应过滤失败。可能原因:\n"
+            f"  - Prompt总长度: {len(prompt)} 字符（可能超出模型上下文）\n"
+            f"  - API密钥/网络问题（检查代理配置）\n"
+            f"  - 模型返回格式异常（缺少'Rust翻译结果:'标记）\n"
+            f"原始错误: {type(e).__name__}: {e}"
+        ) from e
 
 # ====================== 测试用例 ======================
 def run_all_tests():
@@ -482,7 +521,6 @@ pub extern "C" unsafe fn complex_function(arr: *mut i32, len: i32, threshold: f3
 
     except Exception as e:
         print(f"测试过程中出错: {e}")
-
 
 # 示例用法
 if __name__ == "__main__":
