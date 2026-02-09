@@ -555,7 +555,7 @@ impl File {
             // 不删除方便定位，后续执行会无条件覆盖.
             // let _ = fs::remove_file(p);
         });
-        let new_c2rust_file = path.with_extension("c2rust_2");
+        let new_c2rust_file = path.with_extension("c2rust_global");
         fs::write(&*new_c2rust_file, code.as_bytes()).to_err()?;
         let output = Command::new(get_clang())
             .arg("-xc")
