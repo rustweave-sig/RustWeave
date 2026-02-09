@@ -400,6 +400,7 @@ impl Feature {
             .arg("consts")
             .arg("--no-prepend-enum-name")
             .arg("--disable-nested-struct-naming")
+            .arg("--ctypes-prefix ::core::ffi")
             .arg("--")
             .arg("-fno-builtin")
             .output()
