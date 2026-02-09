@@ -2,63 +2,76 @@ from LLM_calling import call_llm_api
 from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
 
-def function_translation(C_function_code, model, openai_instance):
-    # 构建 prompt - 已修改输出格式要求
-    prompt = f"""
-    你是一个代码翻译专家，请将以下的C函数翻译为Rust函数。在翻译过程中，如果识别到C函数依赖了外部C库函数和变量（包括C标准库、第三方库或项目自定义的函数和变量），请自动生成相应的FFI（Foreign Function Interface）调用代码，并将这些FFI声明与Rust函数代码整合在一起输出。
-
-    输入的C函数：
-    {C_function_code}
-
-    输出要求：
-    1. 所有函数必须使用 #[unsafe(no_mangle)] 属性和 unsafe extern "C" ABI
-    2. 所有类型都通过use crate::*引用，不要重复定义，且名字和C类型名字完全相同
-    3. 如果C函数依赖了外部C函数，必须通过use crate::引用，不要在extern "C"中去声明
-    4. 在调用外部C函数时，必须使用unsafe块包裹
-    5. 确保类型转换正确，特别是指针和字符串处理
-    6. C的基本数据类型优先使用::std::os::raw中已定义类型，不要使用libc定义的类型, 其中size_t对应usize, isize_t对应isize
-    7. 函数内部的静态变量都包装到std::sync::Mutex中
-    8. 使用Rust的宏需要遵循宏的卫生性要求，外部变量必须通过宏参数传递，在宏的内部无法直接访问外部资源 
-    8. 你的环境不完整，无需编译验证，而是交给我来编译
-
-    输出格式：
-    Rust翻译结果:
-    // FFI声明（如果有）
-    unsafe extern "C" {{
-        // 外部C库函数和变量
-    }}
-
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn your_function_name() {{
-        ...
-        
-        // 如果需要调用外部函数，应按如下格式调用
-        unsafe {{
-            let result = external_c_function(ptr);
-        }}
-    }}
-
-    注意：
-    - 严格按输出格式输出，无需其他任何内容，你的环境不完整，不要进行编译验证
-    - 如果没有外部依赖，只输出纯Rust实现的函数，但仍需使用 #[unsafe(no_mangle)] 和 unsafe extern "C"
-    - 所有类型都从crate::*引用，不要重复定义
-    - 如果使用了Rust库的任何内容，必须添加与之相关的导入语句
-    - 使用标准的Rust FFI实践，如必要的use语句（如std::os::raw::*）
-    - 函数签名必须使用#[unsafe(no_mangle)]和unsafe extern "C"以保持C ABI兼容性
-    - 对于C标准库函数，使用std::os::raw::*中的类型
-    - Rust翻译结果中，对于裸指针的任何操作，都必须在unsafe块中进行
-    - 确保C函数与翻译后的Rust函数的名称是完全一致的（特别注意大小写）
-    - 确保代码格式正确，包括缩进和括号匹配
-    - 确保Rust翻译结果中的各参数与变量的类型是正确的（可通过Rust编译的），并且是与C函数中各参数与变量的类型是对应的
-    - C的 struct.member_function(args) 应该翻译为 Rust 的 struct.member_function.unwrap()(args). 特别注意函数指针通常包装在 Option 中，需要 .unwrap() 来解包. 同样的规则适用于所有结构体成员函数指针的调用
+def function_translation(C_function_code, model, openai_instance, prompt_file='./prompts/func_translation.txt'):
     """
+    将C函数翻译为Rust函数（使用外部prompt模板）
 
-    # 调用大模型
-    output = call_llm_api(prompt, model, openai_instance)
+    Args:
+        C_function_code (str): C函数代码
+        model (str): LLM模型名称
+        openai_instance: OpenAI客户端实例
+        prompt_file (str|None): Prompt模板文件路径。若为None，自动查找默认位置
 
-    res = filter_model_response(output)
+    Returns:
+        str: 过滤后的Rust代码
 
-    return res
+    Raises:
+        FileNotFoundError: 模板文件不存在
+        ValueError: 模板格式错误
+        RuntimeError: 读取/格式化失败
+    """
+    # 读取模板文件（带编码容错）
+    try:
+        # 优先尝试标准UTF-8
+        with open(prompt_file, 'r', encoding='utf-8') as f:
+            prompt_template = f.read()
+    except UnicodeDecodeError:
+        # 回退到UTF-8-SIG（处理Windows记事本BOM问题）
+        try:
+            with open(prompt_file, 'r', encoding='utf-8-sig') as f:
+                prompt_template = f.read()
+        except Exception as e:
+            raise RuntimeError(
+                f"无法读取prompt文件（UTF-8和UTF-8-SIG均失败）: {prompt_file}\n"
+                f"错误详情: {e}"
+            )
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Prompt模板文件不存在: {prompt_file}")
+    except Exception as e:
+        raise RuntimeError(f"读取prompt文件时发生未知错误 ({prompt_file}): {e}")
+
+    # 安全替换占位符
+    try:
+        # .format() 会自动处理 {{ → {, }} → } 的转义（完美匹配FFI块语法）
+        prompt = prompt_template.format(C_function_code=C_function_code)
+    except KeyError as e:
+        missing_key = str(e).strip("'")
+        raise ValueError(
+            f"Prompt模板缺少必需的占位符 {{{missing_key}}}。\n"
+            f"模板中必须包含 '{{C_function_code}}'（注意大小写）\n"
+            f"模板文件: {prompt_file}"
+        )
+    except IndexError:
+        raise ValueError(
+            "Prompt模板包含非法的格式化占位符（如 {} 未命名）。\n"
+            "请确保所有花括号都是双花括号 {{ }} 或命名占位符 {C_function_code}"
+        )
+    except Exception as e:
+        raise RuntimeError(f"格式化prompt时出错: {e}")
+
+    # 调用LLM并过滤
+    try:
+        output = call_llm_api(prompt, model, openai_instance)
+        return filter_model_response(output)
+    except Exception as e:
+        # 附加上下文信息便于调试
+        raise RuntimeError(
+            f"LLM调用或响应过滤失败。可能原因:\n"
+            f"  - Prompt过长（当前长度: {len(prompt)} 字符）\n"
+            f"  - API密钥/网络问题\n"
+            f"  - 模型返回格式异常\n"
+            f"原始错误: {e}"
+        ) from e
 
 # ====================== 测试用例 ======================
 def run_all_tests():

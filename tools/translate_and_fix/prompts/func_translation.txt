@@ -1,0 +1,46 @@
+你是一个代码翻译专家，请将以下的C函数翻译为Rust函数。在翻译过程中，如果识别到C函数依赖了外部C库函数和变量（包括C标准库、第三方库或项目自定义的函数和变量），请自动生成相应的FFI（Foreign Function Interface）调用代码，并将这些FFI声明与Rust函数代码整合在一起输出。
+
+输入的C函数：
+{C_function_code}
+
+输出要求：
+1. 所有函数必须使用 #[unsafe(no_mangle)] 属性和 unsafe extern "C" ABI
+2. 所有类型都通过use crate::*引用，不要重复定义，且名字和C类型名字完全相同
+3. 如果C函数依赖了外部C函数，必须通过use crate::引用，不要在extern "C"中去声明
+4. 在调用外部C函数时，必须使用unsafe块包裹
+5. 确保类型转换正确，特别是指针和字符串处理
+6. C的基本数据类型优先使用::std::os::raw中已定义类型，不要使用libc定义的类型, 其中size_t对应usize, isize_t对应isize
+7. 函数内部的静态变量都包装到std::sync::Mutex中
+8. 使用Rust的宏需要遵循宏的卫生性要求，外部变量必须通过宏参数传递，在宏的内部无法直接访问外部资源
+8. 你的环境不完整，无需编译验证，而是交给我来编译
+
+输出格式：
+Rust翻译结果:
+// FFI声明（如果有）
+unsafe extern "C" {{
+    // 外部C库函数和变量
+}}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn your_function_name() {{
+    ...
+
+    // 如果需要调用外部函数，应按如下格式调用
+    unsafe {{
+        let result = external_c_function(ptr);
+    }}
+}}
+
+注意：
+- 严格按输出格式输出，无需其他任何内容，你的环境不完整，不要进行编译验证
+- 如果没有外部依赖，只输出纯Rust实现的函数，但仍需使用 #[unsafe(no_mangle)] 和 unsafe extern "C"
+- 所有类型都从crate::*引用，不要重复定义
+- 如果使用了Rust库的任何内容，必须添加与之相关的导入语句
+- 使用标准的Rust FFI实践，如必要的use语句（如std::os::raw::*）
+- 函数签名必须使用#[unsafe(no_mangle)]和unsafe extern "C"以保持C ABI兼容性
+- 对于C标准库函数，使用std::os::raw::*中的类型
+- Rust翻译结果中，对于裸指针的任何操作，都必须在unsafe块中进行
+- 确保C函数与翻译后的Rust函数的名称是完全一致的（特别注意大小写）
+- 确保代码格式正确，包括缩进和括号匹配
+- 确保Rust翻译结果中的各参数与变量的类型是正确的（可通过Rust编译的），并且是与C函数中各参数与变量的类型是对应的
+- C的 struct.member_function(args) 应该翻译为 Rust 的 struct.member_function.unwrap()(args). 特别注意函数指针通常包装在 Option 中，需要 .unwrap() 来解包. 同样的规则适用于所有结构体成员函数指针的调用
