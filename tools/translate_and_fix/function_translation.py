@@ -13,10 +13,13 @@ def function_translation(C_function_code, model, openai_instance):
     输出要求：
     1. 所有函数必须使用 #[unsafe(no_mangle)] 属性和 unsafe extern "C" ABI
     2. 所有类型都通过use crate::*引用，不要重复定义，且名字和C类型名字完全相同
-    3. 如果C函数依赖了外部C函数，必须在Rust代码中使用unsafe extern块声明这些外部函数
+    3. 如果C函数依赖了外部C函数，必须通过use crate::引用，不要在extern "C"中去声明
     4. 在调用外部C函数时，必须使用unsafe块包裹
     5. 确保类型转换正确，特别是指针和字符串处理
-    6. 你的环境不完整，无需编译验证，而是交给我来编译
+    6. C的基本数据类型优先使用::std::os::raw中已定义类型，不要使用libc定义的类型, 其中size_t对应usize, isize_t对应isize
+    7. 函数内部的静态变量都包装到std::sync::Mutex中
+    8. 使用Rust的宏需要遵循宏的卫生性要求，外部变量必须通过宏参数传递，在宏的内部无法直接访问外部资源 
+    8. 你的环境不完整，无需编译验证，而是交给我来编译
 
     输出格式：
     Rust翻译结果:
@@ -48,7 +51,6 @@ def function_translation(C_function_code, model, openai_instance):
     - 确保代码格式正确，包括缩进和括号匹配
     - 确保Rust翻译结果中的各参数与变量的类型是正确的（可通过Rust编译的），并且是与C函数中各参数与变量的类型是对应的
     - C的 struct.member_function(args) 应该翻译为 Rust 的 struct.member_function.unwrap()(args). 特别注意函数指针通常包装在 Option 中，需要 .unwrap() 来解包. 同样的规则适用于所有结构体成员函数指针的调用
-    - 输出的Rust代码必须符合Rust 1.89版本要求
     """
 
     # 调用大模型

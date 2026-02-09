@@ -732,6 +732,7 @@ impl File {
                         code.drain(pos..);
                         code.push(';');
                     }
+                    code.insert_str(0, "extern ");
                 }
             }
 

@@ -341,7 +341,8 @@ impl Feature {
                     continue;
                 };
                 let mut is_var = false;
-                let is_type = match node.kind {
+                let mut is_fun = false;
+                let is_decl = match node.kind {
                     Kind::RecordDecl(_) | Kind::EnumDecl(_) => {
                         if node.kind.is_definition() {
                             seen_names.insert(id)
@@ -354,9 +355,13 @@ impl Feature {
                         is_var = true;
                         seen_names.insert(id)
                     }
+                    Kind::FunctionDecl(_) => {
+                        is_fun = true;
+                        seen_names.insert(id)
+                    },
                     _ => false,
                 };
-                if !is_type {
+                if !is_decl {
                     continue;
                 }
                 let code = node.kind.c_code(&c_root, &node.inner)?;
@@ -365,6 +370,12 @@ impl Feature {
                 }
                 if is_var {
                     if let Some(pos) = code.find('=') {
+                        content.push_str(&code[..pos]);
+                        content.push_str(";\n");
+                        continue;
+                    }
+                } else if is_fun {
+                    if let Some(pos) = code.find('{') {
                         content.push_str(&code[..pos]);
                         content.push_str(";\n");
                         continue;
@@ -389,6 +400,8 @@ impl Feature {
             .arg("consts")
             .arg("--no-prepend-enum-name")
             .arg("--disable-nested-struct-naming")
+            .arg("--")
+            .arg("-fno-builtin")
             .output()
             .log_err("bindgen")?;
         if !output.status.success() {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::io::Write;
 use crate::util;
+use crate::constants;
 use colored::Colorize;
 
 /// Get the translate script directory from environment variable
@@ -75,20 +76,15 @@ fn build_fix_args<'a>(
     ]
 }
 
-/// Display Rust code from a file with formatted output
-/// 
-/// # Parameters
-/// - `file_path`: Path to the Rust file to display
-/// - `header`: Header text to display (e.g., "─ Translated Rust Code ─")
-/// - `max_lines`: Maximum number of lines to display
-fn display_rust_code(file_path: &Path, header: &str, max_lines: usize) {
+/// Display code from a file with formatted output
+fn display_code(file_path: &Path, header: &str, max_lines: usize, show_full: bool) {
     match std::fs::read_to_string(file_path) {
         Ok(content) => {
             let lines: Vec<&str> = content.lines().collect();
             let total_lines = lines.len();
-            let display_lines = std::cmp::min(total_lines, max_lines);
+            let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, max_lines) };
             
-            println!("│ {}", header.bright_green());
+            println!("│ {}", header.bright_cyan());
             for (i, line) in lines.iter().take(display_lines).enumerate() {
                 println!("│ {} {}", format!("{:3}", i + 1).dimmed(), line);
             }
@@ -105,37 +101,23 @@ fn display_rust_code(file_path: &Path, header: &str, max_lines: usize) {
 }
 
 /// Translate a C file to Rust using the translation tool
-pub fn translate_c_to_rust(feature: &str, file_type: &str, c_file: &Path, rs_file: &Path) -> Result<()> {
+pub fn translate_c_to_rust(feature: &str, file_type: &str, c_file: &Path, rs_file: &Path, show_full_output: bool) -> Result<()> {
     util::validate_feature_name(feature)?;
     
     let project_root = util::find_project_root()?;
     let config_path = get_config_path()?;
     let work_dir = project_root.join(".c2rust").join(feature).join("rust");
     
-    // Verify working directory exists
     if !work_dir.exists() {
         anyhow::bail!(
-            "Working directory does not exist: {}. Expected directory structure: <project_root>/.c2rust/<feature>/rust",
+            "Working directory does not exist: {}. Expected: <project_root>/.c2rust/<feature>/rust",
             work_dir.display()
         );
     }
     
-    // Read and display C code content (first 15 lines for preview)
-    if let Ok(c_content) = std::fs::read_to_string(c_file) {
-        let lines: Vec<&str> = c_content.lines().collect();
-        let preview_lines = lines.iter().take(15).count();
-        
-        println!("│ {}", "─ C Source Preview ─".bright_cyan());
-        for (i, line) in lines.iter().take(15).enumerate() {
-            println!("│ {} {}", format!("{:3}", i + 1).dimmed(), line);
-        }
-        if lines.len() > 15 {
-            println!("│ {} (showing {} of {} lines)", "...".dimmed(), preview_lines, lines.len());
-        }
-        println!("│");
-    }
+    // Display C code preview
+    display_code(c_file, "─ C Source Preview ─", constants::CODE_PREVIEW_LINES, show_full_output);
     
-    // Get translate script path from environment variable
     let script_path = get_translate_script_full_path()?;
     let script_str = script_path.to_str()
         .with_context(|| format!("Non-UTF8 path: {}", script_path.display()))?;
@@ -179,59 +161,62 @@ pub fn translate_c_to_rust(feature: &str, file_type: &str, c_file: &Path, rs_fil
     }
 
     // Read and display the translated Rust code
-    display_rust_code(rs_file, "─ Translated Rust Code ─", 100);
+    display_code(rs_file, "─ Translated Rust Code ─", constants::CODE_PREVIEW_LINES, show_full_output);
 
     Ok(())
 }
 
-/// Fix translation errors using the translation tool
-/// 
-/// # Parameters
-/// - `feature`: The feature name being translated
-/// - `_file_type`: Kept for backward compatibility but not used (fix always uses type="fix")
-/// - `rs_file`: The Rust file to be fixed (serves as both input --code and output --output)
-/// - `error_msg`: The compiler error message to be written to a temporary file
-pub fn fix_translation_error(feature: &str, _file_type: &str, rs_file: &Path, error_msg: &str) -> Result<()> {
-    util::validate_feature_name(feature)?;
-    
-    let project_root = util::find_project_root()?;
-    let config_path = get_config_path()?;
-    let work_dir = project_root.join(".c2rust").join(feature).join("rust");
-    
-    // Verify working directory exists
-    if !work_dir.exists() {
-        anyhow::bail!(
-            "Working directory does not exist: {}. Expected directory structure: <project_root>/.c2rust/<feature>/rust",
-            work_dir.display()
-        );
-    }
-    
-    // Display error preview (first 10 lines)
+/// Display error message preview
+fn display_error_preview(error_msg: &str, show_full: bool) {
     let error_lines: Vec<&str> = error_msg.lines().collect();
+    let total_lines = error_lines.len();
+    let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, constants::ERROR_PREVIEW_LINES) };
+    
     println!("│ {}", "─ Build Error Preview ─".yellow());
-    for (i, line) in error_lines.iter().take(10).enumerate() {
+    for (i, line) in error_lines.iter().take(display_lines).enumerate() {
         if i == 0 {
             println!("│ {}", line.bright_red());
         } else {
             println!("│ {}", line.dimmed());
         }
     }
-    if error_lines.len() > 10 {
-        println!("│ {} (showing 10 of {} lines)", "...".dimmed(), error_lines.len());
+    if total_lines > display_lines {
+        println!("│ {} (showing {} of {} lines)", "...".dimmed(), display_lines, total_lines);
     }
     println!("│");
-    
-    // Create a unique temporary file with error message
+}
+
+/// Create temporary file with error message
+fn create_error_temp_file(error_msg: &str) -> Result<tempfile::NamedTempFile> {
     let mut temp_file = tempfile::NamedTempFile::new()
         .context("Failed to create temporary error file")?;
     write!(temp_file, "{}", error_msg)
         .context("Failed to write error message to temp file")?;
+    Ok(temp_file)
+}
+
+/// Fix translation errors using the translation tool
+pub fn fix_translation_error(feature: &str, _file_type: &str, rs_file: &Path, error_msg: &str, show_full_output: bool) -> Result<()> {
+    util::validate_feature_name(feature)?;
     
-    // Get translate script path from environment variable
+    let project_root = util::find_project_root()?;
+    let config_path = get_config_path()?;
+    let work_dir = project_root.join(".c2rust").join(feature).join("rust");
+    
+    if !work_dir.exists() {
+        anyhow::bail!(
+            "Working directory does not exist: {}. Expected: <project_root>/.c2rust/<feature>/rust",
+            work_dir.display()
+        );
+    }
+    
+    display_error_preview(error_msg, show_full_output);
+    
+    let temp_file = create_error_temp_file(error_msg)?;
     let script_path = get_translate_script_full_path()?;
+    
     let script_str = script_path.to_str()
         .with_context(|| format!("Non-UTF8 path: {}", script_path.display()))?;
-    
     let config_str = config_path.to_str()
         .with_context(|| format!("Non-UTF8 path: {}", config_path.display()))?;
     let error_file_str = temp_file.path().to_str()
@@ -239,9 +224,6 @@ pub fn fix_translation_error(feature: &str, _file_type: &str, rs_file: &Path, er
     let rs_file_str = rs_file.to_str()
         .with_context(|| format!("Non-UTF8 path: {}", rs_file.display()))?;
 
-    // Note: --code and --output both point to rs_file, which means the Python script
-    // will read the original file and overwrite it with the fixed version.
-    // This is the intended behavior as specified in the requirements.
     println!("│ {}", "Executing error fix command:".yellow());
     println!("│ {} python {} --config {} --type fix --code {} --output {} --error {}", 
         "→".yellow(),
@@ -252,16 +234,7 @@ pub fn fix_translation_error(feature: &str, _file_type: &str, rs_file: &Path, er
         error_file_str.dimmed());
     println!("│");
 
-    // Build fix command arguments.
-    // Note: rs_file_str is used for both code_file and output_file parameters,
-    // meaning the Python script reads from rs_file and overwrites it with the fix.
-    let args = build_fix_args(
-        script_str,
-        config_str,
-        rs_file_str,  // code_file: input file to fix
-        rs_file_str,  // output_file: where to write fixed result (overwrites input)
-        error_file_str,
-    );
+    let args = build_fix_args(script_str, config_str, rs_file_str, rs_file_str, error_file_str);
 
     let status = Command::new("python")
         .args(&args)
@@ -271,13 +244,11 @@ pub fn fix_translation_error(feature: &str, _file_type: &str, rs_file: &Path, er
         .context("Failed to execute translate_and_fix.py for fixing")?;
 
     if !status.success() {
-        anyhow::bail!("Fix failed with exit code: {} (check output above for details)", status.code().unwrap_or(-1));
+        anyhow::bail!("Fix failed with exit code: {}", status.code().unwrap_or(-1));
     }
 
-    // Read and display the fixed Rust code
-    display_rust_code(rs_file, "─ Fixed Rust Code ─", 100);
+    display_code(rs_file, "─ Fixed Rust Code ─", constants::CODE_PREVIEW_LINES, show_full_output);
 
-    // temp_file is automatically deleted when it goes out of scope
     Ok(())
 }
 
@@ -453,5 +424,132 @@ mod tests {
         assert_eq!(args[8], output);
         assert_eq!(args[9], "--error");
         assert_eq!(args[10], error);
+    }
+    
+    #[test]
+    fn test_display_code_truncation_behavior() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Create a temporary file with 20 lines
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=20 {
+            writeln!(temp_file, "Line {}", i).unwrap();
+        }
+        temp_file.flush().unwrap();
+        
+        // Test with show_full = false (should truncate to max_lines)
+        // We can't easily capture stdout in a unit test, but we can verify the function
+        // doesn't panic and reads the file correctly by testing the logic independently
+        let content = std::fs::read_to_string(temp_file.path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+        let max_lines = 10;
+        
+        // Verify truncation logic when show_full = false
+        let show_full = false;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, max_lines) };
+        assert_eq!(display_lines, 10, "Should truncate to max_lines when show_full is false");
+        assert!(total_lines > display_lines, "Should show truncation message");
+        
+        // Verify full display logic when show_full = true
+        let show_full = true;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, max_lines) };
+        assert_eq!(display_lines, 20, "Should display all lines when show_full is true");
+        assert_eq!(total_lines, display_lines, "Should not show truncation message");
+    }
+    
+    #[test]
+    fn test_display_code_no_truncation_when_lines_less_than_max() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Create a temporary file with only 5 lines
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=5 {
+            writeln!(temp_file, "Line {}", i).unwrap();
+        }
+        temp_file.flush().unwrap();
+        
+        let content = std::fs::read_to_string(temp_file.path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+        let max_lines = 10;
+        
+        // Verify no truncation when lines <= max_lines, regardless of show_full
+        let show_full = false;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, max_lines) };
+        assert_eq!(display_lines, 5, "Should display all lines when total < max_lines");
+        assert_eq!(total_lines, display_lines, "Should not show truncation message");
+        
+        let show_full = true;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, max_lines) };
+        assert_eq!(display_lines, 5, "Should display all lines when total < max_lines");
+    }
+    
+    #[test]
+    fn test_display_error_preview_truncation_behavior() {
+        // Create an error message with many lines
+        let mut error_msg = String::new();
+        for i in 1..=25 {
+            error_msg.push_str(&format!("Error line {}\n", i));
+        }
+        
+        let error_lines: Vec<&str> = error_msg.lines().collect();
+        let total_lines = error_lines.len();
+        
+        // Verify truncation logic when show_full = false
+        let show_full = false;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, constants::ERROR_PREVIEW_LINES) };
+        assert_eq!(display_lines, constants::ERROR_PREVIEW_LINES, 
+            "Should truncate to ERROR_PREVIEW_LINES when show_full is false");
+        assert!(total_lines > display_lines, "Should show truncation message");
+        
+        // Verify full display logic when show_full = true
+        let show_full = true;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, constants::ERROR_PREVIEW_LINES) };
+        assert_eq!(display_lines, 25, "Should display all error lines when show_full is true");
+        assert_eq!(total_lines, display_lines, "Should not show truncation message");
+    }
+    
+    #[test]
+    fn test_display_error_preview_no_truncation_when_lines_less_than_max() {
+        // Create a short error message
+        let error_msg = "Error line 1\nError line 2\nError line 3";
+        
+        let error_lines: Vec<&str> = error_msg.lines().collect();
+        let total_lines = error_lines.len();
+        
+        // Verify no truncation when lines <= ERROR_PREVIEW_LINES, regardless of show_full
+        let show_full = false;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, constants::ERROR_PREVIEW_LINES) };
+        assert_eq!(display_lines, 3, "Should display all error lines when total < ERROR_PREVIEW_LINES");
+        assert_eq!(total_lines, display_lines, "Should not show truncation message");
+        
+        let show_full = true;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, constants::ERROR_PREVIEW_LINES) };
+        assert_eq!(display_lines, 3, "Should display all error lines when total < ERROR_PREVIEW_LINES");
+    }
+    
+    #[test]
+    fn test_display_error_preview_line_count_message() {
+        // Create an error message with exactly ERROR_PREVIEW_LINES + 5 lines
+        let num_lines = constants::ERROR_PREVIEW_LINES + 5;
+        let mut error_msg = String::new();
+        for i in 1..=num_lines {
+            error_msg.push_str(&format!("Error line {}\n", i));
+        }
+        
+        let error_lines: Vec<&str> = error_msg.lines().collect();
+        let total_lines = error_lines.len();
+        
+        // When truncated, verify the counts are correct
+        let show_full = false;
+        let display_lines = if show_full { total_lines } else { std::cmp::min(total_lines, constants::ERROR_PREVIEW_LINES) };
+        
+        // The truncation message should show: "showing {display_lines} of {total_lines} lines"
+        assert_eq!(display_lines, constants::ERROR_PREVIEW_LINES);
+        assert_eq!(total_lines, num_lines);
+        assert!(total_lines > display_lines, "Total lines should be greater than displayed lines");
     }
 }

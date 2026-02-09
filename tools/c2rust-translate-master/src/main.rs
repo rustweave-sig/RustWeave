@@ -1,5 +1,14 @@
 use clap::{Parser, Subcommand};
 
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    let value: usize = s.parse()
+        .map_err(|_| format!("`{s}` is not a valid number"))?;
+    if value == 0 {
+        return Err(String::from("value must be greater than 0"));
+    }
+    Ok(value)
+}
+
 #[derive(Parser)]
 #[command(name = "c2rust-translate")]
 #[command(about = "A tool for translating C code to Rust", long_about = None)]
@@ -15,6 +24,18 @@ enum Commands {
         /// Feature name (defaults to "default" if not specified)
         #[arg(long, default_value = "default")]
         feature: String,
+        
+        /// Allow processing all unprocessed files without prompting for selection
+        #[arg(long)]
+        allow_all: bool,
+        
+        /// Maximum number of fix attempts for build errors (must be > 0, defaults to 10)
+        #[arg(long, default_value = "10", value_parser = parse_positive_usize)]
+        max_fix_attempts: usize,
+        
+        /// Show full output for code and errors without truncation
+        #[arg(long)]
+        show_full_output: bool,
     },
 }
 
@@ -30,7 +51,9 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Translate { feature } => c2rust_translate::translate_feature(&feature),
+        Commands::Translate { feature, allow_all, max_fix_attempts, show_full_output } => {
+            c2rust_translate::translate_feature(&feature, allow_all, max_fix_attempts, show_full_output)
+        }
     };
 
     if let Err(e) = result {

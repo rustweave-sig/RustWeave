@@ -10,12 +10,20 @@ def var_translation(C_var_code, model, openai_instance):
     输入的C全局变量：
     {C_var_code}
 
+    输出要求：
+    1. 所有变量必须使用 #[unsafe(no_mangle)] 属性
+    2. 所有变量可见性必须是pub
+    2. 所有依赖的类型，变量和函数都通过use crate::*引用，不要重复定义，且名字和C中名字完全相同
+
     输出格式：
     Rust翻译结果:
     // 在这里写出翻译出的Rust全局变量
 
     注意：
     - 严格按输出格式输出，无需其他任何内容
+    - 初始化依赖的外部符号都从crate::*引入
+    - C的基本数据类型优先使用::std::os::raw中已定义类型，不要使用libc定义的类型, 其中size_t对应usize, isize_t对应isize
+    - 函数内部的静态变量都包装到std::sync::Mutex中
     - 确保C全局变量与翻译后的Rust全局变量的名称是完全一致的（特别注意大小写）
     - 确保Rust全局变量的类型是正确的（可通过Rust编译的），并且是与C全局变量的类型是对应的
     - 确保Rust全局变量添加了pub关键字，但是对于C静态变量(static)，翻译结果不应添加pub关键字
@@ -26,7 +34,6 @@ def var_translation(C_var_code, model, openai_instance):
     - 对于静态变量的全局变量，必须用Mutex来包装
     - 如果C变量的初始化值是一个表达式，那么翻译结果也应该通过翻译该表达式来赋值，来确保可维护性
     - 如果输入的C变量有注释，那么翻译结果应该将这些注释翻译为与Rust翻译结果对应的注释
-    - 输出的Rust代码必须符合Rust 1.89版本要求
     """
 
     # 调用大模型
