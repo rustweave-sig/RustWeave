@@ -7,6 +7,9 @@ pub mod util;
 pub mod progress;
 pub mod logger;
 pub mod constants;
+pub mod target_selector;
+pub(crate) mod interaction;
+pub(crate) mod suggestion;
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -75,10 +78,25 @@ pub fn translate_feature(feature: &str, allow_all: bool, max_fix_attempts: usize
         git::git_commit(&format!("Initialize {} rust directory", feature), feature)?;
     }
 
-    // Load or initialize progress state
-    let mut progress_state = progress::ProgressState::load(feature)?;
+    // Step 1: Target artifact selection
+    // Prompt user to select target artifact before processing files
+    println!("\n{}", "Step 1: Select target artifact".bright_cyan().bold());
+    let selected_target = target_selector::prompt_target_selection(feature)?;
+    target_selector::store_target_in_config(feature, &selected_target)?;
+
+    // Initialize progress state before the main loop
+    // Count total .rs files and calculate how many have already been processed
+    let total_rs_files = file_scanner::count_all_rs_files(&rust_dir)?;
+    let initial_empty_count = file_scanner::find_empty_rs_files(&rust_dir)?.len();
+    let already_processed = total_rs_files.saturating_sub(initial_empty_count);
+    
+    let mut progress_state = progress::ProgressState::with_initial_progress(
+        total_rs_files,
+        already_processed
+    );
 
     // Step 2: Main loop - process all empty .rs files
+    println!("\n{}", "Step 2: Translate C source files".bright_cyan().bold());
     loop {
         // Step 2.1: Try to build first
         println!("\n{}", "Building project...".bright_blue().bold());
@@ -87,7 +105,25 @@ pub fn translate_feature(feature: &str, allow_all: bool, max_fix_attempts: usize
                 println!("{}", "✓ Build successful!".bright_green().bold());
             }
             Err(e) => {
-                return Err(e).context("Translation workflow aborted due to build failure");
+                println!("{}", "✗ Initial build failed!".red().bold());
+                println!("{}", "This may indicate issues with the project setup or previous translations.".yellow());
+                
+                // Offer interactive handling for startup build failure
+                let choice = interaction::prompt_user_choice("Initial build failure", false)?;
+                
+                match choice {
+                    interaction::UserChoice::Continue => {
+                        println!("│ {}", "Continuing despite build failure. You can fix issues during file processing.".yellow());
+                        // Continue with the workflow
+                    }
+                    interaction::UserChoice::ManualFix => {
+                        println!("│ {}", "Please manually fix the build issues and run the tool again.".yellow());
+                        return Err(e).context("Initial build failed and user chose manual fix");
+                    }
+                    interaction::UserChoice::Exit => {
+                        return Err(e).context("Initial build failed and user chose to exit");
+                    }
+                }
             }
         }
 
@@ -98,9 +134,34 @@ pub fn translate_feature(feature: &str, allow_all: bool, max_fix_attempts: usize
         git::git_commit(&format!("Update code analysis for {}", feature), feature)?;
 
         println!("{}", "Running hybrid build tests...".bright_blue());
-        builder::run_hybrid_build(feature)?;
+        match builder::run_hybrid_build(feature) {
+            Ok(_) => {
+                println!("{}", "✓ Hybrid build tests passed".bright_green());
+            }
+            Err(e) => {
+                println!("{}", "✗ Initial hybrid build tests failed!".red().bold());
+                println!("{}", "This may indicate issues with the test environment or previous translations.".yellow());
+                
+                // Offer interactive handling for startup test failure
+                let choice = interaction::prompt_user_choice("Initial test failure", false)?;
+                
+                match choice {
+                    interaction::UserChoice::Continue => {
+                        println!("│ {}", "Continuing despite test failure. You can fix issues during file processing.".yellow());
+                        // Continue with the workflow
+                    }
+                    interaction::UserChoice::ManualFix => {
+                        println!("│ {}", "Please manually fix the test issues and run the tool again.".yellow());
+                        return Err(e).context("Initial tests failed and user chose manual fix");
+                    }
+                    interaction::UserChoice::Exit => {
+                        return Err(e).context("Initial tests failed and user chose to exit");
+                    }
+                }
+            }
+        }
         
-        // Step 2.2: Scan for empty .rs files
+        // Step 2.2: Scan for empty .rs files (unprocessed files)
         let empty_rs_files = file_scanner::find_empty_rs_files(&rust_dir)?;
         
         if empty_rs_files.is_empty() {
@@ -109,45 +170,23 @@ pub fn translate_feature(feature: &str, allow_all: bool, max_fix_attempts: usize
             logger::log_message(msg);
             break;
         }
-
-        // Filter out already processed files
-        let unprocessed_files: Vec<_> = empty_rs_files
-            .iter()
-            .filter(|f| !progress_state.is_processed(f, &rust_dir))
-            .collect();
         
-        if unprocessed_files.is_empty() {
-            println!("{}", "All files have been processed already.".cyan());
-            break;
-        }
-        
-        // Set total count for progress display (total unprocessed + already processed).
-        // To maintain consistent progress across runs, never decrease the total count;
-        // only update it if we observe more empty files than previously recorded.
-        let current_total = progress_state.get_total_count();
-        let new_total = std::cmp::max(current_total, empty_rs_files.len());
-        if new_total != current_total {
-            progress_state.set_total_count(new_total);
-            progress_state.save(feature)?;
-        }
-        
-        println!("{}", format!("Found {} empty .rs file(s) to process ({} already processed)", 
-            unprocessed_files.len(), 
-            empty_rs_files.len() - unprocessed_files.len()).cyan());
+        println!("{}", format!("Found {} empty .rs file(s) to process", 
+            empty_rs_files.len()).cyan());
 
         // Select files to process based on allow_all flag
-        // Use indices to avoid unnecessary cloning
         let selected_indices: Vec<usize> = if allow_all {
-            // Process all unprocessed files without prompting
-            (0..unprocessed_files.len()).collect()
+            // Process all empty files without prompting
+            (0..empty_rs_files.len()).collect()
         } else {
             // Prompt user to select files
-            file_scanner::prompt_file_selection(&unprocessed_files, &rust_dir)?
+            let file_refs: Vec<_> = empty_rs_files.iter().collect();
+            file_scanner::prompt_file_selection(&file_refs, &rust_dir)?
         };
 
         for &idx in selected_indices.iter() {
-            let rs_file = unprocessed_files[idx];
-            // Get current progress position (persisted across runs)
+            let rs_file = &empty_rs_files[idx];
+            // Get current progress position (persists across loop iterations)
             let current_position = progress_state.get_current_position();
             let total_count = progress_state.get_total_count();
             
@@ -166,9 +205,8 @@ pub fn translate_feature(feature: &str, allow_all: bool, max_fix_attempts: usize
             
             process_rs_file(feature, rs_file, file_name, current_position, total_count, max_fix_attempts, show_full_output)?;
             
-            // Mark file as processed and save progress
-            progress_state.mark_processed(rs_file, &rust_dir)?;
-            progress_state.save(feature)?;
+            // Mark file as processed in this session
+            progress_state.mark_processed();
         }
     }
 
@@ -208,7 +246,7 @@ fn process_rs_file(feature: &str, rs_file: &std::path::Path, file_name: &str, cu
         )?;
         
         if build_successful {
-            complete_file_processing(feature, file_name, &format_progress)?;
+            complete_file_processing(feature, file_name, file_type, rs_file, &format_progress)?;
             return Ok(());
         }
     }
@@ -319,7 +357,9 @@ where
                         rs_file,
                         is_last_attempt,
                         attempt_number,
-                        max_fix_attempts
+                        max_fix_attempts,
+                        feature,
+                        file_type,
                     );
                 } else {
                     apply_error_fix(feature, file_type, rs_file, &build_error, format_progress, show_full_output)?;
@@ -332,6 +372,7 @@ where
 }
 
 /// Handle the case when max fix attempts are reached
+/// Returns Ok(true) if processing should continue without retrying translation, Ok(false) if translation should be retried
 fn handle_max_fix_attempts_reached(
     build_error: anyhow::Error,
     file_name: &str,
@@ -339,61 +380,164 @@ fn handle_max_fix_attempts_reached(
     is_last_attempt: bool,
     attempt_number: usize,
     max_fix_attempts: usize,
+    feature: &str,
+    file_type: &str,
 ) -> Result<bool> {
-    use std::io::{self, Write};
     use constants::MAX_TRANSLATION_ATTEMPTS;
     
     println!("│");
     println!("│ {}", "⚠ Maximum fix attempts reached!".red().bold());
     println!("│ {}", format!("File {} still has build errors after {} fix attempts.", file_name, max_fix_attempts).yellow());
-    println!("│");
     
-    if !is_last_attempt {
-        let remaining_retries = MAX_TRANSLATION_ATTEMPTS - attempt_number;
-        println!("│ {}", format!("Do you want to retry translating this file from scratch? ({} retries remaining)", remaining_retries).bright_yellow());
-        println!("│ {} Type 'retry' to retry, or press Enter to skip:", "→".bright_yellow());
-        
-        loop {
-            print!("│ ");
-            io::stdout().flush()?;
+    // Display full C and Rust code for user reference
+    let c_file = rs_file.with_extension("c");
+    
+    // Show file locations
+    interaction::display_file_paths(Some(&c_file), rs_file);
+    
+    // Display full code (always show full for interactive mode)
+    println!("│ {}", "═══ C Source Code (Full) ═══".bright_cyan().bold());
+    translator::display_code(&c_file, "─ C Source ─", usize::MAX, true);
+    
+    println!("│ {}", "═══ Rust Code (Full) ═══".bright_cyan().bold());
+    translator::display_code(rs_file, "─ Rust Code ─", usize::MAX, true);
+    
+    println!("│ {}", "═══ Build Error ═══".bright_red().bold());
+    println!("│ {}", build_error);
+    
+    // Get user choice
+    let choice = interaction::prompt_user_choice("Build failure", false)?;
+    
+    match choice {
+        interaction::UserChoice::Continue => {
+            println!("│");
+            println!("│ {}", "You chose: Continue trying with a new suggestion".bright_cyan());
             
-            let mut user_input = String::new();
-            io::stdin().read_line(&mut user_input)?;
+            // Get optional suggestion from user
+            if let Some(suggestion_text) = interaction::prompt_suggestion(false)? {
+                // Save suggestion to c2rust.md
+                suggestion::append_suggestion(&suggestion_text)?;
+            }
             
-            let input_trimmed = user_input.trim();
-            if input_trimmed.eq_ignore_ascii_case("retry") {
-                println!("│ {}", "Retrying translation...".bright_cyan());
+            // If we can still retry translation, do so
+            if !is_last_attempt {
+                let remaining_retries = MAX_TRANSLATION_ATTEMPTS - attempt_number;
+                println!("│ {}", format!("Retrying translation from scratch... ({} retries remaining)", remaining_retries).bright_cyan());
                 println!("│ {}", "Note: The translator will overwrite the existing file content.".bright_blue());
                 println!("│ {}", "✓ Retry scheduled".bright_green());
-                return Ok(false); // Signal retry
-            } else if input_trimmed.is_empty() {
-                // User pressed Enter to skip
-                println!("│ {}", "Skipping file due to build errors.".yellow());
-                return Err(build_error).context(format!(
-                    "Build failed after {} fix attempts for file {}",
-                    max_fix_attempts,
-                    rs_file.display()
-                ));
+                Ok(false)// Signal retry
             } else {
-                // Invalid input, prompt user to try again
-                println!("│ {}", format!("Invalid input '{}'. Please type 'retry' to retry, or press Enter to skip.", input_trimmed).yellow());
-                continue;
+                // No more translation retries, but we can try fix again
+                println!("│ {}", "No translation retries remaining, attempting fix with new suggestion...".bright_yellow());
+                
+                // Apply fix with the suggestion
+                let format_progress = |op: &str| format!("Fix with suggestion - {}", op);
+                apply_error_fix(feature, file_type, rs_file, &build_error, &format_progress, true)?;
+                
+                // Try to build one more time
+                println!("│");
+                println!("│ {}", "Building with applied fix...".bright_blue().bold());
+                match builder::cargo_build(feature, true) {
+                    Ok(_) => {
+                        println!("│ {}", "✓ Build successful after applying suggestion!".bright_green().bold());
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        println!("│ {}", "✗ Build still failing after fix attempt".red());
+                        Err(e).context(format!(
+                            "Build failed after fix with suggestion for file {}",
+                            rs_file.display()
+                        ))
+                    }
+                }
             }
         }
-    } else {
-        let total_retries = MAX_TRANSLATION_ATTEMPTS - 1;
-        println!("│ {}", format!("All {} attempts exhausted (1 initial + {} retries). Cannot retry further.", MAX_TRANSLATION_ATTEMPTS, total_retries).red());
-        Err(build_error).context(format!(
-            "Build failed after {} fix attempts and {} retries for file {}",
-            max_fix_attempts,
-            total_retries,
-            rs_file.display()
-        ))
+        interaction::UserChoice::ManualFix => {
+            println!("│");
+            println!("│ {}", "You chose: Manual fix".bright_cyan());
+            
+            // Try to open vim
+            match interaction::open_in_vim(rs_file) {
+                Ok(_) => {
+                    // After Vim editing, repeatedly try building and allow the user
+                    // to decide whether to retry or exit, using a loop to avoid recursion
+                    loop {
+                        println!("│");
+                        println!("│ {}", "Vim editing completed. Attempting to build...".bright_blue());
+                        
+                        // Try building after manual edit
+                        match builder::cargo_build(feature, true) {
+                            Ok(_) => {
+                                println!("│ {}", "✓ Build successful after manual fix!".bright_green().bold());
+                                return Ok(true);
+                            }
+                            Err(e) => {
+                                println!("│ {}", "✗ Build still failing after manual fix".red());
+                                
+                                // Ask if user wants to try again
+                                println!("│");
+                                println!("│ {}", "Build still has errors. What would you like to do?".yellow());
+                                let retry_choice = interaction::prompt_user_choice("Build still failing", false)?;
+                                
+                                match retry_choice {
+                                    interaction::UserChoice::Continue => {
+                                        // Continue: just retry the build with existing changes
+                                        continue;
+                                    }
+                                    interaction::UserChoice::ManualFix => {
+                                        println!("│ {}", "Reopening file in Vim for additional manual fixes...".bright_blue());
+                                        match interaction::open_in_vim(rs_file) {
+                                            Ok(_) => {
+                                                // After additional manual fixes, loop will retry the build
+                                                continue;
+                                            }
+                                            Err(open_err) => {
+                                                println!("│ {}", format!("Failed to reopen vim: {}", open_err).red());
+                                                println!("│ {}", "Cannot continue manual fix flow; exiting.".yellow());
+                                                return Err(open_err).context(format!(
+                                                    "Build still failing and could not reopen vim for file {}",
+                                                    rs_file.display()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    interaction::UserChoice::Exit => {
+                                        return Err(e).context(format!(
+                                            "Build failed after manual fix for file {}",
+                                            rs_file.display()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("│ {}", format!("Failed to open vim: {}", e).red());
+                    println!("│ {}", "Falling back to exit.".yellow());
+                    Err(e).context(format!(
+                        "Build failed (original error: {}) and could not open vim for file {}",
+                        build_error,
+                        rs_file.display()
+                    ))
+                }
+            }
+        }
+        interaction::UserChoice::Exit => {
+            println!("│");
+            println!("│ {}", "You chose: Exit".yellow());
+            println!("│ {}", "Exiting due to build failures.".yellow());
+            Err(build_error).context(format!(
+                "Build failed after {} fix attempts for file {}. User chose to exit.",
+                max_fix_attempts,
+                rs_file.display()
+            ))
+        }
     }
 }
 
 /// Apply error fix to the file
-fn apply_error_fix<F>(
+pub(crate) fn apply_error_fix<F>(
     feature: &str,
     file_type: &str,
     rs_file: &std::path::Path,
@@ -421,7 +565,13 @@ where
 }
 
 /// Complete file processing (commit, analyze, hybrid build)
-fn complete_file_processing<F>(feature: &str, file_name: &str, format_progress: &F) -> Result<()>
+fn complete_file_processing<F>(
+    feature: &str, 
+    file_name: &str, 
+    file_type: &str,
+    rs_file: &std::path::Path,
+    format_progress: &F
+) -> Result<()>
 where
     F: Fn(&str) -> String
 {
@@ -444,7 +594,7 @@ where
     println!("│");
     println!("│ {}", format_progress("Hybrid Build Tests").bright_magenta().bold());
     println!("│ {}", "Running hybrid build tests...".bright_blue());
-    builder::run_hybrid_build(feature)?;
+    builder::run_hybrid_build_interactive(feature, Some(file_type), Some(rs_file))?;
     
     println!("{}", "└─ File processing complete".bright_white().bold());
     

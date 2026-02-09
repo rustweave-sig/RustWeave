@@ -7,6 +7,7 @@
 ### 核心功能
 - 自动化的 C 到 Rust 翻译工作流
 - 支持基于特性(feature)的翻译，使用 `--feature` 标志
+- **目标制品选择** - 在翻译前自动提示选择目标制品（从 `.c2rust/<feature>/c/targets.list` 读取）
 - 交互式文件选择或自动处理模式（`--allow-all`）
 - 自动初始化 Rust 项目结构
 - 自动检测和修复构建错误
@@ -15,7 +16,8 @@
 ### 用户体验优化
 - **彩色输出** - 构建/测试/清理命令使用不同颜色高亮，成功/错误/警告消息带有图标标识
 - **代码预览** - 显示正在翻译的 C 代码（默认前 15 行）和构建错误（默认前 10 行），可使用 `--show-full-output` 选项显示完整内容
-- **进度持久化** - 保存翻译进度，中断后可恢复（`.c2rust/<feature>/rust/progress.json`）
+- **进度跟踪** - 基于文件内容实时跟踪翻译进度，显示当前处理文件在所有文件中的序号和总数（如 `[7/10] Processing var_example.rs`，表示已处理6个，正在处理第7个，共10个文件）
+- **智能恢复** - 中断后重新运行时，自动跳过已处理（非空）的文件，进度序号会继续累计（例如已完成6个文件后中断，重启后会从 `[7/10]` 继续）
 - **执行时间统计** - 显示所有命令的耗时，便于识别性能瓶颈
 - **文件排序显示** - 未处理文件按字母顺序列出
 
@@ -101,9 +103,12 @@ Your selection: 1,3-4
 
 该命令将执行以下操作：
 
-1. **初始化** - 检查并初始化 `<特性名称>/rust` 目录
-2. **扫描** - 查找所有空的 `.rs` 文件
-3. **翻译** - 对每个文件：
+1. **初始化**（如需要）- 检查并初始化 `<特性名称>/rust` 目录
+2. **目标制品选择** - 提示用户从 `.c2rust/<特性名称>/c/targets.list` 中选择目标制品
+   - 自动读取并去重制品列表
+   - 如果只有一个制品，自动选择
+   - 选择结果存储到配置文件中（`build.target`）
+3. **文件翻译** - 对每个空的 `.rs` 文件：
    - 根据文件名前缀（`var_` 或 `fun_`）确定类型
    - 翻译对应的 `.c` 文件为 Rust
    - 构建并自动修复编译错误（默认最多 10 次尝试，可通过 `--max-fix-attempts` 选项配置）
@@ -129,23 +134,31 @@ Your selection: 1,3-4
 ```
 项目根目录/
 ├── .c2rust/
-│   └── config.toml           # 配置文件
-└── <feature>/
-    └── rust/                 # 待翻译的 .rs 和 .c 文件
-        ├── Cargo.toml        # Rust 项目配置
-        ├── fun_*.rs / .c     # 函数翻译文件
-        └── var_*.rs / .c     # 变量翻译文件
+│   ├── config.toml           # 配置文件
+│   └── <feature>/
+│       ├── c/
+│       │   └── targets.list  # 目标制品列表
+│       └── rust/             # 待翻译的 .rs 和 .c 文件
+│           ├── Cargo.toml    # Rust 项目配置
+│           ├── fun_*.rs / .c # 函数翻译文件
+│           └── var_*.rs / .c # 变量翻译文件
 ```
 
 #### 工具用法示例
 
 **翻译工具调用格式：**
 ```bash
-# 翻译
-python translate_and_fix.py --config <config.toml> --type <var|fn> --code <input.c> --output <output.rs>
+# 变量翻译
+python translate_and_fix.py --config <config.toml> --type var --c_code <input.c> --output <output.rs>
 
-# 修复错误
-python translate_and_fix.py --config <config.toml> --type fix --code <code.rs> --output <output.rs> --error <error.txt>
+# 函数翻译
+python translate_and_fix.py --config <config.toml> --type fn --c_code <input.c> --output <output.rs>
+
+# 语法修复（没有修复建议时）
+python translate_and_fix.py --config <config.toml> --type syntax_fix --c_code <code.c> --rust_code <code.rs> --output <output.rs> --error <error.txt>
+
+# 语法修复（有修复建议时）
+python translate_and_fix.py --config <config.toml> --type syntax_fix --c_code <code.c> --rust_code <code.rs> --output <output.rs> --error <error.txt> --suggestion <suggestion.txt>
 ```
 
 **代码分析工具：**
@@ -170,14 +183,117 @@ c2rust-translate translate
 
 ## 错误处理
 
-工具会在以下情况下停止执行并显示错误：
+工具在遇到编译错误或测试失败时提供智能的交互式错误处理：
+
+### 自动修复尝试
+
+- 编译错误会自动尝试修复（默认最多 10 次，可通过 `--max-fix-attempts` 配置）
+- 每次修复失败后，自动应用下一次修复
+
+### 交互式错误处理
+
+当达到最大修复尝试次数后，工具会提供三个选项供用户选择：
+
+#### 1. 继续尝试（Continue）
+- 允许用户输入修复建议提示词
+- 提示词会保存到项目根目录的 `c2rust.md` 文件中
+- 后续的修复尝试会使用这些提示词作为参考
+- **对于测试失败**：必须输入修复建议才能继续
+
+**使用场景**：
+- 您已经分析了错误原因，想要给 AI 提供更具体的修复方向
+- 需要添加特定的约束或要求到修复过程中
+
+#### 2. 手工修复（Manual Fix）
+- 自动在 vim 中打开失败的 Rust 文件
+- 完整显示 C 源代码和 Rust 代码（不截断）
+- 手工修改后会自动重新执行构建
+  - 对于构建失败：手工修改保存后会自动重新执行构建
+  - 对于测试失败：手工修改保存后会自动重新执行构建和测试
+- 如果修改后仍有错误，可以继续选择处理方式
+
+**使用场景**：
+- 错误原因明确，手工修改更快
+- 需要进行复杂的代码重构
+- AI 修复多次失败，需要人工介入
+
+#### 3. 退出（Exit）
+- 停止翻译过程并退出工具
+- 未完成的文件不会被处理
+
+**使用场景**：
+- 遇到无法解决的问题，需要停止处理
+- 当前任务无法继续，需要修改项目配置或依赖后重新运行
+
+### 适用场景
+
+交互式错误处理适用于以下情况：
+
+1. **编译失败**：达到最大修复尝试次数后
+2. **测试失败**：混合构建测试失败时
+3. **启动时失败**：翻译开始前的初始构建或测试失败
+
+### 建议文件（c2rust.md）
+
+- **位置**：项目根目录下的 `c2rust.md`
+- **格式**：Markdown 格式，带时间戳
+- **用途**：存储用户输入的修复建议，供 translate_and_fix.py 参考
+- **持久化**：建议会累积保存，可以在多次翻译过程中复用
+
+### 示例流程
+
+```
+⚠ Maximum fix attempts reached!
+File example.rs still has build errors after 10 fix attempts.
+
+File Locations:
+  C file:    /path/to/example.c
+  Rust file: /path/to/example.rs
+
+═══ C Source Code (Full) ═══
+[显示完整C代码]
+
+═══ Rust Code (Full) ═══
+[显示完整Rust代码]
+
+═══ Build Error ═══
+[显示编译错误]
+
+⚠ Build failure - What would you like to do?
+
+Available options:
+  1. Continue trying (optionally enter a fix suggestion)
+  2. Manual fix (edit the file directly)
+  3. Exit (abort the translation process)
+
+Enter your choice (1/2/3): 1
+
+Please enter your fix suggestion:
+(The suggestion will be saved and used in the next fix attempt)
+(Press Enter to skip entering a suggestion)
+
+Suggestion: Please use std::ffi::CStr instead of raw pointer manipulation
+
+✓ Suggestion recorded: Please use std::ffi::CStr instead of raw pointer manipulation
+✓ Suggestion saved to /path/to/project/c2rust.md
+```
+
+### 错误类型
+
+工具会在以下情况下提供交互选项或停止执行：
+
+**提供交互选项的情况**：
+- 构建错误修复超过配置的最大尝试次数（默认 10 次）- 提供继续/手工修复/退出选项
+- 混合构建测试失败 - 提供继续/手工修复/退出选项（继续需要输入建议）
+- 启动时的初始构建失败 - 提供继续/手工修复/退出选项
+- 启动时的初始测试失败 - 提供继续/手工修复/退出选项
+
+**直接停止的情况**：
 - Rust 目录初始化失败
 - 缺少对应的 `.c` 文件
-- 翻译或错误修复失败
-- 构建错误修复超过配置的最大尝试次数仍失败（默认 10 次，可通过 `--max-fix-attempts` 配置）
-- 混合构建测试失败（需要 c2rust-config 正确配置）
+- 翻译失败
 - Git 操作失败（add/commit，"nothing to commit" 除外）
-- 最终构建失败
+- 用户选择"退出"选项
 
 ## Git 集成
 
