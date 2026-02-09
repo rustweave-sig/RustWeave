@@ -101,6 +101,7 @@ impl Feature {
         let rust_old = self.root.join("rust_old");
         let _ = fs::remove_dir_all(&rust_old);
         let _ = fs::rename(&rust, &rust_old);
+        let _ = fs::remove_dir_all(&rust);
         println!("Backed up existing rust directory to rust_old");
         let guard = Guard::make(|_| {
             // 不删除，方便定位，后续重复执行会无条件覆盖.
