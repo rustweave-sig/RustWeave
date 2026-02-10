@@ -108,19 +108,19 @@ def filter_model_response(response):
     except Exception as e:
         raise RuntimeError(f"ERROR - 过滤大模型输出-替换no_mangle为unsafe(no_mangle)出错: {e}") from e
 
-    # use crate::* 处理
+    # use super::* 处理
     try:
-        if final_response.startswith("use crate::*;"):
+        if final_response.startswith("use super::*;"):
             # 情况1：已正确包含分号，保持不变
             pass
-        elif final_response.startswith("use crate::*"):
-            # 情况2：有 use crate::* 但缺少分号，在其后精确添加一个分号（不添加空格或换行）
-            final_response = "use crate::*;" + final_response[len("use crate::*"):]
+        elif final_response.startswith("use super::*"):
+            # 情况2：有 use super::* 但缺少分号，在其后精确添加一个分号（不添加空格或换行）
+            final_response = "use super::*;" + final_response[len("use super::*"):]
         else:
-            # 情况3：完全缺失 use crate::*，在开头添加完整语句和两个换行
-            final_response = "use crate::*;\n\n" + final_response
+            # 情况3：完全缺失 use super::*，在开头添加完整语句和两个换行
+            final_response = "use super::*;\n\n" + final_response
     except Exception as e:
-        raise RuntimeError(f"ERROR - 过滤大模型输出-添加use crate::*;出错: {e}") from e
+        raise RuntimeError(f"ERROR - 过滤大模型输出-添加use super::*;出错: {e}") from e
 
     return final_response
 
