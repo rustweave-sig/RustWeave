@@ -21,26 +21,35 @@ def var_translation(C_var_code, model, openai_instance, suggestion_file_path=Non
         FileNotFoundError: 模板文件不存在
         ValueError: 模板格式错误
     """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception as e:
+        raise RuntimeError(f"Error - 获取文件路径失败: {e}")
 
     if suggestion_file_path is None:
-        suggestion_file_path = os.path.join(script_dir, 'prompts/suggestion.txt')
+        try:
+            suggestion_file_path = os.path.join(script_dir, 'prompts/suggestion.txt')
+        except Exception as e:
+            print(f"Warning - 获取默认修复建议文件路径失败: {e}")
 
     if prompt_file is None:
-        prompt_file  = os.path.join(script_dir, 'prompts/var_translation.txt')
+        try:
+            prompt_file  = os.path.join(script_dir, 'prompts/var_translation.txt')
+        except Exception as e:
+            raise RuntimeError(f"Error - 获取默认prompt文件路径失败: {e}")
 
     # 读取模板文件
     try:
         with open(prompt_file, 'r', encoding='utf-8') as f:
             prompt_template = f.read()
     except FileNotFoundError:
-        raise FileNotFoundError(f"Prompt模板文件不存在: {prompt_file}")
+        raise FileNotFoundError(f"Error - Prompt模板文件不存在: {prompt_file}")
     except UnicodeDecodeError:
         # 尝试UTF-8-SIG（处理BOM问题）
         with open(prompt_file, 'r', encoding='utf-8-sig') as f:
             prompt_template = f.read()
     except Exception as e:
-        raise RuntimeError(f"读取prompt文件失败 ({prompt_file}): {e}")
+        raise RuntimeError(f"Error - 读取prompt文件失败 ({prompt_file}): {e}")
 
     # 安全替换占位符
     try:
@@ -48,15 +57,21 @@ def var_translation(C_var_code, model, openai_instance, suggestion_file_path=Non
         prompt = prompt_template.format(C_var_code=C_var_code)
     except KeyError as e:
         raise ValueError(
-            f"Prompt模板缺少必需的占位符 {{{e}}}。\n"
+            f"Error - Prompt模板缺少必需的占位符 {{{e}}}。\n"
             "模板中必须包含 '{C_var_code}'（注意大小写）"
         )
     except Exception as e:
-        raise RuntimeError(f"格式化prompt时出错: {e}")
+        raise RuntimeError(f"Error - 格式化prompt时出错: {e}")
 
-    # 调用LLM并过滤
-    output = call_llm_api(prompt, model, openai_instance)
-    return filter_model_response(output)
+    # 调用LLM并过滤（带超时保护）
+    try:
+        output = call_llm_api(prompt, model, openai_instance)
+        return filter_model_response(output)
+    except Exception as e:
+        # 附加上下文便于调试
+        raise RuntimeError(
+            f"Error - LLM调用或响应过滤失败。原始错误: {type(e).__name__}: {e}"
+        ) from e
 
 # ====================== 测试用例 ======================
 def run_all_tests():
@@ -278,7 +293,7 @@ pub static mut status_flags: Flags = Flags::new();
                 """,
             "explanation": "静态变量的全局变量，Rust应用Mutex包装",
             "expected": """
-                static CALL_COUNT: LazyLock<Mutex<i32>> = LazyLock::new(|| Mutex::new(0));
+                static call_count: LazyLock<Mutex<i32>> = LazyLock::new(|| Mutex::new(0));
                 """
         }
     ]

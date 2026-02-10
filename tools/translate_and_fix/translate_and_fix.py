@@ -75,7 +75,7 @@ elif tool_type == "semantic_fix":
 else:
     # 关闭大模型会话
     close_openai_instance(openai_instance)
-    print(f"调用工具的类型出错，只允许以下值： var/fn/fix（分别代表变量翻译/函数翻译/语法修复）")
+    print(f"ERROR - 调用工具的类型出错，只允许以下值： var/fn/syntax_fix/semantic_fix（分别代表变量翻译/函数翻译/语法修复/语义修复）")
     exit(1)
 
 # 关闭大模型会话
@@ -85,7 +85,7 @@ close_openai_instance(openai_instance)
 try:
     with open(args.output, 'w', encoding='utf-8') as file:
         file.write(res)
-        print(f"翻译/修复结果已写入 {args.output}")
+        print(f"Info - 翻译/修复结果已写入 {args.output}")
 except Exception as e:
     print(f"ERROR - 写入output文件时发生错误: {e}")
     exit(1)
