@@ -1,8 +1,10 @@
+import os
+
 from LLM_calling import call_llm_api
 from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
 
-def var_translation(C_var_code, model, openai_instance, prompt_file='./prompts/var_translation.txt'):
+def var_translation(C_var_code, model, openai_instance, suggestion_file_path=None, prompt_file=None):
     """
     将C全局变量翻译为Rust全局变量（使用外部prompt模板）
 
@@ -19,6 +21,14 @@ def var_translation(C_var_code, model, openai_instance, prompt_file='./prompts/v
         FileNotFoundError: 模板文件不存在
         ValueError: 模板格式错误
     """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if suggestion_file_path is None:
+        suggestion_file_path = os.path.join(script_dir, 'prompts/suggestion.txt')
+
+    if prompt_file is None:
+        prompt_file  = os.path.join(script_dir, 'prompts/var_translation.txt')
+
     # 读取模板文件
     try:
         with open(prompt_file, 'r', encoding='utf-8') as f:

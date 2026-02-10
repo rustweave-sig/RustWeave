@@ -3,6 +3,11 @@
 # ignore all json files
 *.json
 
+c_code.txt
+error.txt
+output.txt
+rust_code.txt
+
 # ignore all log files
 *.log
 *.log.*

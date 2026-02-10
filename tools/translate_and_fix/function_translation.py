@@ -1,8 +1,10 @@
+import os
+
 from LLM_calling import call_llm_api
 from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
 
-def function_translation(C_function_code, model, openai_instance, prompt_file='./prompts/func_translation.txt'):
+def function_translation(C_function_code, model, openai_instance, suggestion_file_path=None, prompt_file=None):
     """
     将C函数翻译为Rust函数（使用外部prompt模板）
 
@@ -20,6 +22,14 @@ def function_translation(C_function_code, model, openai_instance, prompt_file='.
         ValueError: 模板格式错误
         RuntimeError: 读取/格式化失败
     """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if suggestion_file_path is None:
+        suggestion_file_path = os.path.join(script_dir, 'prompts/suggestion.txt')
+
+    if prompt_file is None:
+        prompt_file  = os.path.join(script_dir, 'prompts/func_translation.txt')
+
     # 读取模板文件（带编码容错）
     try:
         # 优先尝试标准UTF-8

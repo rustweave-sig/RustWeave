@@ -1,3 +1,5 @@
+import os
+
 from LLM_calling import call_llm_api
 from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance # 这两个函数只用在该文件的示例中，实际项目中应在初始化阶段完成
@@ -24,7 +26,7 @@ def safe_read_file(file_path, context="文件"):
     except Exception as e:
         raise RuntimeError(f"读取{context}时发生未知错误 ({file_path}): {e}")
 
-def semantic_fixing(c_code, rust_code, model, openai_instance, suggestion_file_path='./suggestion.txt', prompt_file='./prompts/semantic_fixing.txt'):
+def semantic_fixing(c_code, rust_code, model, openai_instance, suggestion_file_path=None, prompt_file=None):
     """
     修复Rust代码中的语义错误（使用外部prompt模板 + 修复建议文件）
 
@@ -44,6 +46,13 @@ def semantic_fixing(c_code, rust_code, model, openai_instance, suggestion_file_p
         ValueError: 模板格式错误
         RuntimeError: 读取/格式化/LLM调用失败
     """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if suggestion_file_path is None:
+        suggestion_file_path = os.path.join(script_dir, 'prompts/suggestion.txt')
+
+    if prompt_file is None:
+        prompt_file = os.path.join(script_dir, 'prompts/semantic_fixing.txt')
 
     # 读取修复建议文件
     suggestion = ""
