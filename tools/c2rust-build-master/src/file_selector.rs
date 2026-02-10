@@ -5,6 +5,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// ANSI escape code to show cursor (restore terminal visibility)
+const ANSI_SHOW_CURSOR: &str = "\x1B[?25h";
+
 /// Represents a preprocessed file available for selection
 #[derive(Debug, Clone)]
 pub struct PreprocessedFileInfo {
@@ -67,6 +70,7 @@ fn collect_files_recursive(
 pub fn select_files_interactive(
     files: Vec<PreprocessedFileInfo>,
     no_interactive: bool,
+    selected_target: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     if files.is_empty() {
         println!("No preprocessed files found.");
@@ -87,6 +91,16 @@ pub fn select_files_interactive(
 
     println!("\n=== File Selection ===");
     println!("Found {} preprocessed file(s)", files.len());
+
+    // Show different prompts based on whether a target was selected
+    if let Some(target) = selected_target {
+        println!(
+            "\x1b[1m选择参与构建 target '{}' 的文件 | Select files that participate in building target '{}'\x1b[0m",
+            target, target
+        );
+    } else {
+        println!("\x1b[1m选择要翻译的文件 | Select files to translate\x1b[0m");
+    }
     println!("Use SPACE to select/deselect, ENTER to confirm, ESC to cancel");
     println!();
 
@@ -95,14 +109,23 @@ pub fn select_files_interactive(
     // All files are selected by default
     let defaults: Vec<bool> = vec![true; files.len()];
 
+    let prompt_text = if let Some(target) = selected_target {
+        format!(
+            "Select files that participate in building target '{}'",
+            target
+        )
+    } else {
+        "Select files to translate".to_string()
+    };
+
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select files to translate")
+        .with_prompt(&prompt_text)
         .items(&items)
         .defaults(&defaults)
         .interact()
         .map_err(|e| {
             // Restore terminal state, ensure cursor is visible
-            print!("\x1B[?25h"); // ANSI escape code to show cursor
+            print!("{}", ANSI_SHOW_CURSOR);
             if let Err(flush_err) = std::io::stdout().flush() {
                 eprintln!(
                     "Warning: Failed to flush terminal output during restoration: {}",
@@ -118,10 +141,15 @@ pub fn select_files_interactive(
         .map(|idx| files[idx].path.clone())
         .collect();
 
-    println!(
-        "\nSelected {} file(s) for translation",
-        selected_files.len()
-    );
+    if let Some(target) = selected_target {
+        println!(
+            "\nSelected {} file(s) that participate in building target '{}'",
+            selected_files.len(),
+            target
+        );
+    } else {
+        println!("\nSelected {} file(s)", selected_files.len());
+    }
 
     Ok(selected_files)
 }
@@ -171,8 +199,7 @@ pub fn save_selected_files(
 /// # Arguments
 /// * `all_files` - All preprocessed files found
 /// * `selected_files` - Files selected by the user to keep
-/// * `base_dir` - The root directory for preprocessing files (e.g., .c2rust/{feature}/c).
-///                Directory cleanup will not traverse above this boundary.
+/// * `base_dir` - Root directory for preprocessing files; cleanup will not traverse above this boundary
 pub fn cleanup_unselected_files(
     all_files: &[PreprocessedFileInfo],
     selected_files: &[PathBuf],
@@ -334,6 +361,9 @@ fn cleanup_empty_directories(dirs: HashSet<PathBuf>, base_dir: &Path) -> Result<
 /// 3. Saves the selected files to a JSON file
 /// 4. Cleans up unselected files
 ///
+/// # Parameters
+/// - `selected_target`: Optional target name to include in prompts
+///
 /// # Returns
 /// - `Ok(usize)` - The number of files selected (0 if no files were found or selected)
 /// - `Err` - If any file operation fails
@@ -342,6 +372,7 @@ pub fn process_and_select_files(
     feature: &str,
     project_root: &Path,
     no_interactive: bool,
+    selected_target: Option<&str>,
 ) -> Result<usize> {
     println!("\nCollecting preprocessed files from: {}", c_dir.display());
 
@@ -356,20 +387,28 @@ pub fn process_and_select_files(
         return Ok(0);
     }
 
-    let selected_files = select_files_interactive(preprocessed_files.clone(), no_interactive)?;
+    let selected_files =
+        select_files_interactive(preprocessed_files.clone(), no_interactive, selected_target)?;
 
     if !selected_files.is_empty() {
         // First save the selection
         save_selected_files(&selected_files, feature, project_root)?;
         let count = selected_files.len();
-        println!("Selected {} file(s) for translation", count);
+        if let Some(target) = selected_target {
+            println!(
+                "Selected {} file(s) that participate in building target '{}'",
+                count, target
+            );
+        } else {
+            println!("Selected {} file(s)", count);
+        }
 
         // Then cleanup unselected files
         cleanup_unselected_files(&preprocessed_files, &selected_files, c_dir)?;
 
         Ok(count)
     } else {
-        println!("No files selected for translation.");
+        println!("No files selected.");
         Ok(0)
     }
 }

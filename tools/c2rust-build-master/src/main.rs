@@ -2,6 +2,7 @@ mod config_helper;
 mod error;
 mod file_selector;
 mod git_helper;
+mod target_selector;
 mod targets_processor;
 mod tracker;
 
@@ -116,13 +117,19 @@ fn run(args: CommandArgs) -> Result<()> {
     println!("Command: {}", command.join(" "));
     println!();
 
+    // Truncate targets.list before build to avoid stale entries from previous builds
+    // libhook.so appends to the file, so we need to clear it first
+    let targets_list_path = project_root
+        .join(".c2rust")
+        .join(feature)
+        .join("c")
+        .join("targets.list");
+    if targets_list_path.exists() {
+        fs::write(&targets_list_path, "")?;
+    }
+
     println!("Tracking build process...");
     let compilers = tracker::track_build(&current_dir, &command, &project_root, feature)?;
-
-    // Process and clean up targets.list after build
-    println!("\nProcessing binary targets...");
-    targets_processor::process_targets_list(&project_root, feature)?;
-    println!("✓ Binary targets list generated at: .c2rust/{}/c/targets.list", feature);
 
     // Check for preprocessed files instead of compile_entries
     let c_dir = project_root.join(".c2rust").join(feature).join("c");
@@ -133,16 +140,23 @@ fn run(args: CommandArgs) -> Result<()> {
     if preprocessed_count == 0 {
         println!("Warning: No C file compilations were tracked.");
         println!("Make sure your build command actually compiles C files.");
-    } else {
-        println!("\nNote: Preprocessed files are generated directly by libhook.so");
-        println!("Files are located at: .c2rust/{}/c/", feature);
+    }
 
-        // File selection step
+    println!("\nNote: Files and targets are generated directly by libhook.so");
+    println!("Files are located at: .c2rust/{}/c/", feature);
+
+    // Target artifact selection step (do this first)
+    let selected_target =
+        target_selector::process_and_select_target(&project_root, feature, args.no_interactive)?;
+
+    // File selection step (select files that participate in building the target)
+    if preprocessed_count > 0 {
         file_selector::process_and_select_files(
             &c_dir,
             feature,
             &project_root,
             args.no_interactive,
+            selected_target.as_deref(),
         )?;
     }
 
@@ -153,6 +167,11 @@ fn run(args: CommandArgs) -> Result<()> {
         Some(feature),
         &project_root,
     )?;
+
+    // Save selected target if one was chosen
+    if let Some(target) = selected_target {
+        config_helper::save_target(&target, Some(feature), &project_root)?;
+    }
 
     if !compilers.is_empty() {
         println!("\nSaving detected compilers...");
