@@ -22,13 +22,22 @@ def function_translation(C_function_code, model, openai_instance, suggestion_fil
         ValueError: 模板格式错误
         RuntimeError: 读取/格式化失败
     """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception as e:
+        raise RuntimeError(f"Error - 获取文件路径失败: {e}")
 
     if suggestion_file_path is None:
-        suggestion_file_path = os.path.join(script_dir, 'prompts/suggestion.txt')
+        try:
+            suggestion_file_path = os.path.join(script_dir, 'prompts/suggestion.txt')
+        except Exception as e:
+            print(f"Warning - 获取默认修复建议文件路径失败: {e}")
 
     if prompt_file is None:
-        prompt_file  = os.path.join(script_dir, 'prompts/func_translation.txt')
+        try:
+            prompt_file  = os.path.join(script_dir, 'prompts/func_translation.txt')
+        except Exception as e:
+            raise RuntimeError(f"Error - 获取默认prompt文件路径失败: {e}")
 
     # 读取模板文件（带编码容错）
     try:
@@ -42,13 +51,13 @@ def function_translation(C_function_code, model, openai_instance, suggestion_fil
                 prompt_template = f.read()
         except Exception as e:
             raise RuntimeError(
-                f"无法读取prompt文件（UTF-8和UTF-8-SIG均失败）: {prompt_file}\n"
+                f"Error - 无法读取prompt文件（UTF-8和UTF-8-SIG均失败）: {prompt_file}\n"
                 f"错误详情: {e}"
             )
     except FileNotFoundError:
-        raise FileNotFoundError(f"Prompt模板文件不存在: {prompt_file}")
+        raise FileNotFoundError(f"Error - Prompt模板文件不存在: {prompt_file}")
     except Exception as e:
-        raise RuntimeError(f"读取prompt文件时发生未知错误 ({prompt_file}): {e}")
+        raise RuntimeError(f"Error - 读取prompt文件时发生未知错误 ({prompt_file}): {e}")
 
     # 安全替换占位符
     try:
@@ -57,17 +66,17 @@ def function_translation(C_function_code, model, openai_instance, suggestion_fil
     except KeyError as e:
         missing_key = str(e).strip("'")
         raise ValueError(
-            f"Prompt模板缺少必需的占位符 {{{missing_key}}}。\n"
+            f"Error - Prompt模板缺少必需的占位符 {{{missing_key}}}。\n"
             f"模板中必须包含 '{{C_function_code}}'（注意大小写）\n"
             f"模板文件: {prompt_file}"
         )
     except IndexError:
         raise ValueError(
-            "Prompt模板包含非法的格式化占位符（如 {} 未命名）。\n"
+            "Error - Prompt模板包含非法的格式化占位符（如 {} 未命名）。\n"
             "请确保所有花括号都是双花括号 {{ }} 或命名占位符 {C_function_code}"
         )
     except Exception as e:
-        raise RuntimeError(f"格式化prompt时出错: {e}")
+        raise RuntimeError(f"Error - 格式化prompt时出错: {e}")
 
     # 调用LLM并过滤
     try:
@@ -76,11 +85,7 @@ def function_translation(C_function_code, model, openai_instance, suggestion_fil
     except Exception as e:
         # 附加上下文信息便于调试
         raise RuntimeError(
-            f"LLM调用或响应过滤失败。可能原因:\n"
-            f"  - Prompt过长（当前长度: {len(prompt)} 字符）\n"
-            f"  - API密钥/网络问题\n"
-            f"  - 模型返回格式异常\n"
-            f"原始错误: {e}"
+            f"Error - LLM调用或响应过滤失败。原始错误: {e}"
         ) from e
 
 # ====================== 测试用例 ======================
