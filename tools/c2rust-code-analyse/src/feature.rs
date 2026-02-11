@@ -276,7 +276,7 @@ impl Feature {
 
         let mut nodes = HashMap::new();
         for node in file.iter() {
-            if !Self::is_node_definition(node) {
+            if !Self::is_node_definition(node) || node.kind.is_variadic() {
                 continue;
             }
             let Some(name) = node.kind.name() else {
@@ -316,13 +316,13 @@ impl Feature {
     }
 
     pub fn generate_types_rs(&self, file: &File, mod_dir: &Path) -> Result<()> {
-        let mut input = file.path().with_extension("c2rust_global");
-        if !input.exists() {
-            input = file.path().to_path_buf();
-        }
+        let types_h = mod_dir.join("types.h");
+        let header = file.export_header(&self.root.join("c"))?;
+        fs::write(&types_h, header.as_bytes()).to_err()?;
+
         let output = Command::new("bindgen")
             .current_dir(mod_dir)
-            .arg(input)
+            .arg(types_h)
             .arg("-o")
             .arg("types.rs")
             .arg("--no-layout-tests")
@@ -335,6 +335,8 @@ impl Feature {
             .arg("--")
             .arg("-fno-builtin")
             .arg("-xc")
+            .arg("-Wno-duplicate-decl-specifier")
+            .arg("-Wno-attributes")
             .output()
             .log_err("bindgen")?;
         if !output.status.success() {

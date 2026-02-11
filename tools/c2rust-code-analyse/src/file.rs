@@ -228,9 +228,9 @@ impl Kind {
                 return Ok(String::new());
             }
             // TO DO: cJSON临时修改.
-            if name.starts_with("_Float") {
-                return Ok(String::new());
-            }
+            // if name.starts_with("_Float") {
+            //    return Ok(String::new());
+            // }
         }
         let Some(range) = self.range() else {
             return Err(Error::inval());
@@ -361,6 +361,14 @@ impl Kind {
             _ => false,
         }
     }
+
+    /// 是否变长参数，这类函数Rust无法实现
+    pub fn is_variadic(&self) -> bool {
+        let Kind::FunctionDecl(ref item) = self else {
+            return false;
+        };
+        item.ty.qual_type.contains("...") || item.ty.qual_type.contains("struct __va_list_tag")
+    }
 }
 
 fn init_base_location(target: &mut BareSourceLocation, src: &BareSourceLocation) {
@@ -489,6 +497,8 @@ pub struct FunctionDecl {
     is_implicit: bool,
     #[serde(default)]
     inline: bool,
+    #[serde(rename = "type")]
+    ty: MyClangType,
     #[serde(default, rename = "storageClass")]
     storage_class: Option<String>,
     #[serde(default)]
@@ -550,17 +560,19 @@ impl File {
         if !has_static {
             return Ok(node);
         }
-        let code = Self::generate_c_code(root, &node.inner, true)?;
+        let code = Self::generate_c_code(root, &node.inner, true, false)?;
         let new_c_file = higuard::Guard::new(path.with_extension("c"), |p| {
             // 不删除方便定位，后续执行会无条件覆盖.
             // let _ = fs::remove_file(p);
         });
         let new_c2rust_file = path.with_extension("c2rust_global");
         fs::write(&*new_c2rust_file, code.as_bytes()).to_err()?;
+        // 输入已经是预处理后的文件，这里无条件使用clang只实现宏展开，不会引入clang特有的内容.
         let output = Command::new(get_clang())
             .arg("-xc")
             .arg("-E")
             .arg("-P") //去除行号, 混合构建需要调试应该直接定位到这里生成的文件而不是原文件.
+            .arg("-fno-builtin")
             .arg(&*new_c2rust_file)
             .arg("-o")
             .arg(&*new_c_file)
@@ -592,13 +604,14 @@ impl File {
             .arg(rel_path)
             .output()
             .to_err()?;
+        // clang解析gcc预处理文件是可能出错，但是忽略，直接查看输出的json文件是否可用.
+        let mut err_msg = String::new();
         if !output.status.success() {
-            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-            return Err(Error::inval());
+            err_msg = String::from_utf8_lossy(&output.stderr).to_string();
         }
         let json = String::from_utf8_lossy(&output.stdout);
-        let mut node = serde_json::from_str(&json).to_err()?;
-        let js = path.with_extension("js");
+        let mut node = serde_json::from_str(&json).log_err(&err_msg)?;
+        let js = path.with_extension("json.tmp");
         if js.exists() {
             let _ = fs::write(path.with_extension("js2"), json.as_bytes());
         } else {
@@ -641,13 +654,49 @@ impl File {
             if let (Some(target), Some(src)) = (target, src) {
                 init_loc(target, &src);
             }
-            let src = node.inner[n - 1].kind.range().cloned();
-            let target = node.inner[n].kind.range_mut();
-            if let (Some(target), Some(src)) = (target, src) {
-                init_range(target, &src);
-                if range_include(target, &src) {
-                    node.inner[n - 1].kind.set_skip();
+        }
+
+        // typedef struct Foo { } Foo, 就是前序节点被后续节点包含.
+        for n in 0..node.inner.len() {
+            if node.inner[n].kind.skip() {
+                continue;
+            }
+            let Some(range1) = node.inner[n].kind.range() else {
+                continue;
+            };
+            for m in (n + 1)..node.inner.len() {
+                let Some(range2) = node.inner[m].kind.range() else {
+                    continue;
+                };
+                if !range_include(range2, &range1) {
+                    continue;
                 }
+                for k in n..m {
+                    node.inner[k].kind.set_skip();
+                }
+                break;
+            }
+        }
+
+        // void foo(int, ...), 存在后续节点被前序节点包含
+        for n in (0..node.inner.len()).rev() {
+            if node.inner[n].kind.skip() {
+                continue;
+            }
+            let Some(range1) = node.inner[n].kind.range() else {
+                continue;
+            };
+            for m in (0..n).rev() {
+                let Some(range2) = node.inner[m].kind.range() else {
+                    continue;
+                };
+                if !range_include(range2, &range1) {
+                    continue;
+                }
+                for k in m + 1..n + 1 {
+                    node.inner[k].kind.set_skip();
+                }
+                break;
             }
         }
     }
@@ -689,10 +738,26 @@ impl File {
 
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     pub fn export_c_code(&self, root: &Path) -> Result<String> {
-        Self::generate_c_code(root, &self.node.inner, false)
+        Self::generate_c_code(root, &self.node.inner, false, false)
     }
 
-    fn generate_c_code(root: &Path, nodes: &[Node], has_line: bool) -> Result<String> {
+    pub fn export_header(&self, root: &Path) -> Result<String> {
+        let mut header = Self::generate_c_code(root, &self.node.inner, false, true)?;
+        let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*__malloc__\s*(\(.+\))?\)\s*\)").map_err(|_| Error::inval())?;
+        while let Some(m) = re.find(&header) {
+            header.replace_range(m.start()..m.start() + m.len(), "");
+        }
+        // bindgen基于clang，clang需要定义，但是gcc的预处理没有，无条件添加，重复无影响
+        let mut new_header = "typedef float _Float32;\n".to_string();
+        new_header.push_str("typedef double _Float64;\n");
+        new_header.push_str("typedef double _Float32x;\n");
+        new_header.push_str("typedef long double _Float64x;\n");
+        new_header.push_str("typedef __float128 _Float128;\n");
+        new_header.push_str(&header); 
+        Ok(new_header)
+    }
+
+    fn generate_c_code(root: &Path, nodes: &[Node], has_line: bool, is_header: bool) -> Result<String> {
         let mut content = String::new();
         let mut last = None;
         for node in nodes {
@@ -720,7 +785,7 @@ impl File {
                 continue;
             }
 
-            if node.kind.has_committed() {
+            if is_header || node.kind.has_committed() {
                 // 需要声明
                 let deli = match node.kind {
                     Kind::FunctionDecl(_) => '{',
