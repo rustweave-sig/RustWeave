@@ -68,6 +68,6 @@ Rust翻译结果:
 // 你的Rust代码这里结束
 
 现在开始转换以下C代码：
-{C_function_code}
+{C_var_code}
 
 请记住：只输出Rust代码，不要任何其他内容。
