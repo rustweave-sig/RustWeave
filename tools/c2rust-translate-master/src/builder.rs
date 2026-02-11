@@ -356,7 +356,15 @@ pub fn run_hybrid_build_interactive(
         Err(build_error) => {
             // 仅当我们有文件上下文时才显示交互菜单
             if let (Some(ftype), Some(rfile)) = (file_type, rs_file) {
-                return handle_build_failure_interactive(feature, ftype, rfile, build_error);
+                let processing_complete = handle_build_failure_interactive(feature, ftype, rfile, build_error)?;
+                if !processing_complete {
+                    // User chose to retry translation - not supported in this context
+                    // so treat it as a failure and return early
+                    println!("│ {}", "Note: Retry translation requested but not supported in this context".yellow());
+                    return Err(anyhow::anyhow!(
+                        "Hybrid build failed and retry translation is not supported in this context"
+                    ));
+                }
             } else {
                 // 没有文件上下文，只返回错误
                 return Err(build_error);
@@ -373,7 +381,16 @@ pub fn run_hybrid_build_interactive(
         Err(test_error) => {
             // 仅当我们有文件上下文时才显示交互菜单
             if let (Some(ftype), Some(rfile)) = (file_type, rs_file) {
-                handle_test_failure_interactive(feature, ftype, rfile, test_error)
+                let processing_complete = handle_test_failure_interactive(feature, ftype, rfile, test_error)?;
+                if !processing_complete {
+                    // User chose to retry translation - not supported in this context
+                    // so treat it as a failure and return early
+                    println!("│ {}", "Note: Retry translation requested but not supported in this context".yellow());
+                    return Err(anyhow::anyhow!(
+                        "Hybrid build tests failed and retry translation is not supported in this context"
+                    ));
+                }
+                Ok(())
             } else {
                 // 没有文件上下文，只返回错误
                 Err(test_error)
@@ -383,12 +400,18 @@ pub fn run_hybrid_build_interactive(
 }
 
 /// 交互式处理构建失败
+/// Handles build failures in hybrid build phase interactively
+/// 
+/// Returns:
+/// - Ok(true) if the build failure was resolved (continue processing)
+/// - Ok(false) if translation should be retried from scratch
+/// - Err if an unrecoverable error occurred
 pub(crate) fn handle_build_failure_interactive(
     feature: &str,
     file_type: &str,
     rs_file: &std::path::Path,
     build_error: anyhow::Error,
-) -> Result<()> {
+) -> Result<bool> {
     use crate::interaction;
     use crate::suggestion;
     use crate::diff_display;
@@ -428,6 +451,20 @@ pub(crate) fn handle_build_failure_interactive(
     let choice = interaction::prompt_build_failure_choice()?;
     
     match choice {
+        interaction::FailureChoice::RetryDirectly => {
+            println!("│");
+            println!("│ {}", "You chose: Retry directly without suggestion".bright_cyan());
+            
+            // 清除旧建议
+            suggestion::clear_suggestions()?;
+            
+            println!("│ {}", "Retrying translation from scratch...".bright_cyan());
+            println!("│ {}", "Note: The translator will overwrite the existing file content.".bright_blue());
+            println!("│ {}", "✓ Retry scheduled".bright_green());
+            
+            // 返回 false 以信号重试翻译
+            return Ok(false);
+        }
         interaction::FailureChoice::AddSuggestion => {
             println!("│");
             println!("│ {}", "You chose: Add fix suggestion for AI to modify".bright_cyan());
@@ -458,39 +495,29 @@ pub(crate) fn handle_build_failure_interactive(
                 
                 // 再次尝试构建和测试
                 println!("│");
-                println!("│ {}", "Rebuilding...".bright_blue().bold());
+                println!("│ {}", "Running full build and test...".bright_blue().bold());
                 
-                match c2rust_build(feature) {
+                match run_full_build_and_test_interactive(feature, file_type, rs_file) {
                     Ok(_) => {
-                        // 构建成功，现在尝试测试
-                        println!("│ {}", "✓ Build passed after applying fix!".bright_green().bold());
-                        println!("│");
-                        println!("│ {}", "Running tests...".bright_blue().bold());
-                        
-                        match c2rust_test(feature) {
-                            Ok(_) => {
-                                println!("│ {}", "✓ Tests passed!".bright_green().bold());
-                                return Ok(());
-                            }
-                            Err(test_error) => {
-                                // 构建成功但测试失败，切换到测试失败处理
-                                println!("│ {}", "✗ Build succeeded but tests failed".yellow());
-                                return handle_test_failure_interactive(feature, file_type, rs_file, test_error);
-                            }
-                        }
+                        return Ok(true);
                     }
                     Err(e) => {
-                        println!("│ {}", "✗ Build still failing".red());
+                        println!("│ {}", "✗ Build or tests still failing".red());
                         
                         // 使用最新失败更新 current_error
                         current_error = e;
                         
                         // 询问用户是否想再试一次
                         println!("│");
-                        println!("│ {}", "Build still has errors. What would you like to do?".yellow());
+                        println!("│ {}", "Build or tests still have errors. What would you like to do?".yellow());
                         let retry_choice = interaction::prompt_build_failure_choice()?;
                         
                         match retry_choice {
+                            interaction::FailureChoice::RetryDirectly => {
+                                println!("│ {}", "Switching to retry translation flow.".yellow());
+                                suggestion::clear_suggestions()?;
+                                return Ok(false);
+                            }
                             interaction::FailureChoice::AddSuggestion => {
                                 // 继续循环以使用新建议重试
                                 continue;
@@ -504,36 +531,27 @@ pub(crate) fn handle_build_failure_interactive(
                                 match interaction::open_in_vim(rs_file) {
                                     Ok(_) => {
                                         println!("│");
-                                        println!("│ {}", "Rebuilding after manual fix...".bright_blue().bold());
+                                        println!("│ {}", "Running full build and test after manual fix...".bright_blue().bold());
                                         
-                                        match c2rust_build(feature) {
+                                        // 执行完整构建流程（包含 cargo_build）
+                                        match run_full_build_and_test_interactive(feature, file_type, rs_file) {
                                             Ok(_) => {
-                                                // 构建成功，现在尝试测试
-                                                println!("│ {}", "✓ Build passed after manual fix!".bright_green().bold());
-                                                println!("│");
-                                                println!("│ {}", "Running tests...".bright_blue().bold());
-                                                
-                                                match c2rust_test(feature) {
-                                                    Ok(_) => {
-                                                        println!("│ {}", "✓ Tests passed!".bright_green().bold());
-                                                        return Ok(());
-                                                    }
-                                                    Err(test_error) => {
-                                                        // 构建成功但测试失败，切换到测试失败处理
-                                                        println!("│ {}", "✗ Build succeeded but tests failed".yellow());
-                                                        return handle_test_failure_interactive(feature, file_type, rs_file, test_error);
-                                                    }
-                                                }
+                                                return Ok(true);
                                             }
                                             Err(e) => {
-                                                println!("│ {}", "✗ Build still failing after manual fix".red());
+                                                println!("│ {}", "✗ Build or tests still failing after manual fix".red());
                                                 
                                                 // 询问用户是否想再试一次
                                                 println!("│");
-                                                println!("│ {}", "Build still has errors. What would you like to do?".yellow());
+                                                println!("│ {}", "Build or tests still have errors. What would you like to do?".yellow());
                                                 let nested_retry_choice = interaction::prompt_build_failure_choice()?;
                                                 
                                                 match nested_retry_choice {
+                                                    interaction::FailureChoice::RetryDirectly => {
+                                                        println!("│ {}", "Switching to retry translation flow.".yellow());
+                                                        suggestion::clear_suggestions()?;
+                                                        return Ok(false);
+                                                    }
                                                     interaction::FailureChoice::AddSuggestion => {
                                                         // 更新 current_error 并继续外部循环以使用新建议重试
                                                         current_error = e;
@@ -579,37 +597,27 @@ pub(crate) fn handle_build_failure_interactive(
                 Ok(_) => {
                     loop {
                         println!("│");
-                        println!("│ {}", "Vim editing completed. Rebuilding...".bright_blue());
+                        println!("│ {}", "Vim editing completed. Running full build and test...".bright_blue());
                         
                         // Vim 编辑后尝试使用混合构建流程进行构建和测试
-                        match c2rust_build(feature) {
+                        match run_full_build_and_test_interactive(feature, file_type, rs_file) {
                             Ok(_) => {
-                                // 构建成功，现在尝试测试
-                                println!("│ {}", "✓ Build passed after manual fix!".bright_green().bold());
-                                println!("│");
-                                println!("│ {}", "Running tests...".bright_blue().bold());
-                                
-                                match c2rust_test(feature) {
-                                    Ok(_) => {
-                                        println!("│ {}", "✓ Tests passed!".bright_green().bold());
-                                        return Ok(());
-                                    }
-                                    Err(test_error) => {
-                                        // 构建成功但测试失败，切换到测试失败处理
-                                        println!("│ {}", "✗ Build succeeded but tests failed".yellow());
-                                        return handle_test_failure_interactive(feature, file_type, rs_file, test_error);
-                                    }
-                                }
+                                return Ok(true);
                             }
                             Err(e) => {
-                                println!("│ {}", "✗ Build still failing after manual fix".red());
+                                println!("│ {}", "✗ Build or tests still failing after manual fix".red());
                                 
                                 // 询问用户是否想再试一次
                                 println!("│");
-                                println!("│ {}", "Build still has errors. What would you like to do?".yellow());
+                                println!("│ {}", "Build or tests still have errors. What would you like to do?".yellow());
                                 let retry_choice = interaction::prompt_build_failure_choice()?;
                                 
                                 match retry_choice {
+                                    interaction::FailureChoice::RetryDirectly => {
+                                        println!("│ {}", "Switching to retry translation flow.".yellow());
+                                        suggestion::clear_suggestions()?;
+                                        return Ok(false);
+                                    }
                                     interaction::FailureChoice::ManualFix => {
                                         println!("│ {}", "Reopening Vim for another manual fix attempt...".bright_blue());
                                         interaction::open_in_vim(rs_file)
@@ -647,12 +655,18 @@ pub(crate) fn handle_build_failure_interactive(
 }
 
 /// 交互式处理测试失败
+/// Handles test failures interactively
+/// 
+/// Returns:
+/// - Ok(true) if the test failure was resolved (continue processing)
+/// - Ok(false) if translation should be retried from scratch
+/// - Err if an unrecoverable error occurred
 pub(crate) fn handle_test_failure_interactive(
     feature: &str,
     file_type: &str,
     rs_file: &std::path::Path,
     test_error: anyhow::Error,
-) -> Result<()> {
+) -> Result<bool> {
     use crate::interaction;
     use crate::suggestion;
     use crate::diff_display;
@@ -692,6 +706,20 @@ pub(crate) fn handle_test_failure_interactive(
     let choice = interaction::prompt_test_failure_choice()?;
     
     match choice {
+        interaction::FailureChoice::RetryDirectly => {
+            println!("│");
+            println!("│ {}", "You chose: Retry directly without suggestion".bright_cyan());
+            
+            // 清除旧建议
+            suggestion::clear_suggestions()?;
+            
+            println!("│ {}", "Retrying translation from scratch...".bright_cyan());
+            println!("│ {}", "Note: The translator will overwrite the existing file content.".bright_blue());
+            println!("│ {}", "✓ Retry scheduled".bright_green());
+            
+            // 返回 false 以信号重试翻译
+            return Ok(false);
+        }
         interaction::FailureChoice::AddSuggestion => {
             println!("│");
             println!("│ {}", "You chose: Add fix suggestion for AI to modify".bright_cyan());
@@ -722,14 +750,11 @@ pub(crate) fn handle_test_failure_interactive(
                 
                 // 再次尝试构建和测试
                 println!("│");
-                println!("│ {}", "Rebuilding and retesting...".bright_blue().bold());
+                println!("│ {}", "Running full build and test...".bright_blue().bold());
                 
-                c2rust_build(feature)?;
-                
-                match c2rust_test(feature) {
+                match run_full_build_and_test_interactive(feature, file_type, rs_file) {
                     Ok(_) => {
-                        println!("│ {}", "✓ Tests passed after applying fix!".bright_green().bold());
-                        return Ok(());
+                        return Ok(true);
                     }
                     Err(e) => {
                         println!("│ {}", "✗ Tests still failing".red());
@@ -743,6 +768,11 @@ pub(crate) fn handle_test_failure_interactive(
                         let retry_choice = interaction::prompt_test_failure_choice()?;
                         
                         match retry_choice {
+                            interaction::FailureChoice::RetryDirectly => {
+                                println!("│ {}", "Switching to retry translation flow.".yellow());
+                                suggestion::clear_suggestions()?;
+                                return Ok(false);
+                            }
                             interaction::FailureChoice::AddSuggestion => {
                                 // 继续循环以使用新建议重试
                                 continue;
@@ -756,14 +786,11 @@ pub(crate) fn handle_test_failure_interactive(
                                 match interaction::open_in_vim(rs_file) {
                                     Ok(_) => {
                                         println!("│");
-                                        println!("│ {}", "Rebuilding and retesting after manual fix...".bright_blue().bold());
+                                        println!("│ {}", "Running full build and test after manual fix...".bright_blue().bold());
                                         
-                                        c2rust_build(feature)?;
-                                        
-                                        match c2rust_test(feature) {
+                                        match run_full_build_and_test_interactive(feature, file_type, rs_file) {
                                             Ok(_) => {
-                                                println!("│ {}", "✓ Tests passed after manual fix!".bright_green().bold());
-                                                return Ok(());
+                                                return Ok(true);
                                             }
                                             Err(e) => {
                                                 println!("│ {}", "✗ Tests still failing after manual fix".red());
@@ -797,15 +824,12 @@ pub(crate) fn handle_test_failure_interactive(
                 Ok(_) => {
                     loop {
                         println!("│");
-                        println!("│ {}", "Vim editing completed. Rebuilding and retesting...".bright_blue());
+                        println!("│ {}", "Vim editing completed. Running full build and test...".bright_blue());
                         
                         // Vim 编辑后尝试使用混合构建流程进行构建和测试
-                        c2rust_build(feature)?;
-                        
-                        match c2rust_test(feature) {
+                        match run_full_build_and_test_interactive(feature, file_type, rs_file) {
                             Ok(_) => {
-                                println!("│ {}", "✓ Tests passed after manual fix!".bright_green().bold());
-                                return Ok(());
+                                return Ok(true);
                             }
                             Err(e) => {
                                 println!("│ {}", "✗ Tests still failing after manual fix".red());
@@ -816,6 +840,11 @@ pub(crate) fn handle_test_failure_interactive(
                                 let retry_choice = interaction::prompt_test_failure_choice()?;
                                 
                                 match retry_choice {
+                                    interaction::FailureChoice::RetryDirectly => {
+                                        println!("│ {}", "Switching to retry translation flow.".yellow());
+                                        suggestion::clear_suggestions()?;
+                                        return Ok(false);
+                                    }
                                     interaction::FailureChoice::ManualFix => {
                                         println!("│ {}", "Reopening Vim for another manual fix attempt...".bright_blue());
                                         interaction::open_in_vim(rs_file)
@@ -849,4 +878,85 @@ pub(crate) fn handle_test_failure_interactive(
             Err(test_error).context("Tests failed and user chose to exit")
         }
     }
+}
+
+/// 执行完整的构建和测试流程
+/// 顺序：cargo_build → c2rust_clean → c2rust_build → c2rust_test
+/// 这是主流程中的标准验证流程
+/// 
+/// 注意：此函数会多次调用 `update_code_analysis`（在 clean、build、test 步骤中各一次），
+/// 这会略微降低性能。未来可以优化为只更新一次分析。
+pub fn run_full_build_and_test(feature: &str) -> Result<()> {
+    println!("│");
+    println!("│ {}", "Running full build and test flow...".bright_blue().bold());
+    
+    // 1. 先构建 Rust 代码
+    println!("│ {}", "→ Step 1/4: Building Rust code (cargo build)...".bright_blue());
+    cargo_build(feature, true)?;
+    println!("│ {}", "  ✓ Rust build successful".bright_green());
+    
+    // 2. 清理混合构建环境
+    println!("│ {}", "→ Step 2/4: Cleaning hybrid build...".bright_blue());
+    c2rust_clean(feature)?;
+    
+    // 3. 混合构建
+    println!("│ {}", "→ Step 3/4: Running hybrid build (C + Rust)...".bright_blue());
+    c2rust_build(feature)?;
+    println!("│ {}", "  ✓ Hybrid build successful".bright_green());
+    
+    // 4. 运行测试
+    println!("│ {}", "→ Step 4/4: Running tests...".bright_blue());
+    c2rust_test(feature)?;
+    println!("│ {}", "  ✓ All tests passed".bright_green().bold());
+    
+    Ok(())
+}
+
+/// 执行完整的构建和测试流程
+/// 顺序：cargo_build → c2rust_clean → c2rust_build → c2rust_test
+/// 
+/// 注意：此函数不提供交互式错误处理，任何步骤失败时都会直接返回错误。
+/// 调用方负责处理错误并提供交互式修复选项（如需要）。
+/// 
+/// 参数 `_file_type` 和 `_rs_file` 保留用于 API 兼容性，当前未使用。
+/// 
+/// 性能提示：此函数会多次调用 `update_code_analysis`（在 clean、build、test 步骤中各一次），
+/// 这会略微降低性能。未来可以优化为只更新一次分析。
+pub fn run_full_build_and_test_interactive(
+    feature: &str,
+    _file_type: &str,
+    _rs_file: &std::path::Path,
+) -> Result<()> {
+    println!("│");
+    println!("│ {}", "Running full build and test flow...".bright_blue().bold());
+    
+    // 1. 先构建 Rust 代码
+    println!("│ {}", "→ Step 1/4: Building Rust code (cargo build)...".bright_blue());
+    match cargo_build(feature, true) {
+        Ok(_) => {
+            println!("│ {}", "  ✓ Rust build successful".bright_green());
+        }
+        Err(e) => {
+            println!("│ {}", "  ✗ Rust build failed".red());
+            // cargo_build 失败通常意味着翻译的 Rust 代码有问题
+            // 这不应该发生在手动修复后，所以直接返回错误
+            return Err(e).context("Rust build failed in full build flow");
+        }
+    }
+    
+    // 2. 清理混合构建环境
+    println!("│ {}", "→ Step 2/4: Cleaning hybrid build...".bright_blue());
+    c2rust_clean(feature)?;
+    
+    // 3. 混合构建（不调用交互式处理器以避免递归）
+    println!("│ {}", "→ Step 3/4: Running hybrid build (C + Rust)...".bright_blue());
+    c2rust_build(feature)?;
+    println!("│ {}", "  ✓ Hybrid build successful".bright_green());
+    
+    // 4. 运行测试（不调用交互式处理器以避免递归）
+    println!("│ {}", "→ Step 4/4: Running tests...".bright_blue());
+    c2rust_test(feature)?;
+    println!("│ {}", "  ✓ All tests passed".bright_green().bold());
+    
+    Ok(())
 }

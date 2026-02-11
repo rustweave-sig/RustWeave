@@ -272,8 +272,11 @@ fn process_rs_file(feature: &str, rs_file: &std::path::Path, file_name: &str, cu
         )?;
         
         if build_successful {
-            complete_file_processing(feature, file_name, file_type, rs_file, &format_progress)?;
-            return Ok(());
+            let processing_complete = complete_file_processing(feature, file_name, file_type, rs_file, &format_progress)?;
+            if processing_complete {
+                return Ok(());
+            }
+            // If processing_complete is false, retry translation (loop continues)
         }
     }
     
@@ -450,6 +453,25 @@ fn handle_max_fix_attempts_reached(
     let choice = interaction::prompt_compile_failure_choice()?;
     
     match choice {
+        interaction::FailureChoice::RetryDirectly => {
+            println!("│");
+            println!("│ {}", "You chose: Retry directly without suggestion".bright_cyan());
+            
+            // 清除旧建议
+            suggestion::clear_suggestions()?;
+            
+            // 重新翻译（清空并重新生成 rs 文件）
+            let remaining_retries = MAX_TRANSLATION_ATTEMPTS - attempt_number;
+            if is_last_attempt {
+                println!("│ {}", "This is the last automatic retry attempt.".bright_yellow());
+                println!("│ {}", "Retrying translation from scratch one final time...".bright_cyan());
+            } else {
+                println!("│ {}", format!("Retrying translation from scratch... ({} retries remaining)", remaining_retries).bright_cyan());
+            }
+            println!("│ {}", "Note: The translator will overwrite the existing file content.".bright_blue());
+            println!("│ {}", "✓ Retry scheduled".bright_green());
+            return Ok(false); // 发出重试信号
+        }
         interaction::FailureChoice::AddSuggestion => {
             println!("│");
             println!("│ {}", "You chose: Add fix suggestion for AI to modify".bright_cyan());
@@ -482,18 +504,17 @@ fn handle_max_fix_attempts_reached(
                 let format_progress = |op: &str| format!("Fix with suggestion - {}", op);
                 apply_error_fix(feature, file_type, rs_file, &build_error, &format_progress, true)?;
                 
-                // 再试一次构建
+                // 再试一次构建和测试
                 println!("│");
-                println!("│ {}", "Building with applied fix...".bright_blue().bold());
-                match builder::cargo_build(feature, true) {
+                println!("│ {}", "Running full build and test after applying fix...".bright_blue().bold());
+                match builder::run_full_build_and_test_interactive(feature, file_type, rs_file) {
                     Ok(_) => {
-                        println!("│ {}", "✓ Build successful after applying suggestion!".bright_green().bold());
                         return Ok(true);
                     }
                     Err(e) => {
-                        println!("│ {}", "✗ Build still failing after fix attempt".red());
+                        println!("│ {}", "✗ Build or tests still failing after fix attempt".red());
                         return Err(e).context(format!(
-                            "Build failed after fix with suggestion for file {}",
+                            "Build or tests failed after fix with suggestion for file {}",
                             rs_file.display()
                         ));
                     }
@@ -511,21 +532,21 @@ fn handle_max_fix_attempts_reached(
                     // 决定是重试还是退出，使用循环来避免递归
                     loop {
                         println!("│");
-                        println!("│ {}", "Vim editing completed. Attempting to build...".bright_blue());
+                        println!("│ {}", "Vim editing completed. Running full build and test...".bright_blue());
                         
-                        // 手动编辑后尝试构建
-                        match builder::cargo_build(feature, true) {
+                        // 手动编辑后执行完整构建流程
+                        match builder::run_full_build_and_test_interactive(feature, file_type, rs_file) {
                             Ok(_) => {
-                                println!("│ {}", "✓ Build successful after manual fix!".bright_green().bold());
+                                println!("│ {}", "✓ All builds and tests passed after manual fix!".bright_green().bold());
                                 return Ok(true);
                             }
                             Err(e) => {
-                                println!("│ {}", "✗ Build still failing after manual fix".red());
+                                println!("│ {}", "✗ Build or tests still failing after manual fix".red());
                                 
                                 // 询问用户是否想再试一次
                                 println!("│");
-                                println!("│ {}", "Build still has errors. What would you like to do?".yellow());
-                                let retry_choice = interaction::prompt_user_choice("Build still failing", false)?;
+                                println!("│ {}", "Build or tests still have errors. What would you like to do?".yellow());
+                                let retry_choice = interaction::prompt_user_choice("Build/tests still failing", false)?;
                                 
                                 match retry_choice {
                                     interaction::UserChoice::Continue => {
@@ -621,13 +642,19 @@ where
 }
 
 /// 完成文件处理（提交、分析、混合构建）
+/// Completes file processing by running hybrid build tests and committing changes
+/// 
+/// Returns:
+/// - Ok(true) if file processing completed successfully (continue to next file)
+/// - Ok(false) if translation should be retried from scratch
+/// - Err if an unrecoverable error occurred
 fn complete_file_processing<F>(
     feature: &str, 
     file_name: &str, 
     file_type: &str,
     rs_file: &std::path::Path,
     format_progress: &F
-) -> Result<()>
+) -> Result<bool>
 where
     F: Fn(&str) -> String
 {
@@ -684,7 +711,11 @@ where
         Err(build_error) => {
             println!("│ {}", "✗ Build failed".red().bold());
             // Enter interactive build failure handling
-            builder::handle_build_failure_interactive(feature, file_type, rs_file, build_error)?;
+            let processing_complete = builder::handle_build_failure_interactive(feature, file_type, rs_file, build_error)?;
+            if !processing_complete {
+                // User chose to retry translation
+                return Ok(false);
+            }
         }
     }
     
@@ -733,11 +764,10 @@ where
                         // 打开 vim 进行手动编辑
                         match interaction::open_in_vim(rs_file) {
                             Ok(_) => {
-                                // 编辑后，重新构建并再次测试
-                                println!("│ {}", "Rebuilding and retesting after manual changes...".bright_blue());
-                                builder::c2rust_build(feature)?;
-                                builder::c2rust_test(feature)?;
-                                println!("│ {}", "✓ Tests still pass after manual changes".bright_green());
+                                // 编辑后，执行完整构建和测试
+                                println!("│ {}", "Running full build and test after manual changes...".bright_blue());
+                                builder::run_full_build_and_test_interactive(feature, file_type, rs_file)?;
+                                println!("│ {}", "✓ All builds and tests pass after manual changes".bright_green());
                                 // 继续提交
                             }
                             Err(e) => {
@@ -756,7 +786,11 @@ where
         }
         Err(test_error) => {
             // 测试失败 - 使用交互式处理器
-            builder::handle_test_failure_interactive(feature, file_type, rs_file, test_error)?;
+            let processing_complete = builder::handle_test_failure_interactive(feature, file_type, rs_file, test_error)?;
+            if !processing_complete {
+                // User chose to retry translation
+                return Ok(false);
+            }
         }
     }
     
@@ -781,5 +815,5 @@ where
     
     println!("{}", "└─ File processing complete".bright_white().bold());
     
-    Ok(())
+    Ok(true)
 }
