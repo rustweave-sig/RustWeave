@@ -129,15 +129,10 @@ if __name__ == "__main__":
     """
 
     rust_function_code = """
+    use super::*;
+    
     fn my_function() {
         println!("Hello from Rust!")
-    }
-    """
-
-    c_test_case_code = """
-    int main() {
-        my_function();
-        return 0;
     }
     """
 
