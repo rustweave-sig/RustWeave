@@ -1,4 +1,4 @@
-use crate::{get_root, File, Kind, Result, ToError};
+use crate::{get_root, File, Result, ToError};
 use hierr::Error;
 use higuard::Guard;
 use std::collections::{HashMap, HashSet};
@@ -304,7 +304,7 @@ impl Feature {
             mod_items.push_str(&prefixed_name);
             mod_items.push_str(";\n");
             fs::File::create(mod_dir.join(&prefixed_name).with_extension("rs")).to_err()?;
-            let c_code = node.kind.c_code(&c_root, &node.inner)?;
+            let c_code = node.kind.c_code(&c_root)?;
             fs::write(
                 mod_dir.join(&prefixed_name).with_extension("c"),
                 c_code.as_bytes(),
