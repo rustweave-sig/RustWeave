@@ -26,6 +26,7 @@
 - 如果报告某个字段不存在，且未提供具体修复建议，请尝试将其转换为set_/get_方法，比如let a = struct.field可以修复为struct.get_field(), struct.field = 1可以转换为struct.set_field(1).
 - 如果报告某个结构体成员和Rust关键字冲突，增加后缀_,比如struct.type转换为struct.type_.
 - 如果报告某个结构体成员不是一个方法，尝试按照Option类型处理，增加unwrap()调用进行修复.
+- 如果报告某个类型，常量和函数在super中不存在，则可能是C编译器内置的类型，常量和函数, 请根据C语言的语义转换为Rust代码.
 
 **指针处理:**
 - 如果是C语言的函数指针，对应到Rust的Option<fn()>形式的包装
