@@ -108,17 +108,36 @@ def filter_model_response(response):
     except Exception as e:
         raise RuntimeError(f"ERROR - 过滤大模型输出-替换no_mangle为unsafe(no_mangle)出错: {e}") from e
 
-    # use super::* 处理
+    # use super::* 处理（全局查找，不限于开头）
     try:
-        if final_response.startswith("use super::*;"):
-            # 情况1：已正确包含分号，保持不变
+        # 正则匹配：查找独立的 use super::* 语句（避免匹配注释/字符串中的内容）
+        # 匹配模式：行首或换行后 + 可选空白 + "use" + 空白 + "super" + "::" + "*" + 可选空白
+        pattern = r'(?:^|\n)\s*use super::\*'
+
+        # 情况1：已存在带分号的 use super::*;（任意位置）
+        if re.search(r'(?:^|\n)\s*use super::\*;', final_response):
+            # 已正确包含分号，保持不变
             pass
-        elif final_response.startswith("use super::*"):
-            # 情况2：有 use super::* 但缺少分号，在其后精确添加一个分号（不添加空格或换行）
-            final_response = "use super::*;" + final_response[len("use super::*"):]
+        # 情况2：存在不带分号的 use super::*（任意位置）
+        elif match := re.search(pattern, final_response):
+            # 获取匹配的起始和结束位置
+            start, end = match.span()
+
+            # 检查匹配内容末尾是否已有分号（考虑可能的尾随空格）
+            matched_text = final_response[start:end]
+            if matched_text.rstrip().endswith(';'):
+                # 实际已有分号（只是被空格包裹），保持不变
+                pass
+            else:
+                # 在 * 后精确插入分号（保留原有空白）
+                # 例如: "use super::* " → "use super::*; "
+                #       "use super::*\n" → "use super::*;\n"
+                final_response = final_response[:end] + ';' + final_response[end:]
+        # 情况3：完全缺失 use super::*，在开头添加完整语句
         else:
-            # 情况3：完全缺失 use super::*，在开头添加完整语句和两个换行
-            final_response = "use super::*;\n\n" + final_response
+            # 检查是否已存在 use super::*（避免重复添加 use 语句）
+            if not final_response.strip().startswith("use super::*"):
+                final_response = "use super::*;\n\n" + final_response
     except Exception as e:
         raise RuntimeError(f"ERROR - 过滤大模型输出-添加use super::*;出错: {e}") from e
 
@@ -129,7 +148,8 @@ if __name__ == "__main__":
     # 示例1：带有```标记和"Rust翻译结果:"前缀的回复
     example1 = """Rust翻译结果:
 ```rust
-use crate::*
+// 修复后的Rust代码
+use super::*
 
 #[no_mangle]
 fn my_function() {
@@ -147,7 +167,7 @@ fn my_function() {
     example2 = """好的，我已经完成了翻译。以下是结果：
 
 Rust翻译结果:
-use crate::*;
+use super::*;
 
 #[unsafe(no_mangle)]
 fn calculate_sum(arr: *const i32, len: usize) -> i32 {
