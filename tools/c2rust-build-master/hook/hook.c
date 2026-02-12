@@ -272,8 +272,12 @@ static void discover_target(int argc, char* argv[], const char* project_root, co
                 char* static_lib = get_static_lib(argv[i], project_root);
                 if (static_lib) {
                         libs[pos++] = static_lib;
-                } else if (strcmp(argv[i], "-o") == 0 && i < argc - 1) {
-                        libs[pos++] = get_file(argv[i + 1]);
+                } else if (strncmp(argv[i], "-o", 2) == 0) {
+                        if (argv[i][2] == 0 && i < argc - 1) {
+                            libs[pos++] = get_file(argv[i + 1]);
+                        } else if (argv[i][2]) {
+                            libs[pos++] = get_file(&argv[i][2]);
+                        }
                 }
         }
         target_save(libs, pos, feature_root);

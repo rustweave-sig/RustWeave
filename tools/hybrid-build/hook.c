@@ -94,6 +94,7 @@ static void redirect_cfile(int argc, char* argv[]) {
     char* feature_root = 0;
     char new_path[MAX_PATH_LEN];
     char* new_argv[argc + 2];
+    int pos = 0;
 
     project_root = path_from(C2RUST_PROJECT_ROOT);
     if (!project_root) return;
@@ -103,7 +104,11 @@ static void redirect_cfile(int argc, char* argv[]) {
         
     for (int i = 0; i < argc; ++i) {
         char* arg = argv[i];
-        new_argv[i] = arg;
+        // 混合构建时需要放宽检查，实际发现即便预处理生成的文件可能包含_Float128导致无法编译
+        if (strcmp(arg, "-pedantic") == 0) {
+                continue;
+        }
+        new_argv[pos++] = arg;
         if (arg[0] == '-' || !is_cfile(arg)) continue;
         char* full_path = realpath(arg, 0);
         if (!full_path) continue;
@@ -115,7 +120,7 @@ static void redirect_cfile(int argc, char* argv[]) {
         // new_path内存在进程退出后才自动释放.
         char* new_file = strdup(new_path);
         if (new_file) {
-                new_argv[i] = new_file;
+                new_argv[pos - 1] = new_file;
                 should_reboot = 1;
         } else {
                 dprintf(2, "strdup fail: %s\n", new_path);
@@ -130,8 +135,8 @@ out:
         // 避免重复进入此流程.
         unsetenv(C2RUST_PROJECT_ROOT);
         // static消除时可能不存在独立的函数声明，无条件添加.
-        new_argv[argc] = "-Wno-missing-prototypes";
-        new_argv[argc + 1] = 0;
+        new_argv[pos++] = "-Wno-missing-prototypes";
+        new_argv[pos++] = 0;
         execvp(new_argv[0], new_argv);
     }
 }
