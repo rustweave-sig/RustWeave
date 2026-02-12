@@ -3,6 +3,7 @@ import os
 from LLM_calling import call_llm_api
 from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
+from semantic_fixing import safe_read_file
 
 def var_translation(C_var_code, model, openai_instance, suggestion_file_path=None, prompt_file=None):
     """
@@ -38,23 +39,29 @@ def var_translation(C_var_code, model, openai_instance, suggestion_file_path=Non
         except Exception as e:
             raise RuntimeError(f"Error - 获取默认prompt文件路径失败: {e}")
 
-    # 读取模板文件
+    # 读取修复建议文件
+    suggestion = ""
     try:
-        with open(prompt_file, 'r', encoding='utf-8') as f:
-            prompt_template = f.read()
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Error - Prompt模板文件不存在: {prompt_file}")
-    except UnicodeDecodeError:
-        # 尝试UTF-8-SIG（处理BOM问题）
-        with open(prompt_file, 'r', encoding='utf-8-sig') as f:
-            prompt_template = f.read()
+        suggestion = safe_read_file(suggestion_file_path, context="修复建议文件")
+        # 清理建议内容：移除首尾空白，但保留内部格式
+        suggestion = suggestion.strip()
+    except FileNotFoundError as e:
+        print(f"Warning - 未找到修复建议文件 '{suggestion_file_path}'")
     except Exception as e:
-        raise RuntimeError(f"Error - 读取prompt文件失败 ({prompt_file}): {e}")
+        raise RuntimeError(f"Error - 处理修复建议文件时出错: {e}") from e
+
+    # 读取prompt模板
+    try:
+        prompt_template = safe_read_file(prompt_file, context="prompt模板")
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Error - 未找到prompt文件 '{prompt_file}'")
+    except Exception as e:
+        raise RuntimeError(f"Error - 处理prompt文件时出错: {e}") from e
 
     # 安全替换占位符
     try:
         # .format() 会自动处理 {{ → {, }} → } 的转义
-        prompt = prompt_template.format(C_var_code=C_var_code)
+        prompt = prompt_template.format(C_var_code=C_var_code, suggestion=suggestion)
     except KeyError as e:
         raise ValueError(
             f"Error - Prompt模板缺少必需的占位符 {{{e}}}。\n"

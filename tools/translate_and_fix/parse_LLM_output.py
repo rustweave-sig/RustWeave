@@ -89,7 +89,20 @@ def filter_model_response(response):
         if final_response.startswith("Rust翻译结果:"):
             final_response = final_response[len("Rust翻译结果:"):].strip()
     except Exception as e:
-        raise RuntimeError(f"ERROR - 过滤大模型输出-删除固定的标记字符出错: {e}") from e
+        raise RuntimeError(f"ERROR - 过滤大模型输出-删除固定的标记字符（Rust翻译结果:）出错: {e}") from e
+
+    # 移除"// 你的Rust代码这里开始"和"// 你的Rust代码这里结束"注释行
+    try:
+        lines = final_response.split('\n')
+        filtered_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # 精确匹配整行（忽略首尾空白），移除指定注释行
+            if stripped != "// 你的Rust代码这里开始" and stripped != "// 你的Rust代码这里结束":
+                filtered_lines.append(line)
+        final_response = '\n'.join(filtered_lines)
+    except Exception as e:
+        raise RuntimeError(f"ERROR - 过滤大模型输出-删除固定的标记字符（代码开始/结束）出错: {e}") from e
 
     # 过滤掉任何地方的```rust和```标记
     try:
@@ -148,7 +161,7 @@ if __name__ == "__main__":
     # 示例1：带有```标记和"Rust翻译结果:"前缀的回复
     example1 = """Rust翻译结果:
 ```rust
-// 修复后的Rust代码
+// 你的Rust代码这里开始
 use super::*
 
 #[no_mangle]
@@ -161,6 +174,7 @@ fn my_function() {
         printf(b"Hello, World!\\n".as_ptr() as *const _);
     }
 }
+// 你的Rust代码这里结束
 ```"""
 
     # 示例2：带有额外说明和"Rust翻译结果:"前缀的回复
