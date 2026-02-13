@@ -2,6 +2,35 @@
 
 一个使用 c2rust 框架自动化 C 代码到 Rust 代码翻译的工具。
 
+## 版本历史
+
+### v0.2.0 (当前版本)
+**破坏性变更：**
+- 移除了文件日志功能模块 (`logger` 模块)。所有输出现在仅通过 stdout/stderr 显示。
+- 如果您的代码依赖 `c2rust_translate::logger` 模块，请更新为使用标准输出。
+- 移除了 `chrono` 依赖。
+
+### v0.1.0
+- 初始发布版本
+
+## 项目架构
+
+本项目采用模块化设计，代码组织清晰：
+
+- **lib.rs** - 主工作流程编排
+- **hybrid_build.rs** - 混合构建命令管理
+- **initialization.rs** - 项目初始化和门禁验证
+- **verification.rs** - 构建验证和修复循环
+- **builder.rs** - Cargo 构建和命令执行
+- **translator.rs** - C 到 Rust 翻译
+- **analyzer.rs** - 代码分析集成
+- **interaction.rs** - 用户交互
+- **file_scanner.rs** - 文件发现和选择
+- **git.rs** - Git 版本控制
+- 其他辅助模块（progress, diff_display 等）
+
+详细的架构说明请参见 [REFACTORING_SUMMARY.md](REFACTORING_SUMMARY.md)。
+
 ## 功能特性
 
 ### 核心功能
