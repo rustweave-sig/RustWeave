@@ -35,13 +35,8 @@ c2rust clean -- make clean
 c2rust-config config --model --set model "XXX"
 c2rust-config config --model --set base_url "XXX"
 c2rust-config config --model --set api_key "XXX"
-c2rust-config config --model --set temperature 0
-c2rust-config config --model --set top_p 1
-c2rust-config config --model --set seed 42
-c2rust-config config --model --set max_retries 10
-c2rust-config config --model --set timeout 500
 ```
 7. 执行翻译：c2rust translate（需要python环境）
-	- pip install openai httpx toml
+	- pip install openai httpx tomli
 	- python3 -m venv /root/c2rust_venv
 	- source /root/c2rust_venv/bin/activate
