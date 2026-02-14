@@ -3,7 +3,7 @@
 ## 安装工具
 1. 源码下载
 ```shell
-git clone https://gitcode.com/xuanwu/C2RustXW-CLI.git && cd C2RustXW-CLI/tools
+git clone https://gitcode.com/xuanwu/C2RustXW-CLI.git
 ```
 2. 执行安装
 ```shell
