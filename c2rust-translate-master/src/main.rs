@@ -31,7 +31,7 @@ enum Commands {
         allow_all: bool,
 
         /// 构建错误的最大修复尝试次数（必须 > 0，默认为 10）
-        #[arg(long, default_value = "10", value_parser = parse_positive_usize)]
+        #[arg(long, default_value = "5", value_parser = parse_positive_usize)]
         max_fix_attempts: usize,
 
         /// 显示代码和错误的完整输出，不进行截断
