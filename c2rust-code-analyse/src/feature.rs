@@ -216,14 +216,27 @@ impl Feature {
     }
 
     /// Rust文件和C源码文件一一对应，即合并原来同一个文件下独立的多个变量和函数的Rust文件
-    /// 合并时主要检查两点:
+    /// 合并时主要检查三点:
     /// 1. 依赖的外表FFI声明去重
     /// 1. 根据名字恢复C代码中符号可见性
     /// 1. 合并后需要编译，可能存在因为符号冲突导致的编译错误，需要手工修正.
+    /// 1. 合并各个模块的types.rs文件，去重后写入src.merge/lib.rs
     pub fn merge(&mut self) -> Result<()> {
         println!("Starting merge for feature '{}'", self.name);
         let mut any_merged = false;
 
+        // 首先收集所有模块的types.rs文件路径
+        let types_rs_files = self.collect_types_rs_files()?;
+        println!("Found {} types.rs files to merge", types_rs_files.len());
+
+        // 如果有types.rs文件，先合并它们
+        if !types_rs_files.is_empty() {
+            self.merge_types_rs(&types_rs_files)?;
+            println!("Types.rs files merged successfully");
+            any_merged = true;
+        }
+/*
+        // 然后处理每个file的Rust文件合并
         for file in &self.files {
             println!("Processing file for merge: {}", file.path().display());
             if self.merge_file(file)? {
@@ -238,6 +251,7 @@ impl Feature {
         } else {
             println!("Feature '{}': no files needed merging", self.name);
         }
+*/
         Ok(())
     }
 
@@ -695,5 +709,276 @@ impl Feature {
         }
         let content = fs::read_to_string(path).to_err()?;
         Ok(content.trim().is_empty())
+    }
+
+    /// 收集所有模块目录下的types.rs文件
+    fn collect_types_rs_files(&self) -> Result<Vec<PathBuf>> {
+        let mut types_files = Vec::new();
+        let rust_src = self.root.join("rust/src");
+
+        if !rust_src.exists() {
+            return Ok(types_files);
+        }
+
+        for entry in WalkDir::new(&rust_src)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.file_name() == Some(OsStr::new("types.rs")) {
+                types_files.push(path.to_path_buf());
+            }
+        }
+
+        Ok(types_files)
+    }
+
+    /// 合并所有types.rs文件，去重后写入src.merge/lib.rs
+    fn merge_types_rs(&self, types_files: &[PathBuf]) -> Result<()> {
+        // 创建src.merge目录
+        let merge_dir = self.root.join("rust/src.merge");
+        fs::create_dir_all(&merge_dir).to_err()?;
+
+        // 收集所有types.rs的内容
+        let mut all_items = Vec::new();
+        let mut all_foreign_mods = Vec::new();
+        let mut type_definitions = HashMap::new(); // 用于去重类型定义
+
+        for types_file in types_files {
+            println!("Parsing types.rs: {}", types_file.display());
+            let content = fs::read_to_string(types_file).to_err()?;
+            let ast = syn::parse_file(&content).map_err(|e| {
+                eprintln!("Failed to parse {}: {}", types_file.display(), e);
+                Error::inval()
+            })?;
+
+            for item in ast.items {
+                match &item {
+                    // 收集extern块
+                    syn::Item::ForeignMod(_foreign_mod) => {
+                        all_foreign_mods.push(item);
+                    }
+                    // 收集类型定义，用于去重
+                    syn::Item::Struct(item_struct) => {
+                        let name = item_struct.ident.to_string();
+                        if !name.starts_with("_c2rust_private_") {
+                            type_definitions.insert(name, item);
+                        }
+                    }
+                    syn::Item::Enum(item_enum) => {
+                        let name = item_enum.ident.to_string();
+                        if !name.starts_with("_c2rust_private_") {
+                            type_definitions.insert(name, item);
+                        }
+                    }
+                    syn::Item::Type(item_type) => {
+                        let name = item_type.ident.to_string();
+                        if !name.starts_with("_c2rust_private_") {
+                            type_definitions.insert(name, item);
+                        }
+                    }
+                    syn::Item::Union(item_union) => {
+                        let name = item_union.ident.to_string();
+                        if !name.starts_with("_c2rust_private_") {
+                            type_definitions.insert(name, item);
+                        }
+                    }
+                    syn::Item::Const(item_const) => {
+                        let name = item_const.ident.to_string();
+                        if !name.starts_with("_c2rust_private_") {
+                            type_definitions.insert(name, item);
+                        }
+                    }
+                    syn::Item::Static(item_static) => {
+                        let name = item_static.ident.to_string();
+                        if !name.starts_with("_c2rust_private_") {
+                            type_definitions.insert(name, item);
+                        }
+                    }
+                    syn::Item::Fn(item_fn) => {
+                        let name = item_fn.sig.ident.to_string();
+                        if !name.starts_with("_c2rust_private_") {
+                            type_definitions.insert(name, item);
+                        }
+                    }
+                    syn::Item::Macro(_item_macro) => {
+                        // 保留宏定义（可能有重复，需要特殊处理）
+                        all_items.push(item);
+                    }
+                    _ => {
+                        // 其他类型的item也保留
+                        all_items.push(item);
+                    }
+                }
+            }
+        }
+
+        // 合并所有extern块，去除pub关键字
+        let merged_extern_item = Self::merge_foreign_mods(all_foreign_mods)?;
+
+        // 构建最终的items
+        let mut final_items = Vec::new();
+
+        // 首先添加类型定义（去重后的）
+        final_items.extend(type_definitions.into_values());
+
+        // 然后添加其他item（宏等）
+        final_items.extend(all_items);
+
+        // 最后添加合并的extern块
+        if let Some(extern_item) = merged_extern_item {
+            final_items.push(extern_item);
+        }
+
+        // 创建合并后的文件AST
+        let merged_file = syn::File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: final_items,
+        };
+
+        // 使用prettyplease格式化输出
+        let formatted = prettyplease::unparse(&merged_file);
+
+        // 写入src.merge/lib.rs
+        let lib_rs_path = merge_dir.join("lib.rs");
+        fs::write(&lib_rs_path, formatted.as_bytes()).to_err()?;
+
+        println!("Merged types.rs written to: {}", lib_rs_path.display());
+
+        Ok(())
+    }
+
+    /// 合并所有extern块，去除pub关键字，忽略_c2rust_private_前缀的符号
+    fn merge_foreign_mods(foreign_mod_items: Vec<syn::Item>) -> Result<Option<syn::Item>> {
+        use proc_macro2::Span;
+        use syn::{token, Abi, LitStr};
+
+        if foreign_mod_items.is_empty() {
+            return Ok(None);
+        }
+
+        // 收集所有extern块的属性和内容
+        let mut all_ffi_items = Vec::new();
+        let mut combined_attrs = Vec::new();
+        let mut has_unsafe = false;
+        let mut abi_name: Option<String> = None;
+
+        for item in &foreign_mod_items {
+            if let syn::Item::ForeignMod(foreign_mod) = item {
+                // 记录是否有unsafe关键字
+                if foreign_mod.unsafety.is_some() {
+                    has_unsafe = true;
+                }
+
+                // 记录abi名称
+                if let Some(abi) = &foreign_mod.abi.name {
+                    if abi_name.is_none() {
+                        abi_name = Some(abi.value());
+                    }
+                }
+
+                // 合并属性
+                combined_attrs.extend(foreign_mod.attrs.iter().cloned());
+
+                // 处理extern块中的项
+                for ffi_item in &foreign_mod.items {
+                    // 过滤_c2rust_private_前缀的符号
+                    let should_skip = match ffi_item {
+                        syn::ForeignItem::Fn(ffi_fn) => {
+                            ffi_fn.sig.ident.to_string().starts_with("_c2rust_private_")
+                        }
+                        syn::ForeignItem::Static(ffi_static) => {
+                            ffi_static.ident.to_string().starts_with("_c2rust_private_")
+                        }
+                        syn::ForeignItem::Type(ffi_type) => {
+                            ffi_type.ident.to_string().starts_with("_c2rust_private_")
+                        }
+                        _ => false,
+                    };
+
+                    if should_skip {
+                        continue;
+                    }
+
+                    // 克隆ffi_item并去除pub关键字
+                    let mut ffi_item = ffi_item.clone();
+                    match &mut ffi_item {
+                        syn::ForeignItem::Fn(ffi_fn) => {
+                            ffi_fn.vis = Visibility::Inherited;
+                        }
+                        syn::ForeignItem::Static(ffi_static) => {
+                            ffi_static.vis = Visibility::Inherited;
+                        }
+                        syn::ForeignItem::Type(ffi_type) => {
+                            ffi_type.vis = Visibility::Inherited;
+                        }
+                        _ => {}
+                    }
+
+                    all_ffi_items.push(ffi_item);
+                }
+            }
+        }
+
+        // 如果没有有效的extern项，返回None
+        if all_ffi_items.is_empty() {
+            return Ok(None);
+        }
+
+        // 去重extern项（基于名称）
+        let unique_ffi_items = Self::deduplicate_foreign_items(all_ffi_items);
+
+        if unique_ffi_items.is_empty() {
+            return Ok(None);
+        }
+
+        // 创建合并的extern块
+        let unsafety = if has_unsafe { Some(token::Unsafe::default()) } else { None };
+
+        let abi = if let Some(name) = abi_name {
+            Abi {
+                extern_token: token::Extern::default(),
+                name: Some(LitStr::new(&name, Span::call_site())),
+            }
+        } else {
+            Abi {
+                extern_token: token::Extern::default(),
+                name: Some(LitStr::new("C", Span::call_site())),
+            }
+        };
+
+        let foreign_mod = syn::ItemForeignMod {
+            attrs: combined_attrs,
+            unsafety,
+            abi,
+            brace_token: token::Brace::default(),
+            items: unique_ffi_items,
+        };
+
+        Ok(Some(syn::Item::ForeignMod(foreign_mod)))
+    }
+
+    /// 对extern块中的项进行去重
+    fn deduplicate_foreign_items(items: Vec<syn::ForeignItem>) -> Vec<syn::ForeignItem> {
+        let mut unique_items = Vec::new();
+        let mut seen_names = HashSet::new();
+
+        for item in items {
+            let name = match &item {
+                syn::ForeignItem::Fn(ffi_fn) => ffi_fn.sig.ident.to_string(),
+                syn::ForeignItem::Static(ffi_static) => ffi_static.ident.to_string(),
+                syn::ForeignItem::Type(ffi_type) => ffi_type.ident.to_string(),
+                _ => continue,
+            };
+
+            if !seen_names.contains(&name) {
+                seen_names.insert(name);
+                unique_items.push(item);
+            }
+        }
+
+        unique_items
     }
 }
