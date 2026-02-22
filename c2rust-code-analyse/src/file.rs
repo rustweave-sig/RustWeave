@@ -455,7 +455,7 @@ pub struct FunctionDecl {
     skip: bool,
 }
 
-pub struct File {
+pub(crate) struct File {
     node: Node,
     path: PathBuf,
 }

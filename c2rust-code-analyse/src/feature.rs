@@ -1,20 +1,19 @@
 use crate::{get_root, File, Result, ToError};
 use hierr::Error;
 use higuard::Guard;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use syn::{Item, UseTree, Visibility};
 use walkdir::WalkDir;
 
-pub struct Feature {
-    root: PathBuf,
-    prefix: PathBuf,
-    name: String,
-    files: Vec<File>,
+pub(crate) struct Feature {
+    pub root: PathBuf,
+    pub prefix: PathBuf,
+    pub name: String,
+    pub files: Vec<File>,
 }
 
 impl Feature {
@@ -215,32 +214,6 @@ impl Feature {
         Ok(())
     }
 
-    /// Rust文件和C源码文件一一对应，即合并原来同一个文件下独立的多个变量和函数的Rust文件
-    /// 合并时主要检查两点:
-    /// 1. 依赖的外表FFI声明去重
-    /// 1. 根据名字恢复C代码中符号可见性
-    /// 1. 合并后需要编译，可能存在因为符号冲突导致的编译错误，需要手工修正.
-    pub fn merge(&mut self) -> Result<()> {
-        println!("Starting merge for feature '{}'", self.name);
-        let mut any_merged = false;
-
-        for file in &self.files {
-            println!("Processing file for merge: {}", file.path().display());
-            if self.merge_file(file)? {
-                any_merged = true;
-                println!("File merged successfully: {}", file.path().display());
-                self.cargo_build()?;
-            }
-        }
-
-        if any_merged {
-            println!("Feature '{}' merged successfully", self.name);
-        } else {
-            println!("Feature '{}': no files needed merging", self.name);
-        }
-        Ok(())
-    }
-
     fn set_staticlib(&self) -> Result<()> {
         // TODO: 后续通过toml文件操作API实现读写
         // 当前简单追加写实现
@@ -258,6 +231,7 @@ impl Feature {
         code.push_str("#![allow(non_camel_case_types)]\n");
         code.push_str("#![allow(non_snake_case)]\n");
         code.push_str("#![allow(non_upper_case_globals)]\n");
+        code.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
         // 提示词可以简化为任何未知类型都从super::<name>导入.
         code.push_str("use core::ffi::*;\n");
         code.push_str("type c_size_t = usize;\n");
@@ -357,7 +331,7 @@ impl Feature {
     }
 
     // 获取File对应的mod目录名
-    fn get_mod_name_for_file(prefix: &Path, file: &File) -> Result<String> {
+    pub fn get_mod_name_for_file(prefix: &Path, file: &File) -> Result<String> {
         let file_path = file.path();
         let rel_path = file_path
             .strip_prefix(prefix)
@@ -366,311 +340,17 @@ impl Feature {
         Ok("mod_".to_string() + &rel_path.display().to_string().replace("/", "_"))
     }
 
-    // 合并单个File对应的Rust文件
-    fn merge_file(&self, file: &File) -> Result<bool> {
-        use syn::{
-            token::{Brace, Extern, Unsafe},
-            Abi, LitStr,
-        };
-
-        // 获取File对应的mod目录名
-        let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
-        let mod_dir = self.root.join("rust/src").join(&mod_name);
-
-        // 如果mod目录不存在，说明还没有Rust文件，跳过
-        if !mod_dir.exists() {
-            return Ok(false);
-        }
-
-        // 收集目录下的所有.rs文件（排除mod.rs）
-        let rs_files = Self::collect_rust_files(&mod_dir)?;
-
-        // 如果没有rs文件，跳过
-        if rs_files.is_empty() {
-            return Ok(false);
-        }
-
-        println!("Merging {} .rs files for mod {}", rs_files.len(), mod_name);
-
-        // 解析所有rs文件，合并内容
-        let (all_items, defined_funcs) = Self::parse_rust_files(&rs_files)?;
-
-        // 重新处理items，过滤和合并FFI声明和use语句
-        let (foreign_mods, use_items, other_items) = Self::group_items_by_type(all_items);
-
-        // 合并所有extern块
-        let mut merged_foreign_mod: Option<Item> = None;
-        if !foreign_mods.is_empty() {
-            let mut all_ffi_items = Vec::new();
-            let mut first_mod_attrs: Option<Vec<syn::Attribute>> = None;
-            let mut first_mod_unsafety: Option<Unsafe> = None;
-            let mut first_mod_abi: Option<Abi> = None;
-
-            for foreign_mod in foreign_mods {
-                if first_mod_attrs.is_none() {
-                    first_mod_attrs = Some(foreign_mod.attrs.clone());
-                    first_mod_unsafety = foreign_mod.unsafety;
-                    first_mod_abi = Some(foreign_mod.abi);
-                }
-
-                // 过滤掉已定义函数的FFI声明
-                for ffi_item in foreign_mod.items {
-                    if let syn::ForeignItem::Fn(ffi_fn) = &ffi_item {
-                        if defined_funcs.contains(&ffi_fn.sig.ident.to_string()) {
-                            continue; // 跳过已定义函数的FFI声明
-                        }
-                    }
-                    all_ffi_items.push(ffi_item);
-                }
-            }
-
-            // 去重FFI项（基于函数名）
-            let mut unique_ffi_items = Vec::new();
-            let mut seen_names = HashSet::new();
-
-            for ffi_item in all_ffi_items {
-                // 提取函数名
-                let name = if let syn::ForeignItem::Fn(ffi_fn) = &ffi_item {
-                    ffi_fn.sig.ident.to_string()
-                } else {
-                    // 对于非函数项，保留原样
-                    continue;
-                };
-
-                // 根据函数名去重
-                if !seen_names.contains(&name) {
-                    seen_names.insert(name);
-                    unique_ffi_items.push(ffi_item);
-                }
-            }
-
-            // 创建合并的extern块，使用第一个块的属性
-            if !unique_ffi_items.is_empty() {
-                // 如果没有abi，使用默认的extern "C"
-                let abi = first_mod_abi.unwrap_or_else(|| syn::Abi {
-                    extern_token: Extern::default(),
-                    name: Some(LitStr::new("C", proc_macro2::Span::call_site())),
-                });
-
-                let foreign_mod = syn::ItemForeignMod {
-                    attrs: first_mod_attrs.unwrap_or_default(),
-                    unsafety: first_mod_unsafety,
-                    abi,
-                    brace_token: Brace::default(),
-                    items: unique_ffi_items,
-                };
-                merged_foreign_mod = Some(Item::ForeignMod(foreign_mod));
-            }
-        }
-
-        // 处理use语句的去重（基于UseTree内容的精细化去重）
-        let unique_use_items = Self::deduplicate_use_items(use_items);
-
-        // 构建最终的items向量，按正确顺序：use语句、extern块、其他item
-        let mut final_items = Vec::new();
-
-        // 添加use语句
-        for use_item in unique_use_items {
-            final_items.push(Item::Use(use_item));
-        }
-
-        // 添加合并的extern块（如果有）
-        if let Some(foreign_mod) = merged_foreign_mod {
-            final_items.push(foreign_mod);
-        }
-
-        // 添加其他item
-        final_items.extend(other_items);
-
-        // 处理_c2rust_private_前缀的可见性
-        self.adjust_visibility_for_private_symbols(&mut final_items);
-
-        // 创建合并后的AST
-        let merged_ast = syn::File {
-            shebang: None,
-            attrs: Vec::new(),
-            items: final_items,
-        };
-
-        // 生成合并后的代码
-        let merged_code = quote::quote!(#merged_ast).to_string();
-
-        // 写入合并文件：rust/src/<mod_name>.rs
-        let merged_file_path = self
-            .root
-            .join("rust/src")
-            .join(&mod_name)
-            .with_extension("rs");
-        fs::write(&merged_file_path, merged_code).to_err()?;
-
-        // 删除原目录
-        fs::remove_dir_all(&mod_dir).to_err()?;
-        println!("Deleted directory: {}", mod_dir.display());
-
-        Ok(true)
-    }
-
-    // 调整_c2rust_private_前缀符号的可见性
-    fn adjust_visibility_for_private_symbols(&self, items: &mut [syn::Item]) {
-        for item in items.iter_mut() {
-            match item {
-                Item::Fn(item_fn) => {
-                    let ident_str = item_fn.sig.ident.to_string();
-                    if ident_str.starts_with("_c2rust_private_") {
-                        // 确保没有pub可见性
-                        item_fn.vis = Visibility::Inherited;
-                    }
-                }
-                Item::Static(item_static) => {
-                    let ident_str = item_static.ident.to_string();
-                    if ident_str.starts_with("_c2rust_private_") {
-                        // 确保没有pub可见性
-                        item_static.vis = Visibility::Inherited;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // 从UseTree中收集所有导入项字符串
-    fn collect_import_strings(tree: &UseTree) -> Vec<String> {
-        let mut imports = Vec::new();
-        let mut stack = vec![(tree, Vec::new())];
-
-        while let Some((node, mut current_path)) = stack.pop() {
-            match node {
-                UseTree::Path(path) => {
-                    current_path.push(path.ident.to_string());
-                    stack.push((&path.tree, current_path));
-                }
-                UseTree::Name(name) => {
-                    current_path.push(name.ident.to_string());
-                    imports.push(current_path.join("::"));
-                }
-                UseTree::Rename(rename) => {
-                    current_path.push(rename.rename.to_string());
-                    imports.push(current_path.join("::"));
-                    // 注意：忽略别名，因为去重只关心导入的项
-                }
-                UseTree::Glob(_) => {
-                    imports.push(format!("{}::*", current_path.join("::")));
-                }
-                UseTree::Group(group) => {
-                    for item in &group.items {
-                        stack.push((item, current_path.clone()));
-                    }
-                }
-            }
-        }
-        imports
-    }
-
-    // 检查一个导入项是否已被覆盖（考虑通配符）
-    fn import_is_covered(import: &str, seen_imports: &HashSet<String>) -> bool {
-        // 完全匹配
-        if seen_imports.contains(import) {
-            return true;
-        }
-        // 如果是具体导入，检查是否存在对应的通配符导入
-        if !import.ends_with("::*") {
-            // 将路径分段，检查每一级父路径是否有通配符
-            let segments: Vec<&str> = import.split("::").collect();
-            for i in 1..segments.len() {
-                let wildcard = segments[0..i].join("::") + "::*";
-                if seen_imports.contains(&wildcard) {
-                    return true;
-                }
-            }
-        }
-        // 如果是通配符导入，检查是否存在相同的通配符
-        // 注意：我们不考虑具体导入覆盖通配符的情况，因为可能没有导入所有项
-        false
-    }
-
-    // 收集目录下的所有.rs文件（排除mod.rs）
-    fn collect_rust_files(mod_dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut rs_files = Vec::new();
-        for entry in fs::read_dir(mod_dir).to_err()? {
-            let entry = entry.to_err()?;
-            let path = entry.path();
-            if path.is_file() && path.extension().map(|e| e == "rs").unwrap_or(false) {
-                let file_name = path.file_name().unwrap().to_string_lossy();
-                if file_name == "mod.rs" {
-                    continue; // 跳过mod.rs文件
-                }
-                rs_files.push(path);
-            }
-        }
-        Ok(rs_files)
-    }
-
-    // 解析所有Rust文件，收集items和已定义的函数名
-    fn parse_rust_files(rs_files: &[PathBuf]) -> Result<(Vec<syn::Item>, HashSet<String>)> {
-        let mut all_items = Vec::new();
-        let mut defined_funcs = HashSet::new();
-
-        for rs_file in rs_files {
-            let content = fs::read_to_string(rs_file).to_err()?;
-            let ast = syn::parse_file(&content).map_err(|e| {
-                eprintln!("Failed to parse {}: {}", rs_file.display(), e);
-                Error::inval()
-            })?;
-
-            for item in ast.items {
-                if let syn::Item::Fn(item_fn) = &item {
-                    defined_funcs.insert(item_fn.sig.ident.to_string());
-                }
-                all_items.push(item);
-            }
-        }
-
-        Ok((all_items, defined_funcs))
-    }
-
-    // 将items按类型分组：extern块、use语句、其他items
-    fn group_items_by_type(
-        items: Vec<syn::Item>,
-    ) -> (Vec<syn::ItemForeignMod>, Vec<syn::ItemUse>, Vec<syn::Item>) {
-        let mut foreign_mods = Vec::new();
-        let mut use_items = Vec::new();
-        let mut other_items = Vec::new();
-
-        for item in items {
-            match item {
-                syn::Item::ForeignMod(foreign_mod) => foreign_mods.push(foreign_mod),
-                syn::Item::Use(use_item) => use_items.push(use_item),
-                _ => other_items.push(item),
-            }
-        }
-
-        (foreign_mods, use_items, other_items)
-    }
-
-    // 对use语句进行去重（基于导入内容的精细化去重）
-    fn deduplicate_use_items(use_items: Vec<syn::ItemUse>) -> Vec<syn::ItemUse> {
-        let mut unique_use_items = Vec::new();
-        let mut seen_imports = HashSet::new();
-
-        for use_item in use_items {
-            let imports = Self::collect_import_strings(&use_item.tree);
-            let all_covered = imports
-                .iter()
-                .all(|import| Self::import_is_covered(import, &seen_imports));
-
-            if !all_covered {
-                unique_use_items.push(use_item);
-                for import in imports {
-                    seen_imports.insert(import);
-                }
-            }
-        }
-
-        unique_use_items
+    pub fn get_merged_mod_name(prefix: &Path, file: &File) -> Result<String> {
+        let file_path = file.path();
+        let rel_path = file_path
+            .strip_prefix(prefix)
+            .map_err(|_| Error::general())?
+            .with_extension("");
+        Ok("cfile_".to_string() + &rel_path.display().to_string().replace("/", "_"))
     }
 
     // 执行cargo build检查编译
-    fn cargo_build(&self) -> Result<()> {
+    pub fn cargo_build(&self) -> Result<()> {
         println!("Running cargo build to verify compilation...");
         let output = Command::new("cargo")
             .current_dir(self.root.join("rust"))
