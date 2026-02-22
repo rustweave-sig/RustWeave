@@ -6,26 +6,30 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{
     punctuated::Punctuated,
+    visit::{visit_foreign_item, visit_item, Visit},
     visit_mut::{
-        visit_item_const_mut, visit_item_fn_mut, visit_item_mut, visit_item_static_mut, visit_path_mut,
-        VisitMut,
+        visit_item_const_mut, visit_item_fn_mut, visit_item_mut, visit_item_static_mut,
+        visit_path_mut, VisitMut,
     },
 };
 use walkdir::WalkDir;
 
-struct NormalizeFile<'a>(&'a mut HashSet<String>);
+struct NormalizeFile;
 
 // 去掉_c2rust_private_前缀符号的pub关键字
 // 所有super::_c2rust_private_xxx需要去掉super, 前提是新生成的lib.rs中会将所有模块的pub符号导入
 // 收集所有类型，函数和变量的名字, 并不绝对准确，可能因为局部变量同名而保留.
-impl VisitMut for NormalizeFile<'_> {
+impl VisitMut for NormalizeFile {
     fn visit_path_mut(&mut self, path: &mut syn::Path) {
         if let (Some(p1), Some(p2)) = (path.segments.get(0), path.segments.get(1)) {
-            if p1.ident.to_string() == "super" && p2.ident.to_string().starts_with("_c2rust_private_") {
+            if p1.ident.to_string() == "super"
+                && p2.ident.to_string().starts_with("_c2rust_private_")
+            {
                 path.segments = Punctuated::from_iter(path.segments.clone().into_iter().skip(1));
                 return;
             }
         }
+        // 可能有泛型.
         visit_path_mut(self, path);
     }
 
@@ -47,6 +51,7 @@ impl VisitMut for NormalizeFile<'_> {
     fn visit_item_fn_mut(&mut self, item: &mut syn::ItemFn) {
         if item.sig.ident.to_string().starts_with("_c2rust_private_") {
             item.vis = syn::Visibility::Inherited;
+            item.attrs.clear();
         }
         visit_item_fn_mut(self, item);
     }
@@ -54,6 +59,7 @@ impl VisitMut for NormalizeFile<'_> {
     fn visit_item_static_mut(&mut self, item: &mut syn::ItemStatic) {
         if item.ident.to_string().starts_with("_c2rust_private_") {
             item.vis = syn::Visibility::Inherited;
+            item.attrs.clear();
         }
         visit_item_static_mut(self, item);
     }
@@ -61,13 +67,34 @@ impl VisitMut for NormalizeFile<'_> {
     fn visit_item_const_mut(&mut self, item: &mut syn::ItemConst) {
         if item.ident.to_string().starts_with("_c2rust_private_") {
             item.vis = syn::Visibility::Inherited;
+            item.attrs.clear();
         }
         visit_item_const_mut(self, item);
     }
+}
 
-    fn visit_ident_mut(&mut self, ident: &mut syn::Ident) {
-        if !ident.to_string().starts_with("_c2rust_private_") {
-            self.0.insert(ident.to_string());
+struct DepNames<'a>(&'a mut HashSet<String>);
+
+impl Visit<'_> for DepNames<'_> {
+    // 类型
+    fn visit_type_path(&mut self, ty: &syn::TypePath) {
+        let Some(ident) = ty.path.segments.last() else {
+            return;
+        };
+        let name = ident.ident.to_string();
+        if !name.starts_with("_c2rust_private_") {
+            self.0.insert(name);
+        }
+    }
+
+    // 变量，函数
+    fn visit_expr_path(&mut self, expr: &syn::ExprPath) {
+        let Some(ident) = expr.path.segments.last() else {
+            return;
+        };
+        let name = ident.ident.to_string();
+        if !name.starts_with("_c2rust_private_") {
+            self.0.insert(name);
         }
     }
 }
@@ -85,33 +112,23 @@ impl Feature {
         let merge_dir = self.root.join("rust/src.merge");
         fs::create_dir_all(&merge_dir).to_err()?;
 
-        let mut any_merged = false;
         // 简化处理不区分名字空间，可能会导致实际未使用的符号仍然保留下来，可以接受.
         let mut used_names = HashSet::new();
 
         // 处理每个file的Rust文件合并
         for file in &self.files {
-            if self.merge_file(file, &mut used_names)? {
-                any_merged = true;
-                self.cargo_build()?;
-            }
+            self.merge_file(file, &mut used_names)?;
         }
 
         // 首先收集所有模块的types.rs文件路径
         let types_rs_files = self.collect_types_rs_files()?;
         println!("Found {} types.rs files to merge", types_rs_files.len());
 
-        // 如果有types.rs文件，合并它们
-        if !types_rs_files.is_empty() {
-            self.merge_types_rs(&types_rs_files, &mut used_names)?;
-            println!("Types.rs files merged successfully");
-            any_merged = true;
-        }
-        if any_merged {
-            println!("Feature '{}' merged successfully", self.name);
-        } else {
-            println!("Feature '{}': no files needed merging", self.name);
-        }
+        self.merge_types_rs(&types_rs_files, &mut used_names)?;
+
+        self.link_src_dir()?;
+
+        println!("Feature '{}' merged successfully", self.name);
         Ok(())
     }
 
@@ -144,9 +161,11 @@ impl Feature {
         // 解析所有rs文件，合并内容
         let mut items = Self::parse_rust_files(&rs_files)?;
         // 规范化处理rs文件.
-        let mut visitor = NormalizeFile(used_names);
+        let mut normalize = NormalizeFile;
+        let mut depend = DepNames(used_names);
         for item in items.iter_mut() {
-            visit_item_mut(&mut visitor, item);
+            visit_item_mut(&mut normalize, item);
+            visit_item(&mut depend, item);
         }
 
         // 创建合并后的文件AST
@@ -161,7 +180,11 @@ impl Feature {
         let content = format!("use super::*;\n\n{}", formatted);
 
         let mod_name = Self::get_merged_mod_name(&self.prefix, file)?;
-        let mod_path = self.root.join("rust/src.merge").join(&mod_name).with_extension("rs");
+        let mod_path = self
+            .root
+            .join("rust/src.merge")
+            .join(&mod_name)
+            .with_extension("rs");
         fs::write(&mod_path, content.as_bytes()).to_err()?;
 
         println!("File merged successfully: {}", mod_path.display());
@@ -239,7 +262,6 @@ impl Feature {
                 );
             }
         }
-        println!("parse rust files: {} {}", all_items.len(), rs_files.len());
         Ok(all_items)
     }
 
@@ -260,7 +282,7 @@ impl Feature {
         }
         let block = &fn_item.block;
         let new_block = quote::quote! {{
-            #(#items);*
+            #(#items)*
             #block
         }};
         fn_item.block = syn::parse2(new_block).unwrap();
@@ -272,7 +294,7 @@ impl Feature {
         }
         let expr = &static_item.expr;
         let new_expr = quote::quote! {{
-            #(#items);*
+            #(#items)*
             #expr
         }};
         static_item.expr = syn::parse2(new_expr).unwrap();
@@ -353,17 +375,48 @@ impl Feature {
             }
         }
 
-        let mut all_items: Vec<_> = all_items.values().cloned().collect();
+        all_items.insert(
+            "c_size_t".to_string(),
+            syn::parse2(quote::quote!(
+                type c_size_t = usize;
+            ))
+            .unwrap(),
+        );
+        all_items.insert(
+            "c_ssize_t".to_string(),
+            syn::parse2(quote::quote!(
+                type c_ssize_t = isize;
+            ))
+            .unwrap(),
+        );
+        all_items.insert(
+            "c_ptrdiff_t".to_string(),
+            syn::parse2(quote::quote!(
+                type c_ptrdiff_t = isize;
+            ))
+            .unwrap(),
+        );
+
+        let mut dep_items = Vec::new();
+        let mut dep_foreign_items = Vec::new();
+        Self::filter_merged_items(
+            all_items,
+            foreign_items,
+            used_names,
+            &mut dep_items,
+            &mut dep_foreign_items,
+        );
+
         if let Some(mut foreign_mod) = merged_foreign_mod {
-            foreign_mod.items = foreign_items.values().cloned().collect();
-            all_items.push(syn::Item::ForeignMod(foreign_mod));
+            foreign_mod.items = dep_foreign_items;
+            dep_items.push(syn::Item::ForeignMod(foreign_mod));
         }
 
         // 创建合并后的文件AST
         let merged_file = syn::File {
             shebang: None,
             attrs: Vec::new(),
-            items: all_items,
+            items: dep_items,
         };
 
         // 使用prettyplease格式化输出
@@ -373,10 +426,8 @@ impl Feature {
         content.push_str("#![allow(non_camel_case_types)]\n");
         content.push_str("#![allow(non_snake_case)]\n");
         content.push_str("#![allow(non_upper_case_globals)]\n");
+        content.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
         content.push_str("use core::ffi::*;\n");
-        content.push_str("type c_size_t = usize;\n");
-        content.push_str("type c_ssize_t = isize;\n");
-        content.push_str("type c_ptrdiff_t = isize;\n");
         content.push('\n');
         content.push_str(&formatted);
         content.push('\n');
@@ -396,6 +447,48 @@ impl Feature {
 
         println!("Merged types.rs written to: {}", lib_rs_path.display());
 
+        Ok(())
+    }
+
+    fn filter_merged_items(
+        mut all_items: HashMap<String, syn::Item>,
+        mut foreign_items: HashMap<String, syn::ForeignItem>,
+        used_names: &mut HashSet<String>,
+        dep_items: &mut Vec<syn::Item>,
+        dep_foreign_items: &mut Vec<syn::ForeignItem>,
+    ) {
+        while !used_names.is_empty() {
+            let mut dep_names = HashSet::new();
+            let mut depend = DepNames(&mut dep_names);
+            for name in used_names.iter() {
+                if let Some(item) = all_items.remove(name) {
+                    visit_item(&mut depend, &item);
+                    dep_items.push(item);
+                }
+                if let Some(item) = foreign_items.remove(name) {
+                    visit_foreign_item(&mut depend, &item);
+                    dep_foreign_items.push(item);
+                }
+            }
+            std::mem::swap(used_names, &mut dep_names);
+        }
+        dep_items.sort_by(|item1, item2| Self::item_name(item2).cmp(&Self::item_name(item1)));
+        dep_foreign_items.sort_by(|item1, item2| {
+            Self::foreign_item_name(item2).cmp(&Self::foreign_item_name(item1))
+        });
+    }
+
+    fn link_src_dir(&self) -> Result<()> {
+        let src_dir = self.root.join("rust/src");
+        if src_dir.is_symlink() {
+            fs::remove_file(&src_dir).to_err()?;
+        } else {
+            let old_src_dir = self.root.join("rust/src.old");
+            let _ = fs::remove_dir_all(&old_src_dir).to_err()?;
+            let _ = fs::rename(&src_dir, &old_src_dir).to_err()?;
+        }
+        let new_src_dir = self.root.join("rust/src.merge");
+        let _ = std::os::unix::fs::symlink(new_src_dir, src_dir).to_err()?;
         Ok(())
     }
 }

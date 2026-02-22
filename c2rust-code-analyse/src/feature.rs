@@ -231,6 +231,7 @@ impl Feature {
         code.push_str("#![allow(non_camel_case_types)]\n");
         code.push_str("#![allow(non_snake_case)]\n");
         code.push_str("#![allow(non_upper_case_globals)]\n");
+        code.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
         // 提示词可以简化为任何未知类型都从super::<name>导入.
         code.push_str("use core::ffi::*;\n");
         code.push_str("type c_size_t = usize;\n");
