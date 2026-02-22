@@ -6,6 +6,7 @@ mod file;
 use file::*;
 mod feature;
 use feature::*;
+mod merge;
 
 trait ToError<T> {
     fn to_err(self) -> Result<T>;
