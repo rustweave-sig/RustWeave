@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-pub(crate) struct Feature {
+pub struct Feature {
     pub root: PathBuf,
     pub prefix: PathBuf,
     pub name: String,
@@ -349,6 +349,7 @@ impl Feature {
         Ok("cfile_".to_string() + &rel_path.display().to_string().replace("/", "_"))
     }
 
+    #[allow(dead_code)]
     // 执行cargo build检查编译
     pub fn cargo_build(&self) -> Result<()> {
         println!("Running cargo build to verify compilation...");
