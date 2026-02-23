@@ -105,12 +105,9 @@ impl Feature {
     /// 1. 依赖的外表FFI声明去重
     /// 1. 根据名字恢复C代码中符号可见性
     /// 1. 合并后需要编译，可能存在因为符号冲突导致的编译错误，需要手工修正.
-    /// 1. 合并各个模块的types.rs文件，去重后写入src.merge/lib.rs
+    /// 1. 合并各个模块的types.rs文件，去重后写入src/lib.rs
     pub fn merge(&mut self) -> Result<()> {
         println!("Starting merge for feature '{}'", self.name);
-        // 创建src.merge目录
-        let merge_dir = self.root.join("rust/src.merge");
-        fs::create_dir_all(&merge_dir).to_err()?;
 
         // 简化处理不区分名字空间，可能会导致实际未使用的符号仍然保留下来，可以接受.
         let mut used_names = HashSet::new();
@@ -126,7 +123,7 @@ impl Feature {
 
         self.merge_types_rs(&types_rs_files, &mut used_names)?;
 
-        self.link_src_dir()?;
+        self.link_lib_rs()?;
 
         println!("Feature '{}' merged successfully", self.name);
         Ok(())
@@ -182,10 +179,10 @@ impl Feature {
         let mod_name = Self::get_merged_mod_name(&self.prefix, file)?;
         let mod_path = self
             .root
-            .join("rust/src.merge")
+            .join("rust/src")
             .join(&mod_name)
             .with_extension("rs");
-        fs::write(&mod_path, content.as_bytes()).to_err()?;
+        fs::write(&mod_path, content.as_bytes()).log_err(&format!("write {mod_name}.rs"))?;
 
         println!("File merged successfully: {}", mod_path.display());
 
@@ -342,7 +339,7 @@ impl Feature {
         }
     }
 
-    /// 合并所有types.rs文件，去重后写入src.merge/lib.rs
+    /// 合并所有types.rs文件，去重后写入src/lib.rs
     fn merge_types_rs(
         &self,
         types_files: &[PathBuf],
@@ -440,10 +437,10 @@ impl Feature {
             content.push_str("::*;\n");
         }
 
-        // 写入src.merge/lib.rs
-        let merge_dir = self.root.join("rust/src.merge");
-        let lib_rs_path = merge_dir.join("lib.rs");
-        fs::write(&lib_rs_path, content.as_bytes()).to_err()?;
+        // 写入src/lib.rs
+        let merge_dir = self.root.join("rust/src");
+        let lib_rs_path = merge_dir.join("lib.rs.2");
+        fs::write(&lib_rs_path, content.as_bytes()).log_err("write lib.rs.2")?;
 
         println!("Merged types.rs written to: {}", lib_rs_path.display());
 
@@ -478,17 +475,17 @@ impl Feature {
         });
     }
 
-    fn link_src_dir(&self) -> Result<()> {
-        let src_dir = self.root.join("rust/src");
-        if src_dir.is_symlink() {
-            fs::remove_file(&src_dir).to_err()?;
+    fn link_lib_rs(&self) -> Result<()> {
+        let lib = self.root.join("rust/src/lib.rs");
+        if lib.is_symlink() {
+            fs::remove_file(&lib).log_err("remove link[lib.rs]")?;
         } else {
-            let old_src_dir = self.root.join("rust/src.old");
-            let _ = fs::remove_dir_all(&old_src_dir).to_err()?;
-            let _ = fs::rename(&src_dir, &old_src_dir).to_err()?;
+            let old_lib = self.root.join("rust/src/lib.rs.1");
+            let _ = fs::remove_file(&old_lib);
+            let _ = fs::rename(&lib, &old_lib).log_err("rename[lib.rs -> lib.rs.1]")?;
         }
-        let new_src_dir = self.root.join("rust/src.merge");
-        let _ = std::os::unix::fs::symlink(new_src_dir, src_dir).to_err()?;
+        let new_lib = self.root.join("rust/src/lib.rs.2");
+        let _ = std::os::unix::fs::symlink(new_lib, lib).log_err("link[lib.rs -> lib.rs.2]")?;
         Ok(())
     }
 }
