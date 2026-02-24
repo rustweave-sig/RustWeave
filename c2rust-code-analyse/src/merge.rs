@@ -9,18 +9,24 @@ use syn::{
     visit::{visit_foreign_item, visit_item, Visit},
     visit_mut::{
         visit_item_const_mut, visit_item_fn_mut, visit_item_mut, visit_item_static_mut,
-        visit_path_mut, VisitMut,
+        VisitMut,
     },
 };
 use walkdir::WalkDir;
 
 struct NormalizeFile;
 
-// 去掉_c2rust_private_前缀符号的pub关键字
-// 所有super::_c2rust_private_xxx需要去掉super, 前提是新生成的lib.rs中会将所有模块的pub符号导入
-// 收集所有类型，函数和变量的名字, 并不绝对准确，可能因为局部变量同名而保留.
+// 1. c2rust_types更名为super
+// 1. 去掉_c2rust_private_前缀符号的pub关键字
+// 1. 所有super::_c2rust_private_xxx需要去掉super, 前提是新生成的lib.rs中会将所有模块的pub符号导入
 impl VisitMut for NormalizeFile {
     fn visit_path_mut(&mut self, path: &mut syn::Path) {
+        // 出现翻译的时候应该用super的地方出现了c2rust_types. 合并之后不存在了.
+        if let Some(p1) = path.segments.get_mut(0) {
+            if p1.ident.to_string() == "c2rust_types" {
+                p1.ident = syn::Ident::new("super", p1.ident.span());
+            }
+        }
         if let (Some(p1), Some(p2)) = (path.segments.get(0), path.segments.get(1)) {
             if p1.ident.to_string() == "super"
                 && p2.ident.to_string().starts_with("_c2rust_private_")
@@ -29,14 +35,17 @@ impl VisitMut for NormalizeFile {
                 return;
             }
         }
-        // 可能有泛型.
-        visit_path_mut(self, path);
     }
 
     // 对于宏只能通过字符串替换，限制只处理super::_c2rust_private_
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
         let mut macro_str = mac.tokens.to_string();
         let mut changed = false;
+        let regex = regex::Regex::new(r"c2rust_types\s*::").unwrap();
+        while let Some(m) = regex.find(&macro_str) {
+            macro_str.replace_range(m.start()..m.start() + m.len(), "super");
+            changed = true;
+        }
         let regex = regex::Regex::new(r"super\s*::\s*_c2rust_private_").unwrap();
         while let Some(m) = regex.find(&macro_str) {
             macro_str.replace_range(m.start()..m.start() + m.len(), "_c2rust_private_");
@@ -61,6 +70,9 @@ impl VisitMut for NormalizeFile {
             item.vis = syn::Visibility::Inherited;
             item.attrs.clear();
         }
+        // C的静态变量都是可写的.
+        // 可能翻译的时候忘记mut修饰符了.
+        item.mutability = syn::StaticMutability::Mut(syn::parse2(quote::quote!(mut)).unwrap());
         visit_item_static_mut(self, item);
     }
 
@@ -105,7 +117,7 @@ impl Feature {
     /// 1. 依赖的外表FFI声明去重
     /// 1. 根据名字恢复C代码中符号可见性
     /// 1. 合并后需要编译，可能存在因为符号冲突导致的编译错误，需要手工修正.
-    /// 1. 合并各个模块的types.rs文件，去重后写入src/lib.rs
+    /// 1. 合并各个模块的c2rust_types.rs文件，去重后写入src/lib.rs
     pub fn merge(&mut self) -> Result<()> {
         println!("Starting merge for feature '{}'", self.name);
 
@@ -117,9 +129,9 @@ impl Feature {
             self.merge_file(file, &mut used_names)?;
         }
 
-        // 首先收集所有模块的types.rs文件路径
+        // 首先收集所有模块的c2rust_types.rs文件路径
         let types_rs_files = self.collect_types_rs_files()?;
-        println!("Found {} types.rs files to merge", types_rs_files.len());
+        println!("Found {} c2rust_types.rs files to merge", types_rs_files.len());
 
         self.merge_types_rs(&types_rs_files, &mut used_names)?;
 
@@ -297,7 +309,7 @@ impl Feature {
         static_item.expr = syn::parse2(new_expr).unwrap();
     }
 
-    /// 收集所有模块目录下的types.rs文件
+    /// 收集所有模块目录下的c2rust_types.rs文件
     fn collect_types_rs_files(&self) -> Result<Vec<PathBuf>> {
         let mut types_files = Vec::new();
         let rust_src = self.root.join("rust/src");
@@ -313,7 +325,7 @@ impl Feature {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if entry.depth() == 2 && path.file_name() == Some(OsStr::new("types.rs")) {
+            if entry.depth() == 2 && path.file_name() == Some(OsStr::new("c2rust_types.rs")) {
                 types_files.push(path.to_path_buf());
             }
         }
@@ -339,19 +351,19 @@ impl Feature {
         }
     }
 
-    /// 合并所有types.rs文件，去重后写入src/lib.rs
+    /// 合并所有c2rust_types.rs文件，去重后写入src/lib.rs
     fn merge_types_rs(
         &self,
         types_files: &[PathBuf],
         used_names: &mut HashSet<String>,
     ) -> Result<()> {
-        // 收集所有types.rs的内容
+        // 收集所有c2rust_types.rs的内容
         let mut all_items = HashMap::new();
         let mut foreign_items = HashMap::new();
         let mut merged_foreign_mod = None;
 
         for types_file in types_files {
-            println!("Parsing types.rs: {}", types_file.display());
+            println!("Parsing c2rust_types.rs: {}", types_file.display());
             let content = fs::read_to_string(types_file).to_err()?;
             let ast = syn::parse_file(&content).map_err(|e| {
                 eprintln!("Failed to parse {}: {}", types_file.display(), e);
@@ -442,7 +454,7 @@ impl Feature {
         let lib_rs_path = merge_dir.join("lib.rs.2");
         fs::write(&lib_rs_path, content.as_bytes()).log_err("write lib.rs.2")?;
 
-        println!("Merged types.rs written to: {}", lib_rs_path.display());
+        println!("Merged c2rust_types.rs written to: {}", lib_rs_path.display());
 
         Ok(())
     }
