@@ -332,21 +332,21 @@ impl Feature {
 
     // 获取File对应的mod目录名
     pub fn get_mod_name_for_file(prefix: &Path, file: &File) -> Result<String> {
-        let file_path = file.path();
-        let rel_path = file_path
-            .strip_prefix(prefix)
-            .map_err(|_| Error::general())?
-            .with_extension("");
+        let rel_path = Self::get_mod_rel_path(prefix, file)?;
         Ok("mod_".to_string() + &rel_path.display().to_string().replace("/", "_"))
     }
 
     pub fn get_merged_mod_name(prefix: &Path, file: &File) -> Result<String> {
-        let file_path = file.path();
-        let rel_path = file_path
+        let rel_path = Self::get_mod_rel_path(prefix, file)?;
+        Ok("cfile_".to_string() + &rel_path.display().to_string().replace("/", "_"))
+    }
+
+    fn get_mod_rel_path(prefix: &Path, file: &File) -> Result<PathBuf> {
+        Ok(file
+            .path()
             .strip_prefix(prefix)
             .map_err(|_| Error::general())?
-            .with_extension("");
-        Ok("cfile_".to_string() + &rel_path.display().to_string().replace("/", "_"))
+            .with_extension(""))
     }
 
     #[allow(dead_code)]

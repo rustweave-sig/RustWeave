@@ -223,7 +223,7 @@ impl Feature {
                 .with_extension("")
                 .file_name()
                 .unwrap()
-                .display()
+                .to_string_lossy()
                 .to_string();
             let main_item_name = &file_name[4..];
             let mut main_item = None;
