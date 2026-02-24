@@ -7,10 +7,7 @@ use std::path::{Path, PathBuf};
 use syn::{
     punctuated::Punctuated,
     visit::{visit_foreign_item, visit_item, Visit},
-    visit_mut::{
-        visit_item_const_mut, visit_item_fn_mut, visit_item_mut, visit_item_static_mut,
-        VisitMut,
-    },
+    visit_mut::{visit_item_mut, VisitMut},
 };
 use walkdir::WalkDir;
 
@@ -55,33 +52,6 @@ impl VisitMut for NormalizeFile {
             use std::str::FromStr;
             mac.tokens = proc_macro2::TokenStream::from_str(&macro_str).unwrap();
         }
-    }
-
-    fn visit_item_fn_mut(&mut self, item: &mut syn::ItemFn) {
-        if item.sig.ident.to_string().starts_with("_c2rust_private_") {
-            item.vis = syn::Visibility::Inherited;
-            item.attrs.clear();
-        }
-        visit_item_fn_mut(self, item);
-    }
-
-    fn visit_item_static_mut(&mut self, item: &mut syn::ItemStatic) {
-        if item.ident.to_string().starts_with("_c2rust_private_") {
-            item.vis = syn::Visibility::Inherited;
-            item.attrs.clear();
-        }
-        // C的静态变量都是可写的.
-        // 可能翻译的时候忘记mut修饰符了.
-        item.mutability = syn::StaticMutability::Mut(syn::parse2(quote::quote!(mut)).unwrap());
-        visit_item_static_mut(self, item);
-    }
-
-    fn visit_item_const_mut(&mut self, item: &mut syn::ItemConst) {
-        if item.ident.to_string().starts_with("_c2rust_private_") {
-            item.vis = syn::Visibility::Inherited;
-            item.attrs.clear();
-        }
-        visit_item_const_mut(self, item);
     }
 }
 
@@ -131,7 +101,10 @@ impl Feature {
 
         // 首先收集所有模块的c2rust_types.rs文件路径
         let types_rs_files = self.collect_types_rs_files()?;
-        println!("Found {} c2rust_types.rs files to merge", types_rs_files.len());
+        println!(
+            "Found {} c2rust_types.rs files to merge",
+            types_rs_files.len()
+        );
 
         self.merge_types_rs(&types_rs_files, &mut used_names)?;
 
@@ -286,6 +259,15 @@ impl Feature {
     }
 
     fn move_items_2_fn(items: Vec<syn::Item>, fn_item: &mut syn::ItemFn) {
+        if fn_item
+            .sig
+            .ident
+            .to_string()
+            .starts_with("_c2rust_private_")
+        {
+            fn_item.vis = syn::Visibility::Inherited;
+            fn_item.attrs.clear();
+        }
         if items.is_empty() {
             return;
         }
@@ -298,6 +280,18 @@ impl Feature {
     }
 
     fn move_items_2_static(items: Vec<syn::Item>, static_item: &mut syn::ItemStatic) {
+        // C的静态变量都是可写的.
+        // 可能翻译的时候忘记mut修饰符了.
+        static_item.mutability =
+            syn::StaticMutability::Mut(syn::parse2(quote::quote!(mut)).unwrap());
+        if static_item
+            .ident
+            .to_string()
+            .starts_with("_c2rust_private_")
+        {
+            static_item.vis = syn::Visibility::Inherited;
+            static_item.attrs.clear();
+        }
         if items.is_empty() {
             return;
         }
@@ -454,7 +448,10 @@ impl Feature {
         let lib_rs_path = merge_dir.join("lib.rs.2");
         fs::write(&lib_rs_path, content.as_bytes()).log_err("write lib.rs.2")?;
 
-        println!("Merged c2rust_types.rs written to: {}", lib_rs_path.display());
+        println!(
+            "Merged c2rust_types.rs written to: {}",
+            lib_rs_path.display()
+        );
 
         Ok(())
     }
