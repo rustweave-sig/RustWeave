@@ -5,7 +5,7 @@ from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
 from semantic_fixing import safe_read_file
 
-def function_translation(C_function_code, model, openai_instance, suggestion_file_path=None, prompt_file=None):
+def function_translation(C_function_code, model, openai_instance, rust_type, suggestion_file_path=None, prompt_file=None):
     """
     将C函数翻译为Rust函数（使用外部prompt模板）
 
@@ -62,7 +62,7 @@ def function_translation(C_function_code, model, openai_instance, suggestion_fil
     # 安全替换占位符
     try:
         # .format() 会自动处理 {{ → {, }} → } 的转义（完美匹配FFI块语法）
-        prompt = prompt_template.format(C_function_code=C_function_code, suggestion=suggestion)
+        prompt = prompt_template.format(C_function_code=C_function_code, rust_type=rust_type, suggestion=suggestion)
     except KeyError as e:
         missing_key = str(e).strip("'")
         raise ValueError(
@@ -570,7 +570,7 @@ pub unsafe extern "C" fn set_state(state: AppState) {
 
             # 调用翻译函数
             print("\n实际翻译结果:")
-            result = function_translation(test['c_code'], LLM_config.model, openai_instance)
+            result = function_translation(test['c_code'], LLM_config.model, openai_instance, "i64")
             print(result)
 
             print("-" * 80 + "\n")

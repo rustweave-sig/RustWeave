@@ -5,7 +5,7 @@ from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
 from semantic_fixing import safe_read_file
 
-def syntax_fixing(c_code, rust_code, error_message, model, openai_instance, suggestion_file_path=None, prompt_file=None):
+def syntax_fixing(c_code, rust_code, error_message, model, openai_instance, rust_type, suggestion_file_path=None, prompt_file=None):
     """
     修复Rust代码中的语法错误（使用外部prompt模板）
 
@@ -67,7 +67,8 @@ def syntax_fixing(c_code, rust_code, error_message, model, openai_instance, sugg
             c_code=c_code,
             rust_code=rust_code,
             error_message=error_message,
-            suggestion=suggestion
+            suggestion=suggestion,
+            rust_type = rust_type
         )
     except KeyError as e:
         missing_key = str(e).strip("'")
@@ -530,7 +531,7 @@ pub extern "C" unsafe fn complex_function(arr: *mut i32, len: i32, threshold: f3
 
             # 调用修复函数
             print("\n实际修复结果:")
-            result = syntax_fixing(test['c_code'], test['rust_code'], test['error_message'], LLM_config.model, openai_instance)
+            result = syntax_fixing(test['c_code'], test['rust_code'], test['error_message'], LLM_config.model, openai_instance, "i64")
             print(result)
 
             print("-" * 80 + "\n")

@@ -5,7 +5,7 @@ from parse_LLM_output import filter_model_response
 from LLM_calling import load_LLM_config, init_openai_instance
 from semantic_fixing import safe_read_file
 
-def var_translation(C_var_code, model, openai_instance, suggestion_file_path=None, prompt_file=None):
+def var_translation(C_var_code, model, openai_instance, rust_type, suggestion_file_path=None, prompt_file=None):
     """
     将C全局变量翻译为Rust全局变量（使用外部prompt模板）
 
@@ -61,7 +61,7 @@ def var_translation(C_var_code, model, openai_instance, suggestion_file_path=Non
     # 安全替换占位符
     try:
         # .format() 会自动处理 {{ → {, }} → } 的转义
-        prompt = prompt_template.format(C_var_code=C_var_code, suggestion=suggestion)
+        prompt = prompt_template.format(C_var_code=C_var_code, rust_type=rust_type, suggestion=suggestion)
     except KeyError as e:
         raise ValueError(
             f"Error - Prompt模板缺少必需的占位符 {{{e}}}。\n"
@@ -324,7 +324,7 @@ pub static mut status_flags: Flags = Flags::new();
 
             # 调用翻译函数
             print("\n实际翻译结果:")
-            result = var_translation(test['c_code'], LLM_config.model, openai_instance)
+            result = var_translation(test['c_code'], LLM_config.model, openai_instance, "i64")
             print(result)
 
             print("-" * 60 + "\n")
