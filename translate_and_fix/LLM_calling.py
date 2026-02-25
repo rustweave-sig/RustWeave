@@ -114,7 +114,7 @@ def load_LLM_config(file_path):
         raise RuntimeError(f"ERROR - 解析配置文件时出错: {e}") from e
 
 # return a new openai instance
-def init_openai_instance(LLM_config):
+def init_openai_instance(LLM_config, proxy_config=None):
     try:
         # 获取当前进程的专属KEY
         api_key = LLM_config.api_key
@@ -123,8 +123,20 @@ def init_openai_instance(LLM_config):
         raise RuntimeError(f"ERROR - 获取大模型配置时出错: {e}") from e
 
     try:
+        if proxy_config is None:
+            mounts = None
+        else:
+            http_proxy = httpx.Proxy(proxy_config["http"])
+            https_proxy = httpx.Proxy(proxy_config["https"])
+
+            # 通过 mounts 参数挂载代理（最底层方式）
+            mounts = {
+                "http://": httpx.HTTPTransport(proxy=http_proxy),
+                "https://": httpx.HTTPTransport(proxy=https_proxy)
+            }
+
         # 提供持久化连接的功能，可以重复使用相同的TCP连接，从而提高性能
-        clean_http_client = httpx.Client(verify=False)
+        clean_http_client = httpx.Client(mounts=mounts, verify=False)
     except Exception as e:
         raise RuntimeError(f"ERROR - 创建TCP连接时出错: {e}") from e
 

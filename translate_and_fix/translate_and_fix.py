@@ -1,6 +1,7 @@
 import argparse
 
 from LLM_calling import load_LLM_config, init_openai_instance, close_openai_instance
+from proxy import ProxyDetector
 from function_translation import function_translation
 from variable_translation import var_translation
 from syntax_fixing import syntax_fixing
@@ -17,10 +18,25 @@ parser.add_argument('--error', type=str, default=None, help='The file path of er
 parser.add_argument('--suggestion', type=str, default=None, help='The file path of human suggestion for fixing.')
 args = parser.parse_args()
 
+# 配置代理
+try:
+    detector = ProxyDetector(timeout=5)
+    proxy_config = detector.detect()
+
+    # 创建 HTTP 客户端
+    if proxy_config:
+        print(f"Info - 使用代理: {proxy_config['http']}")
+        print(f"Info - 来源: {proxy_config['source']}")
+    else:
+        print(f"Warning - 未检测到代理，将尝试直连")
+except Exception as e:
+    print(f"ERROR - 配置代理出错: {e}")
+    exit(1)
+
 # 根据config字段创建大模型会话
 try:
     LLM_config = load_LLM_config(args.config)
-    openai_instance = init_openai_instance(LLM_config)
+    openai_instance = init_openai_instance(LLM_config, proxy_config)
 except Exception as e:
     print(f"ERROR - 加载配置文件/创建大模型会话出错: {e}")
     exit(1)
