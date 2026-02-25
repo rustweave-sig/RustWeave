@@ -28,7 +28,7 @@ try:
         print(f"Info - 使用代理: {proxy_config['http']}")
         print(f"Info - 来源: {proxy_config['source']}")
     else:
-        print(f"Warning - 未检测到代理，将尝试直连")
+        print(f"Info - 未检测到代理，将尝试直连")
 except Exception as e:
     print(f"ERROR - 配置代理出错: {e}")
     exit(1)
