@@ -1,5 +1,6 @@
 use crate::{Feature, File, Result, ToError};
 use hierr::Error;
+use quote::quote;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -266,13 +267,13 @@ impl Feature {
             .starts_with("_c2rust_private_")
         {
             // 只改变可见性，其他函数可能显示通过FFI声明引用它.
-            fn_item.vis = syn::Visibility::Inherited;
+            fn_item.vis = syn::parse2(quote!(pub(super))).unwrap();
         }
         if items.is_empty() {
             return;
         }
         let block = &fn_item.block;
-        let new_block = quote::quote! {{
+        let new_block = quote! {{
             #(#items)*
             #block
         }};
@@ -282,21 +283,20 @@ impl Feature {
     fn move_items_2_static(items: Vec<syn::Item>, static_item: &mut syn::ItemStatic) {
         // C的静态变量都是可写的.
         // 可能翻译的时候忘记mut修饰符了.
-        static_item.mutability =
-            syn::StaticMutability::Mut(syn::parse2(quote::quote!(mut)).unwrap());
+        static_item.mutability = syn::StaticMutability::Mut(syn::parse2(quote!(mut)).unwrap());
         if static_item
             .ident
             .to_string()
             .starts_with("_c2rust_private_")
         {
             // 只改变可见性，其他函数可能显示通过FFI声明引用它.
-            static_item.vis = syn::Visibility::Inherited;
+            static_item.vis = syn::parse2(quote!(pub(super))).unwrap();
         }
         if items.is_empty() {
             return;
         }
         let expr = &static_item.expr;
-        let new_expr = quote::quote! {{
+        let new_expr = quote! {{
             #(#items)*
             #expr
         }};
@@ -380,21 +380,21 @@ impl Feature {
 
         all_items.insert(
             "c_size_t".to_string(),
-            syn::parse2(quote::quote!(
+            syn::parse2(quote!(
                 type c_size_t = usize;
             ))
             .unwrap(),
         );
         all_items.insert(
             "c_ssize_t".to_string(),
-            syn::parse2(quote::quote!(
+            syn::parse2(quote!(
                 type c_ssize_t = isize;
             ))
             .unwrap(),
         );
         all_items.insert(
             "c_ptrdiff_t".to_string(),
-            syn::parse2(quote::quote!(
+            syn::parse2(quote!(
                 type c_ptrdiff_t = isize;
             ))
             .unwrap(),
