@@ -265,8 +265,8 @@ impl Feature {
             .to_string()
             .starts_with("_c2rust_private_")
         {
+            // 只改变可见性，其他函数可能显示通过FFI声明引用它.
             fn_item.vis = syn::Visibility::Inherited;
-            fn_item.attrs.clear();
         }
         if items.is_empty() {
             return;
@@ -289,8 +289,8 @@ impl Feature {
             .to_string()
             .starts_with("_c2rust_private_")
         {
+            // 只改变可见性，其他函数可能显示通过FFI声明引用它.
             static_item.vis = syn::Visibility::Inherited;
-            static_item.attrs.clear();
         }
         if items.is_empty() {
             return;
