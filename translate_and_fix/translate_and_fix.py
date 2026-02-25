@@ -16,6 +16,7 @@ parser.add_argument('--rust_code', type=str, default=None, help='The input file 
 parser.add_argument('--output', type=str, help='The output file path of LLM translation/fixing result. The content of output file will be OVEWRITTEN.')
 parser.add_argument('--error', type=str, default=None, help='The file path of error message for syntax fixing. The error message file should ONLY contain the error message about the code in the input file.')
 parser.add_argument('--suggestion', type=str, default=None, help='The file path of human suggestion for fixing.')
+parser.add_argument('--rusttype', type=str, help='The type of Rust var or func after translation or fix. e.g.: i32')
 args = parser.parse_args()
 
 # 配置代理
@@ -66,9 +67,9 @@ if args.rust_code is not None:
 # 根据type字段类型，进入不同的分支，并调用工具
 tool_type = args.type
 if tool_type == "var":
-    res = var_translation(c_code, LLM_config.model, openai_instance)
+    res = var_translation(c_code, LLM_config.model, openai_instance, args.rusttype)
 elif tool_type == "fn":
-    res = function_translation(c_code, LLM_config.model, openai_instance)
+    res = function_translation(c_code, LLM_config.model, openai_instance, args.rusttype)
 elif tool_type == "syntax_fix":
     # 加错误信息
     try:
@@ -80,14 +81,14 @@ elif tool_type == "syntax_fix":
         print(f"ERROR - 读取error文件时发生错误: {e}")
         exit(1)
     if args.suggestion is not None:
-        res = syntax_fixing(c_code, rust_code, error, LLM_config.model, openai_instance, args.suggestion)
+        res = syntax_fixing(c_code, rust_code, error, LLM_config.model, openai_instance, args.rusttype, args.suggestion)
     else:
-        res = syntax_fixing(c_code, rust_code, error, LLM_config.model, openai_instance)
+        res = syntax_fixing(c_code, rust_code, error, LLM_config.model, openai_instance, args.rusttype)
 elif tool_type == "semantic_fix":
     if args.suggestion is not None:
-        res = semantic_fixing(c_code, rust_code, LLM_config.model, openai_instance, args.suggestion)
+        res = semantic_fixing(c_code, rust_code, LLM_config.model, openai_instance, args.rusttype, args.suggestion)
     else:
-        res = semantic_fixing(c_code, rust_code, LLM_config.model, openai_instance)
+        res = semantic_fixing(c_code, rust_code, LLM_config.model, openai_instance, args.rusttype)
 else:
     # 关闭大模型会话
     close_openai_instance(openai_instance)

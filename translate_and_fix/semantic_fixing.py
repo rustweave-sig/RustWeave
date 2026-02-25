@@ -26,7 +26,7 @@ def safe_read_file(file_path, context="文件"):
     except Exception as e:
         raise RuntimeError(f"Error - 读取{context}时发生未知错误 ({file_path}): {e}")
 
-def semantic_fixing(c_code, rust_code, model, openai_instance, suggestion_file_path=None, prompt_file=None):
+def semantic_fixing(c_code, rust_code, model, openai_instance, rust_type, suggestion_file_path=None, prompt_file=None):
     """
     修复Rust代码中的语义错误（使用外部prompt模板 + 修复建议文件）
 
@@ -88,7 +88,8 @@ def semantic_fixing(c_code, rust_code, model, openai_instance, suggestion_file_p
         prompt = prompt_template.format(
             c_code=c_code,
             rust_code=rust_code,
-            suggestion=suggestion
+            suggestion=suggestion,
+            rust_type = rust_type
         )
     except KeyError as e:
         missing_key = str(e).strip("'")
@@ -143,6 +144,6 @@ if __name__ == "__main__":
     # 创建与大模型平台的api会话实例
     openai_instance = init_openai_instance(LLM_config)
 
-    fixed_rust_function = semantic_fixing(c_function_code, rust_function_code, LLM_config.model, openai_instance)
+    fixed_rust_function = semantic_fixing(c_function_code, rust_function_code, LLM_config.model, openai_instance, "i64")
     print("修复后的 Rust 函数:")
     print(fixed_rust_function)
