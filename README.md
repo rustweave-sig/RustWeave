@@ -12,7 +12,7 @@ git clone https://gitcode.com/xuanwu/C2RustXW-CLI.git
 ## 代码转换
 1. 初始化
 ```shell
-c2rust init
+c2rust-xw init
 ```
 2. 创建Makefile
 ```shell
@@ -20,15 +20,15 @@ mkdir build && cd build && cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
 3. 执行构建
 ```shell
-c2rust build -- make
+c2rust-xw build -- make
 ```
 4. 执行测试
 ```shell
-c2rust test -- make test
+c2rust-xw test -- make test
 ```
 5. 执行清除
 ```shell
-c2rust clean -- make clean
+c2rust-xw clean -- make clean
 ```
 6. 创建model配置
 ```shell
@@ -40,3 +40,8 @@ c2rust-config config --model --set api_key "XXX"
 	- pip install openai httpx tomli
 	- python3 -m venv /root/c2rust_venv
 	- source /root/c2rust_venv/bin/activate
+    
+8.合并代码
+```shell
+c2rust-xw merge
+```
