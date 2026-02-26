@@ -127,6 +127,7 @@ impl Feature {
         println!("Rust project created successfully");
         println!("Setting crate type to cdylib...");
         self.set_staticlib()?;
+        self.set_lint_rules()?;
         println!("Crate type configured");
         println!("Creating file directory structure...");
         self.create_file_directories()?;
@@ -227,6 +228,15 @@ impl Feature {
             .to_err()?;
         file.write(b"\n[lib]\ncrate-type = [\"staticlib\"]\n")
             .to_err()?;
+        Ok(())
+    }
+
+    fn set_lint_rules(&self) -> Result<()> {
+        let cargo = self.root.join("rust/.cargo");
+        fs::create_dir(&cargo).to_err()?;
+        let lint = std::env::var_os("C2RUST_HOME").ok_or(Error::inval())?;
+        let lint = Path::new(&lint);
+        fs::copy(lint.join("conf/lint.toml"), cargo.join("config.toml")).log_err("failed to copy $C2RUST_HOME/conf/lint.toml")?;
         Ok(())
     }
 
