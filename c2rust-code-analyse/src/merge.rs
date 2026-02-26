@@ -6,7 +6,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{
-    punctuated::Punctuated,
     visit::{visit_foreign_item, visit_item, Visit},
     visit_mut::{visit_item_mut, VisitMut},
 };
@@ -14,39 +13,35 @@ use walkdir::WalkDir;
 
 struct NormalizeFile;
 
-// 1. c2rust_types更名为super
-// 1. 去掉_c2rust_private_前缀符号的pub关键字
-// 1. 所有super::_c2rust_private_xxx需要去掉super, 前提是新生成的lib.rs中会将所有模块的pub符号导入
+// _c2rust_private_xxxx_symbol需要更名为symbol
 impl VisitMut for NormalizeFile {
-    fn visit_path_mut(&mut self, path: &mut syn::Path) {
-        // 出现翻译的时候应该用super的地方出现了c2rust_types. 合并之后不存在了.
-        if let Some(p1) = path.segments.get_mut(0) {
-            if p1.ident.to_string() == "c2rust_types" {
-                p1.ident = syn::Ident::new("super", p1.ident.span());
-            }
-        }
-        if let (Some(p1), Some(p2)) = (path.segments.get(0), path.segments.get(1)) {
-            if p1.ident.to_string() == "super"
-                && p2.ident.to_string().starts_with("_c2rust_private_")
-            {
-                path.segments = Punctuated::from_iter(path.segments.clone().into_iter().skip(1));
-                return;
-            }
+    fn visit_ident_mut(&mut self, ident: &mut syn::Ident) {
+        let name = ident.to_string();
+        if name.starts_with("_c2rust_private_") {
+            *ident = syn::Ident::new(name.splitn(5, '_').last().unwrap(), ident.span());
         }
     }
 
-    // 对于宏只能通过字符串替换，限制只处理super::_c2rust_private_
+    fn visit_use_rename_mut(&mut self, rename: &mut syn::UseRename) {
+        // 遇到过有大模型生成use _c2rust_private_xxxx_symbol as symbol的场景.
+        let name = rename.ident.to_string();
+        if !name.starts_with("_c2rust_private_") {
+            return;
+        }
+        let name = name.splitn(5, '_').last().unwrap();
+        rename.ident = syn::Ident::new(name, rename.ident.span());
+        if rename.rename.to_string() == name {
+            rename.rename = syn::Ident::new("_", rename.rename.span());
+        }
+    }
+
+    // 对于宏只能通过字符串替换, 未处理 use _c2rust_private_xxx_symbol as symbol的场景.
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
         let mut macro_str = mac.tokens.to_string();
         let mut changed = false;
-        let regex = regex::Regex::new(r"c2rust_types\s*::").unwrap();
+        let regex = regex::Regex::new(r"_c2rust_private_[^_]+_").unwrap();
         while let Some(m) = regex.find(&macro_str) {
-            macro_str.replace_range(m.start()..m.start() + m.len(), "super");
-            changed = true;
-        }
-        let regex = regex::Regex::new(r"super\s*::\s*_c2rust_private_").unwrap();
-        while let Some(m) = regex.find(&macro_str) {
-            macro_str.replace_range(m.start()..m.start() + m.len(), "_c2rust_private_");
+            macro_str.replace_range(m.start()..m.start() + m.len(), "");
             changed = true;
         }
         if changed {
@@ -266,8 +261,8 @@ impl Feature {
             .to_string()
             .starts_with("_c2rust_private_")
         {
-            // 只改变可见性，其他函数可能显示通过FFI声明引用它.
-            fn_item.vis = syn::parse2(quote!(pub(super))).unwrap();
+            fn_item.vis = syn::Visibility::Inherited;
+            fn_item.attrs.clear();
         }
         if items.is_empty() {
             return;
@@ -289,8 +284,8 @@ impl Feature {
             .to_string()
             .starts_with("_c2rust_private_")
         {
-            // 只改变可见性，其他函数可能显示通过FFI声明引用它.
-            static_item.vis = syn::parse2(quote!(pub(super))).unwrap();
+            static_item.vis = syn::Visibility::Inherited;
+            static_item.attrs.clear();
         }
         if items.is_empty() {
             return;
