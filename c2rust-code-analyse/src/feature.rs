@@ -310,6 +310,11 @@ impl Feature {
             code.push_str("mod ");
             code.push_str(&prefixed_name);
             code.push_str(";\n");
+            // 翻译后的函数从FFI中删除，其他函数直接访问Safe接口, 消除不必要的unsafe调用.
+            // 配合到get_ffi_decl中返回的声明始终是safe的.
+            code.push_str("use ");
+            code.push_str(&prefixed_name);
+            code.push_str(";\n");
             fs::File::create(mod_dir.join(&prefixed_name).with_extension("rs")).to_err()?;
             let c_code = node.kind.c_code(&c_root)?;
             fs::write(
