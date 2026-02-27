@@ -14,7 +14,7 @@
 - 只修复编译报错信息明确指出的语法错误
 
 **严格保持以下内容不变：**
-- 所有函数签名（包括#[unsafe(no_mangle)]和pub unsafe extern "C" fn）
+- 所有函数签名及其属性.
 - 所有C代码中的外部函数, 类型，变量和常量都可直接引用.
 - 绝对不要引入包括`libc`的任何第三方crate
 - 函数指针都需要用Option包装，比如Option<unsafe extern "C" fn()>
