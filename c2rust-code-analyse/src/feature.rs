@@ -1,6 +1,7 @@
 use crate::{get_root, File, Result, ToError};
 use hierr::Error;
 use higuard::Guard;
+use quote::quote;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -10,6 +11,7 @@ use std::process::Command;
 use syn::{
     spanned::Spanned,
     visit::{visit_file, Visit},
+    visit_mut::{visit_file_mut, VisitMut},
 };
 use walkdir::WalkDir;
 
@@ -236,7 +238,8 @@ impl Feature {
         fs::create_dir(&cargo).to_err()?;
         let lint = std::env::var_os("C2RUST_HOME").ok_or(Error::inval())?;
         let lint = Path::new(&lint);
-        fs::copy(lint.join("conf/lint.toml"), cargo.join("config.toml")).log_err("failed to copy $C2RUST_HOME/conf/lint.toml")?;
+        fs::copy(lint.join("conf/lint.toml"), cargo.join("config.toml"))
+            .log_err("failed to copy $C2RUST_HOME/conf/lint.toml")?;
         Ok(())
     }
 
@@ -245,7 +248,7 @@ impl Feature {
         code.push_str("#![allow(non_camel_case_types)]\n");
         code.push_str("#![allow(non_snake_case)]\n");
         code.push_str("#![allow(non_upper_case_globals)]\n");
-        code.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
+        code.push_str("#![deny(unsafe_op_in_unsafe_fn)]\n");
         // 提示词可以简化为任何未知类型都从super::<name>导入.
         code.push_str("use core::ffi::*;\n");
         code.push_str("type c_size_t = usize;\n");
@@ -349,7 +352,53 @@ impl Feature {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return Err(Error::last());
         }
+        Self::normalize_types_rs(mod_dir)
+    }
+
+    // 修改函数入参和返回值
+    // *const T -> Option<&'static T>
+    // *mut T -> Option<&'static mut T>
+    fn normalize_types_rs(mod_dir: &Path) -> Result<()> {
+        let types_rs = mod_dir.join("c2rust_types.rs");
+        let content = fs::read_to_string(&types_rs).to_err()?;
+        let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
+        struct Visitor;
+        impl VisitMut for Visitor {
+            fn visit_fn_arg_mut(&mut self, arg: &mut syn::FnArg) {
+                let syn::FnArg::Typed(arg) = arg else { return; };
+                Feature::normalize_type(&mut arg.ty);
+            }
+            fn visit_return_type_mut(&mut self, retn: &mut syn::ReturnType) {
+                let syn::ReturnType::Type(_, ref mut ty) = retn else {
+                    return;
+                };
+                Feature::normalize_type(&mut **ty);
+            }
+        }
+        visit_file_mut(&mut Visitor, &mut ast);
+
+        // 使用prettyplease格式化输出
+        let formatted = prettyplease::unparse(&ast);
+        fs::write(types_rs, formatted.as_bytes()).to_err()?;
         Ok(())
+    }
+
+    fn normalize_type(ty: &mut syn::Type) {
+        let syn::Type::Ptr(ref ptr) = ty else {
+            return;
+        };
+        let inner = &*ptr.elem;
+        if let syn::Type::Path(path) = inner {
+            // bindgen生成的类型，基本类型都是::core::ffi::前缀，这些类型不改变.
+            if path.path.segments.len() > 1 {
+                return;
+            }
+        }
+        if ptr.const_token.is_some() {
+            *ty = syn::parse2(quote!(Option<&'static #inner>)).unwrap();
+        } else {
+            *ty = syn::parse2(quote!(Option<&'static mut #inner>)).unwrap();
+        }
     }
 
     fn get_ffi_decl(mod_dir: &Path) -> Result<HashMap<String, String>> {
