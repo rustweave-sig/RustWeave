@@ -390,12 +390,14 @@ impl Feature {
                 };
                 Feature::normalize_type(&mut arg.ty);
             }
+            /*
             fn visit_return_type_mut(&mut self, retn: &mut syn::ReturnType) {
                 let syn::ReturnType::Type(_, ref mut ty) = retn else {
                     return;
                 };
                 Feature::normalize_type(&mut **ty);
             }
+            */
         }
         let mut visitor = Visitor(nodes);
         visit_file_mut(&mut visitor, &mut ast);
@@ -443,9 +445,9 @@ impl Feature {
         };
         let inner = &*ptr.elem;
         if ptr.const_token.is_some() {
-            *ty = syn::parse2(quote!(Option<&'static #inner>)).unwrap();
+            *ty = syn::parse2(quote!(Option<& #inner>)).unwrap();
         } else {
-            *ty = syn::parse2(quote!(Option<&'static mut #inner>)).unwrap();
+            *ty = syn::parse2(quote!(Option<&mut #inner>)).unwrap();
         }
     }
 
