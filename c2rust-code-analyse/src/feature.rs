@@ -314,7 +314,7 @@ impl Feature {
             // 配合到get_ffi_decl中返回的声明始终是safe的.
             code.push_str("use ");
             code.push_str(&prefixed_name);
-            code.push_str(";\n");
+            code.push_str("::*;\n");
             fs::File::create(mod_dir.join(&prefixed_name).with_extension("rs")).to_err()?;
             let c_code = node.kind.c_code(&c_root)?;
             fs::write(
