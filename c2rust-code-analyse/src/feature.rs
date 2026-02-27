@@ -442,12 +442,6 @@ impl Feature {
             return;
         };
         let inner = &*ptr.elem;
-        if let syn::Type::Path(path) = inner {
-            // bindgen生成的类型，基本类型都是::core::ffi::前缀，这些类型不改变.
-            if path.path.segments.len() > 1 {
-                return;
-            }
-        }
         if ptr.const_token.is_some() {
             *ty = syn::parse2(quote!(Option<&'static #inner>)).unwrap();
         } else {
