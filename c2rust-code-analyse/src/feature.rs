@@ -3,6 +3,7 @@ use hierr::Error;
 use higuard::Guard;
 use quote::quote;
 use std::collections::{HashMap, HashSet};
+use std::env::var_os;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -21,6 +22,7 @@ pub struct Feature {
     pub prefix: PathBuf,
     pub name: String,
     pub files: Vec<File>,
+    fast: bool,
 }
 
 impl Feature {
@@ -32,9 +34,14 @@ impl Feature {
             name: name.to_string(),
             prefix,
             files: vec![],
+            fast: Self::fast_policy(),
         };
         this.get_files()?;
         Ok(this)
+    }
+
+    fn fast_policy() -> bool {
+        var_os("C2RUST_POLICY").as_deref() == Some(OsStr::new("fast"))
     }
 
     fn get_files(&mut self) -> Result<()> {
@@ -368,14 +375,20 @@ impl Feature {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return Err(Error::last());
         }
-        Self::normalize_types_rs(mod_dir, nodes)
+        self.normalize_types_rs(mod_dir, nodes)
     }
 
     // 修改函数入参和返回值
     // *const T -> Option<&'static T>
     // *mut T -> Option<&'static mut T>
-    fn normalize_types_rs(mod_dir: &Path, nodes: &HashMap<&str, &Node>) -> Result<()> {
+    fn normalize_types_rs(&self, mod_dir: &Path, nodes: &HashMap<&str, &Node>) -> Result<()> {
         let types_rs = mod_dir.join("c2rust_types.rs");
+        // 参数保持指针，unsafe代码较多，但转换速度更快.
+        if self.fast {
+            // 保存一个备份，后续更新的时候需要.
+            fs::copy(&types_rs, types_rs.with_extension("normalized")).to_err()?;
+            return Ok(());
+        }
         let content = fs::read_to_string(&types_rs).to_err()?;
         let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
         struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>);
@@ -391,6 +404,7 @@ impl Feature {
                 };
                 Feature::normalize_type(&mut arg.ty);
             }
+            // 返回值不能修改，引用的生命周期未知，如果采用'static，可能导致无法完成翻译.
             /*
             fn visit_return_type_mut(&mut self, retn: &mut syn::ReturnType) {
                 let syn::ReturnType::Type(_, ref mut ty) = retn else {
