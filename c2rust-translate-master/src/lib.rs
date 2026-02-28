@@ -56,11 +56,14 @@ pub fn translate_feature(
     // Step 2: Run gate verification
     step_2_gate_verification(feature, show_full_output)?;
 
+    // Step 2.5: Check and load previous translation stats
+    let mut stats = step_2_5_load_or_create_stats(feature)?;
+
     // Step 3 & 4: Select files and initialize progress
-    let (rust_dir, mut progress_state) = step_3_4_select_files_and_init_progress(feature)?;
+    let (rust_dir, mut progress_state) =
+        step_3_4_select_files_and_init_progress(feature, &stats)?;
 
     // Step 5: Execute translation loop
-    let mut stats = util::TranslationStats::new();
     let step5_result = step_5_execute_translation_loop(
         feature,
         &rust_dir,
@@ -107,9 +110,58 @@ fn step_2_gate_verification(feature: &str, show_full_output: bool) -> Result<()>
     initialization::run_gate_verification(feature, show_full_output)
 }
 
+/// Step 2.5: Check for existing stats file and load or create stats
+fn step_2_5_load_or_create_stats(feature: &str) -> Result<util::TranslationStats> {
+    match util::TranslationStats::load_from_file(feature)? {
+        Some(existing_stats) => {
+            println!(
+                "\n{}",
+                "Found previous translation progress!".bright_yellow().bold()
+            );
+            println!("Previous progress:");
+            println!(
+                "  - Total files translated: {}",
+                existing_stats.total_files
+            );
+            println!(
+                "  - Files skipped: {}",
+                existing_stats.skipped_files.len()
+            );
+
+            let choice = interaction::prompt_continue_or_restart()?;
+
+            match choice {
+                interaction::ContinueChoice::Continue => {
+                    println!(
+                        "{}",
+                        "✓ Continuing previous progress...".bright_green()
+                    );
+                    Ok(existing_stats)
+                }
+                interaction::ContinueChoice::Restart => {
+                    println!(
+                        "{}",
+                        "✓ Starting fresh translation session...".bright_cyan()
+                    );
+                    util::TranslationStats::clear_stats_file(feature)?;
+                    Ok(util::TranslationStats::new())
+                }
+            }
+        }
+        None => {
+            println!(
+                "{}",
+                "Starting new translation session...".bright_cyan()
+            );
+            Ok(util::TranslationStats::new())
+        }
+    }
+}
+
 /// Steps 3 & 4: Scan for files to translate and initialize progress tracking
 fn step_3_4_select_files_and_init_progress(
     feature: &str,
+    _stats: &util::TranslationStats,
 ) -> Result<(std::path::PathBuf, util::ProgressState)> {
     println!(
         "\n{}",
@@ -176,6 +228,8 @@ fn step_5_execute_translation_loop(
     loop {
         // Scan for empty .rs files, then exclude any that have already been skipped
         // by the user so they are only offered again via handle_skipped_files_loop.
+        // Completed files are already excluded because successfully translated files are
+        // non-empty on disk (the existing file-content-based resume mechanism).
         let all_empty_rs_files = file_scanner::find_empty_rs_files(rust_dir)?;
         let skipped_set: std::collections::HashSet<&str> =
             stats.skipped_files.iter().map(|s| s.as_str()).collect();
@@ -273,6 +327,7 @@ fn handle_skipped_files_loop(
                     ) {
                         if e.downcast_ref::<verification::SkipFileSignal>().is_some() {
                             // File was re-skipped; already re-recorded in process_rs_file.
+                            save_stats_or_warn(stats, feature);
                             continue;
                         }
                         // On real error, re-add the current and all remaining files so they are not lost.
@@ -280,9 +335,11 @@ fn handle_skipped_files_loop(
                         for (_, remaining_file) in iter {
                             stats.record_file_skipped(remaining_file);
                         }
+                        save_stats_or_warn(stats, feature);
                         return Err(e);
                     }
                     progress_state.mark_processed();
+                    save_stats_or_warn(stats, feature);
                 }
                 // Loop again: if any files were skipped during this pass they are now
                 // in stats.skipped_files and the user will be prompted again.
@@ -297,6 +354,17 @@ fn handle_skipped_files_loop(
 // ============================================================================
 // File Processing Functions
 // ============================================================================
+
+/// Save translation stats and print a warning if saving fails
+fn save_stats_or_warn(stats: &util::TranslationStats, feature: &str) {
+    if let Err(e) = stats.save_to_file(feature) {
+        eprintln!(
+            "{}",
+            format!("⚠ Warning: Failed to save translation stats: {}", e)
+                .yellow()
+        );
+    }
+}
 
 /// Select files to process based on allow_all flag
 fn select_files_to_process(
@@ -354,8 +422,12 @@ fn process_selected_files(
                 return Err(e);
             }
             // File was skipped; already recorded in process_rs_file. Don't mark as processed.
+            // Save stats immediately so the skip is persisted.
+            save_stats_or_warn(stats, feature);
         } else {
             progress_state.mark_processed();
+            // Save stats immediately after successful completion.
+            save_stats_or_warn(stats, feature);
         }
     }
     Ok(())
@@ -452,7 +524,14 @@ fn process_rs_file(
         // Translate C to Rust
         translate_file(feature, file_type, rs_file, &format_progress, show_full_output)?;
 
-        // Build and fix errors
+        // Phase 1: Build and fix errors (warnings suppressed via RUSTFLAGS="-A warnings")
+        println!("│");
+        println!(
+            "│ {}",
+            "Phase 1: Building and fixing errors..."
+                .bright_blue()
+                .bold()
+        );
         let build_loop_result = verification::build_and_fix_loop(
             feature,
             file_type,
@@ -486,6 +565,32 @@ fn process_rs_file(
         had_restart |= did_restart;
 
         if build_successful {
+            // Phase 2: Fix warnings after all errors are resolved
+            println!("│");
+            println!(
+                "│ {}",
+                "Phase 2: Checking and fixing warnings..."
+                    .bright_blue()
+                    .bold()
+            );
+            let warning_fix_attempts = verification::build_and_fix_warnings_loop(
+                feature,
+                file_type,
+                rs_file,
+                file_name,
+                &format_progress,
+                max_fix_attempts,
+                show_full_output,
+            )
+            .unwrap_or_else(|e| {
+                println!(
+                    "│ {}",
+                    format!("⚠ Warning phase encountered an error: {}", e).yellow()
+                );
+                0
+            });
+            total_fix_attempts += warning_fix_attempts;
+
             let processing_complete =
                 complete_file_processing(feature, file_name, file_type, rs_file, &format_progress)?;
             if processing_complete {
@@ -660,6 +765,51 @@ where
     }
     
     println!("│ {}", "✓ Fix applied".bright_green());
+
+    Ok(())
+}
+
+/// Apply warning fix to translated file
+///
+/// Similar to `apply_error_fix` but used during Phase 2 (warning fixing).
+/// The build has not failed -- warnings were surfaced by running without `-A warnings`.
+pub(crate) fn apply_warning_fix<F>(
+    feature: &str,
+    file_type: &str,
+    rs_file: &Path,
+    warning_msg: &anyhow::Error,
+    format_progress: &F,
+    show_full_output: bool,
+) -> Result<()>
+where
+    F: Fn(&str) -> String,
+{
+    println!(
+        "│ {}",
+        "⚠ Warnings detected, attempting to fix..."
+            .yellow()
+            .bold()
+    );
+    println!("│");
+    println!("│ {}", format_progress("Warning Fix").bright_magenta().bold());
+
+    // Fix using the same translation tool, passing warnings as the "error" message
+    translator::fix_translation_error(
+        feature,
+        file_type,
+        rs_file,
+        &warning_msg.to_string(),
+        show_full_output,
+        true,
+    )?;
+
+    // Verify fix produced output
+    let metadata = std::fs::metadata(rs_file)?;
+    if metadata.len() == 0 {
+        anyhow::bail!("Warning fix failed: output file is empty");
+    }
+
+    println!("│ {}", "✓ Warning fix applied".bright_green());
 
     Ok(())
 }

@@ -35,11 +35,34 @@ def syntax_fixing(c_code, rust_code, error_message, model, openai_instance, rust
         except Exception as e:
             print(f"Warning - 获取默认修复建议文件路径失败: {e}")
 
+    # if prompt_file is None:
+    #     try:
+    #         prompt_file  = os.path.join(script_dir, 'prompts/syntax_fixing.txt')
+    #     except Exception as e:
+    #         raise RuntimeError(f"Error - 获取默认prompt文件路径失败: {e}")
+
+    # 自动检测报错类型并选择prompt模板
+    error_type = 'error'  # 'error'或'warning'
+
+    # 清理并标准化报错信息（移除首尾空白，统一小写便于匹配）
+    normalized_msg = error_message.strip().lower() if error_message else ""
+
+    # 优先级: error > warning > unknown
+    if normalized_msg:
+        # 检测 Rust 编译器标准格式: "error[E0123]: ..." 或 "error: ..."
+        if 'error[' in normalized_msg or 'error:' in normalized_msg:
+            error_type = 'error'
+        # 检测 Rust 编译器标准格式: "warning[W0123]: ..." 或 "warning: ..."
+        elif 'warning[' in normalized_msg or 'warning:' in normalized_msg:
+            error_type = 'warning'
+
+    # 用户未指定prompt模板 → 按错误信息类型自动检测默认模板
     if prompt_file is None:
-        try:
-            prompt_file  = os.path.join(script_dir, 'prompts/syntax_fixing.txt')
-        except Exception as e:
-            raise RuntimeError(f"Error - 获取默认prompt文件路径失败: {e}")
+        # 根据检测结果选择模板
+        if error_type == 'warning':
+            prompt_file = os.path.join(script_dir, 'prompts/warning_elimination.txt')
+        else:  # error
+            prompt_file = os.path.join(script_dir, 'prompts/syntax_fixing.txt')
 
     # 读取修复建议文件
     suggestion = ""
@@ -68,7 +91,7 @@ def syntax_fixing(c_code, rust_code, error_message, model, openai_instance, rust
             rust_code=rust_code,
             error_message=error_message,
             suggestion=suggestion,
-            rust_type = rust_type
+            rust_type=rust_type
         )
     except KeyError as e:
         missing_key = str(e).strip("'")

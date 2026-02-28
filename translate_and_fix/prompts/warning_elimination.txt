@@ -1,0 +1,100 @@
+你是一个Rust和C语言的代码专家，你之前将一段C代码:
+{c_code}
+
+翻译为以下的Rust代码：
+{rust_code}
+
+翻译后，我们将这段Rust代码与历史翻译结果和未翻译的C代码（通过FFI）一起进行了编译。编译器产生了以下**警告（warning）**，而非错误（error）：
+{error_message}
+
+请消除这些警告，修复时请参考用户提供的以下修复建议：
+{suggestion}
+
+**核心原则（与错误修复的本质区别）：**
+- 警告不影响编译，消除警告的**首要目标是保持代码语义完全不变**
+- 任何修复**不得改变程序行为**，不得引入新错误，不得破坏FFI兼容性
+- 如果无法100%安全地消除警告，优先使用 `#[allow(...)]` 属性抑制警告，而非强行修改代码
+
+**安全消除策略（按优先级）：**
+
+1. **命名规范类警告（non_snake_case / non_camel_case_types）**
+   - FFI场景：**直接添加 `#[allow(non_snake_case)]`**（C符号命名必须保留）
+     ```rust
+     #[allow(non_snake_case)]
+     pub unsafe extern "C" fn MyFunction() {{ ... }}
+     ```
+   - 非FFI内部变量：可重命名为 snake_case（但需确保不破坏逻辑）
+
+2. **未使用变量/导入（unused_variables / unused_imports）**
+   - 故意未使用（如FFI占位符）：添加 `_` 前缀
+     ```rust
+     let _unused = get_value();  // 保留调用但标记为故意未使用
+     ```
+   - 真正未使用：**仅当100%确认无副作用时**才移除（否则加 `_` 前缀）
+   - 未使用导入：直接移除（无副作用）
+
+3. **类型相关警告（type mismatch / lossy_provenance_casts）**
+   - 可安全转换：添加显式类型转换
+     ```rust
+     // 警告: mismatched types
+     let x: c_int = 5 as c_int;  // 显式转换消除警告
+     ```
+   - 指针转换警告：使用 `std::ptr::from_exposed_addr()` 等安全API（仅当语义等价时）
+
+4. **生命周期警告（needless_lifetimes）**
+   - 优先添加显式生命周期注解，而非修改数据流
+     ```rust
+     // 警告: explicit lifetimes given
+     fn get_ref<'a>(x: &'a i32) -> &'a i32 {{ x }}  // 保留显式生命周期
+     ```
+
+5. **Clippy警告（clippy::...）**
+   - 可自动修复类（如 `clippy::needless_return`）：按建议重构
+   - 需人工判断类（如 `clippy::unwrap_used`）：**添加 `#[allow(clippy::unwrap_used)]`**（FFI场景中unwrap是预期行为）
+
+**严格禁止的操作：**
+- 修改函数签名（包括参数名/顺序/类型）→ 破坏FFI ABI
+- 重命名与C对应的符号（如 `my_var` → `my_var_`）→ 导致链接失败
+- 移除看似"未使用"但实际有副作用的代码（如FFI调用）
+- 将 `let x = expr;` 改为 `let _ = expr;`（可能掩盖逻辑错误）
+- 为消除 `dead_code` 而删除FFI导出的函数/变量
+
+**无法安全消除时的标准做法示例：**
+```rust
+// 对于无法100%安全消除的警告，使用allow属性抑制
+#[allow(unused_variables)]
+fn my_func(x: i32) {{
+    // x 故意未使用（如占位符）
+}}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn C_Function_Name() {{ ... }} // C命名规范必须保留
+```
+
+**严格保持以下内容不变：**
+- 所有函数签名（包括#[unsafe(no_mangle)]和pub unsafe extern "C" fn）
+- 所有C代码中的外部函数, 类型，变量和常量都可直接引用.
+- 绝对不要引入包括`libc`的任何第三方crate
+- 函数指针都需要用Option包装，比如Option<unsafe extern "C" fn()>
+- 报错信息中未提及的任何代码部分
+
+**输出要求：**
+- 只输出修复后的Rust代码，不包含任何解释、说明或额外文本
+- 修复后的代码必须完全符合Rust语法
+
+**输出格式（严格遵循）：**
+Rust翻译结果:
+// 你的Rust代码这里开始
+...
+// 你的Rust代码这里结束
+
+**修复后的Rust变量/函数必须为{rust_type}类型/函数签名，不要做任何改变或调整！**
+
+**重要提醒：**
+- 你的环境不完整，不需要尝试编译验证
+- 我的编译器版本和环境可能与你不同，因此必须严格按报错信息修复
+- 任何外部函数，类型，变量，常量都可以直接引用.
+- 绝对不要添加、删除或修改报错信息未提及的代码逻辑
+- 现在开始修复代码。
+
+记住：只输出修复后的Rust代码，不要任何其他内容。

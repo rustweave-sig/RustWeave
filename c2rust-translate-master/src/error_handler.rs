@@ -7,6 +7,50 @@ use std::path::PathBuf;
 
 use crate::{builder, file_scanner, interaction, suggestion, translator, util};
 
+/// 从错误消息中按出现顺序提取文件路径字符串
+/// 只提取 error 和 warning 级别诊断中引用的文件路径
+/// 过滤掉 note、help、suggestion 等辅助级别的文件路径引用
+/// 返回去重后的路径列表（按首次出现顺序排列），确保同一文件不会被多次处理
+fn collect_error_level_file_paths(error_msg: &str) -> Vec<String> {
+    lazy_static::lazy_static! {
+        static ref ERROR_WARNING_LEVEL_RE: regex::Regex =
+            regex::Regex::new(r"^(?:error|warning)(?:\[.*?\])?[:\s]")
+                .expect("Failed to compile error/warning level regex");
+        static ref NOTE_HELP_LEVEL_RE: regex::Regex =
+            regex::Regex::new(r"^(?:note|help|suggestion)(?:\[.*?\])?[:\s]")
+                .expect("Failed to compile note/help level regex");
+        static ref FILE_PATH_LINE_RE: regex::Regex =
+            regex::Regex::new(r"^\s*(?:-->|at)\s+([^\s:]+\.rs)(?::\d+:\d+)?")
+                .expect("Failed to compile file path line regex");
+    }
+
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut in_error_or_warning = false;
+
+    for line in error_msg.lines() {
+        let trimmed = line.trim_start();
+        if ERROR_WARNING_LEVEL_RE.is_match(trimmed) {
+            in_error_or_warning = true;
+        } else if NOTE_HELP_LEVEL_RE.is_match(trimmed) {
+            in_error_or_warning = false;
+        }
+
+        if in_error_or_warning {
+            if let Some(cap) = FILE_PATH_LINE_RE.captures(line) {
+                if let Some(path_match) = cap.get(1) {
+                    let path_str = path_match.as_str().to_string();
+                    if seen.insert(path_str.clone()) {
+                        paths.push(path_str);
+                    }
+                }
+            }
+        }
+    }
+
+    paths
+}
+
 /// 解析错误消息以提取 Rust 文件路径
 /// 返回在错误消息中找到的文件路径列表
 /// 过滤为仅包含项目内的文件
@@ -14,36 +58,27 @@ pub(crate) fn parse_error_for_files(error_msg: &str, feature: &str) -> Result<Ve
     // 验证特性名称以防止路径遍历
     util::validate_feature_name(feature)?;
 
-    lazy_static::lazy_static! {
-        static ref ERROR_PATH_RE: regex::Regex =
-            regex::Regex::new(r"(?:-->|at)\s+([^\s:]+\.rs)(?::\d+:\d+)?")
-                .expect("Failed to compile error path regex");
-    }
-
     let project_root = util::find_project_root()?;
     let feature_path = project_root.join(".c2rust").join(feature);
     let rust_dir = feature_path.join("rust");
 
     let mut file_paths = HashSet::new();
 
-    for cap in ERROR_PATH_RE.captures_iter(error_msg) {
-        if let Some(path_match) = cap.get(1) {
-            let path_str = path_match.as_str();
-            let path = PathBuf::from(path_str);
+    for path_str in collect_error_level_file_paths(error_msg) {
+        let path = PathBuf::from(&path_str);
 
-            // 尝试原样路径和相对于 rust_dir 的路径
-            let candidates = vec![path.clone(), rust_dir.join(&path)];
+        // 尝试原样路径和相对于 rust_dir 的路径
+        let candidates = vec![path.clone(), rust_dir.join(&path)];
 
-            for candidate in candidates {
-                // 检查文件是否存在且在我们的项目内
-                if candidate.exists() && candidate.is_file() {
-                    // 确保文件在 rust 目录内
-                    if let Ok(canonical) = candidate.canonicalize() {
-                        if let Ok(rust_canonical) = rust_dir.canonicalize() {
-                            if canonical.starts_with(&rust_canonical) {
-                                file_paths.insert(canonical);
-                                break;
-                            }
+        for candidate in candidates {
+            // 检查文件是否存在且在我们的项目内
+            if candidate.exists() && candidate.is_file() {
+                // 确保文件在 rust 目录内
+                if let Ok(canonical) = candidate.canonicalize() {
+                    if let Ok(rust_canonical) = rust_dir.canonicalize() {
+                        if canonical.starts_with(&rust_canonical) {
+                            file_paths.insert(canonical);
+                            break;
                         }
                     }
                 }
@@ -54,6 +89,104 @@ pub(crate) fn parse_error_for_files(error_msg: &str, feature: &str) -> Result<Ve
     // 转换为 Vec 并排序以保持一致的顺序
     let mut result: Vec<PathBuf> = file_paths.into_iter().collect();
     result.sort();
+
+    Ok(result)
+}
+
+/// 从错误消息中提取特定文件的错误块
+///
+/// 将错误消息拆分为由空行分隔的块，并返回引用指定文件的块。
+/// 匹配时使用路径分隔符或行首/行尾边界，避免 "test.rs" 误匹配 "my_test.rs"。
+/// 如果没有找到匹配的块，则返回完整的错误消息作为后备。
+pub(crate) fn extract_errors_for_file(error_msg: &str, file_path: &PathBuf) -> String {
+    let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
+        Some(s) => s,
+        None => return error_msg.to_string(),
+    };
+
+    // 构建一个能精确匹配文件名的正则表达式：
+    // 文件名前必须是路径分隔符、空白或行首，后必须是非字母数字下划线字符或行尾。
+    // 这可以防止 "test.rs" 误匹配 "my_test.rs"。
+    let pattern = format!(
+        r"(?:^|[/\\\s]){}\b",
+        regex::escape(file_name)
+    );
+    let file_re = match regex::RegexBuilder::new(&pattern)
+        .multi_line(true)
+        .build()
+    {
+        Ok(re) => re,
+        Err(_) => {
+            // 正则表达式构建失败时返回完整错误消息，以避免不正确的子字符串匹配
+            return error_msg.to_string();
+        }
+    };
+
+    // 将错误消息拆分为由空行分隔的块，保留包含该文件名的块
+    let matching_blocks: Vec<&str> = error_msg
+        .split("\n\n")
+        .filter(|block| file_re.is_match(block))
+        .collect();
+
+    if matching_blocks.is_empty() {
+        // 如果没有找到特定块，则返回完整错误作为后备
+        error_msg.to_string()
+    } else {
+        matching_blocks.join("\n\n")
+    }
+}
+
+/// 按文件分组错误信息，保持文件首次出现的顺序
+///
+/// 解析错误消息中的文件路径，按出现顺序去重，
+/// 并为每个文件提取其相关的错误块。
+///
+/// 返回 (file_path, error_message) 对列表，按文件在错误中首次出现的顺序排列。
+pub(crate) fn group_errors_by_file(
+    error_msg: &str,
+    feature: &str,
+) -> Result<Vec<(PathBuf, String)>> {
+    // 验证特性名称以防止路径遍历
+    util::validate_feature_name(feature)?;
+
+    let project_root = util::find_project_root()?;
+    let feature_path = project_root.join(".c2rust").join(feature);
+    let rust_dir = feature_path.join("rust");
+
+    // 按出现顺序收集文件路径（保留首次出现顺序，去重）
+    let mut seen = HashSet::new();
+    let mut ordered_files: Vec<PathBuf> = Vec::new();
+
+    for path_str in collect_error_level_file_paths(error_msg) {
+        let path = PathBuf::from(&path_str);
+
+        // 尝试原样路径和相对于 rust_dir 的路径
+        let candidates = vec![path.clone(), rust_dir.join(&path)];
+
+        for candidate in candidates {
+            if candidate.exists() && candidate.is_file() {
+                if let Ok(canonical) = candidate.canonicalize() {
+                    if let Ok(rust_canonical) = rust_dir.canonicalize() {
+                        if canonical.starts_with(&rust_canonical)
+                            && seen.insert(canonical.clone())
+                        {
+                            ordered_files.push(canonical);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 为每个文件提取其相关的错误块
+    let result = ordered_files
+        .into_iter()
+        .map(|file| {
+            let file_errors = extract_errors_for_file(error_msg, &file);
+            (file, file_errors)
+        })
+        .collect();
 
     Ok(result)
 }
@@ -511,5 +644,281 @@ note: note about same file
 
         let result = parse_error_for_files(error_msg, "good/bad");
         assert!(result.is_err(), "Should reject feature name with /");
+    }
+
+    #[test]
+    fn test_extract_errors_for_file_single_file() {
+        let error_msg = "error[E0308]: mismatched types
+   --> src/var_test.rs:10:5
+    |
+10  |     let x: i32 = \"hello\";
+    |     ^^^^^^ expected `i32`, found `&str`
+
+error[E0425]: cannot find value `y` in this scope
+  --> src/fun_helper.rs:20:9
+   |
+20 |         y
+   |         ^ not found in this scope";
+
+        let file = PathBuf::from("/project/src/var_test.rs");
+        let result = extract_errors_for_file(error_msg, &file);
+
+        // 应该只包含 var_test.rs 的错误块
+        assert!(result.contains("var_test.rs"));
+        assert!(result.contains("E0308"));
+        // 不应包含 fun_helper.rs 的错误
+        assert!(!result.contains("fun_helper.rs"));
+        assert!(!result.contains("E0425"));
+    }
+
+    #[test]
+    fn test_extract_errors_for_file_multiple_blocks_same_file() {
+        let error_msg = "error[E0308]: mismatched types
+   --> src/var_test.rs:10:5
+    |
+10  |     let x: i32 = \"hello\";
+
+error[E0425]: another error
+   --> src/var_test.rs:20:5
+    |
+20 |     y
+   |     ^ not found";
+
+        let file = PathBuf::from("/project/src/var_test.rs");
+        let result = extract_errors_for_file(error_msg, &file);
+
+        // 应该包含两个错误块
+        assert!(result.contains("E0308"));
+        assert!(result.contains("E0425"));
+    }
+
+    #[test]
+    fn test_extract_errors_for_file_no_match_returns_full_error() {
+        let error_msg = "error[E0308]: mismatched types
+   --> src/var_test.rs:10:5
+    |
+10  |     let x: i32 = \"hello\";";
+
+        // 文件名在错误中未出现
+        let file = PathBuf::from("/project/src/var_unknown.rs");
+        let result = extract_errors_for_file(error_msg, &file);
+
+        // 没有匹配块时应返回完整错误
+        assert_eq!(result, error_msg);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_group_errors_by_file_order_preserved() {
+        use std::env;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let project_root = temp_dir.path();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(project_root).unwrap();
+
+        fs::create_dir(project_root.join(".git")).unwrap();
+
+        let feature = "test_feature";
+        let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let file_a = src_dir.join("var_aaa.rs");
+        let file_b = src_dir.join("fun_bbb.rs");
+        fs::write(&file_a, "// aaa").unwrap();
+        fs::write(&file_b, "// bbb").unwrap();
+
+        // fun_bbb.rs 先出现，然后是 var_aaa.rs
+        let error_msg = "error[E0308]: type mismatch
+   --> src/fun_bbb.rs:5:1
+    |
+5   | fn foo() {}
+
+error[E0425]: not found
+   --> src/var_aaa.rs:10:1
+    |
+10  | let x = y;";
+
+        let result = group_errors_by_file(error_msg, feature).unwrap();
+
+        env::set_current_dir(&original_dir).unwrap();
+
+        assert_eq!(result.len(), 2);
+        // 应该按出现顺序：fun_bbb.rs 在前，var_aaa.rs 在后
+        assert!(result[0].0.ends_with("fun_bbb.rs"));
+        assert!(result[1].0.ends_with("var_aaa.rs"));
+
+        // 每个文件应该有对应的错误信息
+        assert!(result[0].1.contains("fun_bbb.rs"));
+        assert!(result[1].1.contains("var_aaa.rs"));
+    }
+
+    #[test]
+    fn test_group_errors_by_file_validates_feature_name() {
+        // 测试无效的特性名称被拒绝
+        let error_msg = "error: --> src/test.rs:1:1";
+
+        let result = group_errors_by_file(error_msg, "../bad");
+        assert!(result.is_err(), "Should reject feature name with ..");
+
+        let result = group_errors_by_file(error_msg, "good/bad");
+        assert!(result.is_err(), "Should reject feature name with /");
+    }
+
+    #[test]
+    fn test_extract_errors_for_file_no_substring_false_positive() {
+        // 错误信息同时包含 test.rs 和 my_test.rs，过滤 test.rs 时不应匹配只包含 my_test.rs 的块
+        let error_msg = "error[E0001]: some error
+   --> src/test.rs:10:5
+    |
+10  | let x: i32 = 1;
+
+error[E0002]: another error
+   --> src/my_test.rs:20:5
+    |
+20  | let y = 2;";
+
+        let file = PathBuf::from("/project/src/test.rs");
+        let result = extract_errors_for_file(error_msg, &file);
+
+        // 只应包含与 test.rs 相关的错误块，不应误匹配 my_test.rs
+        assert!(result.contains("E0001"));
+        assert!(result.contains("src/test.rs"));
+        assert!(!result.contains("E0002"));
+        assert!(!result.contains("my_test.rs"));
+    }
+
+    #[test]
+    fn test_collect_error_level_file_paths_filters_note_help() {
+        // note 和 help 中引用的文件路径不应被提取
+        let error_msg = "error[E0308]: mismatched types
+  --> src/var_main.rs:15:10
+   |
+15 |     foo(x);
+   |          ^ expected `String`, found `i32`
+   |
+note: expected signature from here
+  --> src/fun_foo.rs:3:1
+   |
+3  | fn foo(s: String) { }
+   | ^^^^^^^^^^^^^^^^^";
+
+        let paths = collect_error_level_file_paths(error_msg);
+
+        // 只应包含 error 级别的文件路径，不应包含 note 中的路径
+        assert!(paths.contains(&"src/var_main.rs".to_string()));
+        assert!(!paths.contains(&"src/fun_foo.rs".to_string()));
+    }
+
+    #[test]
+    fn test_collect_error_level_file_paths_includes_warning() {
+        // warning 级别的文件路径应被提取
+        let error_msg = "warning: unused variable: `x`
+  --> src/var_counter.rs:5:9
+   |
+5  |     let x = 42;
+   |         ^ help: if this is intentional, prefix it with an underscore: `_x`";
+
+        let paths = collect_error_level_file_paths(error_msg);
+
+        assert!(paths.contains(&"src/var_counter.rs".to_string()));
+    }
+
+    #[test]
+    fn test_collect_error_level_file_paths_multiple_errors() {
+        // 多个 error 块中的文件路径都应被提取
+        let error_msg = "error[E0308]: mismatched types
+   --> src/var_test.rs:10:5
+    |
+10  |     let x: i32 = \"hello\";
+
+error[E0425]: cannot find value `y` in this scope
+  --> src/fun_helper.rs:20:9
+   |
+20 |         y
+   |         ^ not found in this scope";
+
+        let paths = collect_error_level_file_paths(error_msg);
+
+        assert!(paths.contains(&"src/var_test.rs".to_string()));
+        assert!(paths.contains(&"src/fun_helper.rs".to_string()));
+    }
+
+    #[test]
+    fn test_collect_error_level_file_paths_deduplicates_same_file() {
+        // 同一文件在多个 error 块中出现时，路径列表中只应出现一次
+        let error_msg = "error[E0308]: mismatched types
+   --> src/var_test.rs:10:5
+    |
+10  |     let x: i32 = \"hello\";
+
+error[E0425]: cannot find value `y` in this scope
+   --> src/var_test.rs:20:9
+    |
+20 |         y
+    |         ^ not found in this scope";
+
+        let paths = collect_error_level_file_paths(error_msg);
+
+        // var_test.rs 出现两次错误，但路径列表中只应有一个条目
+        assert_eq!(
+            paths.iter().filter(|p| *p == "src/var_test.rs").count(),
+            1,
+            "Same file path should appear only once"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_error_for_files_ignores_note_files() {
+        // note 中引用的文件（即使存在于项目中）不应被返回
+        use std::env;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let project_root = temp_dir.path();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(project_root).unwrap();
+        // 确保当前目录在测试结束时（包括 panic 情况下）被恢复
+        let _restore = scopeguard::guard(original_dir.clone(), |dir| {
+            let _ = env::set_current_dir(dir);
+        });
+
+        let feature = "test_feature";
+        let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let error_file = src_dir.join("var_error.rs");
+        let note_file = src_dir.join("fun_note.rs");
+        fs::write(&error_file, "// error content").unwrap();
+        fs::write(&note_file, "// note content").unwrap();
+
+        // fun_note.rs 仅在 note 部分被引用
+        let error_msg = "error[E0308]: mismatched types
+  --> src/var_error.rs:10:5
+   |
+10 |     foo(x);
+   |          ^ expected `String`, found `i32`
+   |
+note: expected signature from here
+  --> src/fun_note.rs:3:1
+   |
+3  | fn foo(s: String) { }
+   | ^^^^^^^^^^^^^^^^^";
+
+        let result = parse_error_for_files(error_msg, feature).unwrap();
+
+        env::set_current_dir(&original_dir).unwrap();
+
+        // 只应包含 var_error.rs，不应包含仅在 note 中引用的 fun_note.rs
+        assert_eq!(result.len(), 1, "Should only contain the error-level file");
+        assert!(result[0].ends_with("var_error.rs"), "Should contain var_error.rs");
     }
 }
