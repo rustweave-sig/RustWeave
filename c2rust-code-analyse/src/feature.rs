@@ -463,11 +463,20 @@ impl Feature {
                     if let syn::ForeignItem::Fn(ref item) = item {
                         let name = item.sig.ident.to_string();
                         let range = item.sig.span().byte_range();
-                        self.0.insert(name, self.1[range].to_string());
+                        self.0.insert(
+                            name,
+                            format!(
+                                "#[unsafe(no_mangle)]\npub extern \"C\" {}",
+                                self.1[range].to_string()
+                            ),
+                        );
                     } else if let syn::ForeignItem::Static(ref item) = item {
                         let name = item.ident.to_string();
                         let range = item.span().byte_range();
-                        self.0.insert(name, self.1[range].to_string());
+                        self.0.insert(
+                            name,
+                            format!("#[unsafe(no_mangle)]\n{}", self.1[range].to_string()),
+                        );
                     }
                 }
             }
