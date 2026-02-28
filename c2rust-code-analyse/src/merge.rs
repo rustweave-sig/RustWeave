@@ -7,11 +7,29 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{
     visit::{visit_foreign_item, visit_item, Visit},
-    visit_mut::{visit_item_mut, VisitMut},
+    visit_mut::{visit_item_mut, visit_item_use_mut, VisitMut},
 };
 use walkdir::WalkDir;
 
 struct NormalizeFile;
+
+fn use_tree_rename(mut tree: &syn::UseTree, renames: &mut Vec<syn::UseRename>) {
+    loop {
+        match tree {
+            syn::UseTree::Path(path) => {
+                tree = &*path.tree;
+                continue;
+            }
+            syn::UseTree::Rename(rename) => renames.push(rename.clone()),
+            syn::UseTree::Group(grp) => grp
+                .items
+                .iter()
+                .for_each(|tree| use_tree_rename(tree, renames)),
+            _ => {}
+        }
+        return;
+    }
+}
 
 // _c2rust_private_xxxx_symbol需要更名为symbol
 impl VisitMut for NormalizeFile {
@@ -19,6 +37,23 @@ impl VisitMut for NormalizeFile {
         let name = ident.to_string();
         if name.starts_with("_c2rust_private_") {
             *ident = syn::Ident::new(name.splitn(5, '_').last().unwrap(), ident.span());
+        }
+    }
+
+    fn visit_item_use_mut(&mut self, u: &mut syn::ItemUse) {
+        if let syn::UseTree::Path(path) = &u.tree {
+            if !matches!(path.ident.to_string().as_str(), "crate" | "super") {
+                return;
+            }
+            // 只会依赖self，只需要处理rename，其他都可以忽略.
+            let mut renames = Vec::new();
+            use_tree_rename(&*path.tree, &mut renames);
+            if renames.is_empty() {
+                *u = syn::parse_str("use crate as _;").unwrap();
+            } else {
+                *u = syn::parse2(quote!(use crate::{#(#renames),*};)).unwrap();
+            }
+            visit_item_use_mut(self, u);
         }
     }
 

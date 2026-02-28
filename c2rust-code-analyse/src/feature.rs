@@ -324,18 +324,18 @@ impl Feature {
             code.push_str(&prefixed_name);
             code.push_str("::*;\n");
             fs::File::create(mod_dir.join(&prefixed_name).with_extension("rs")).to_err()?;
-            let c_code = node.kind.c_code(&c_root)?;
+            let c_code = Self::normalize_c_code(node.kind.c_code(&c_root)?);
             fs::write(
                 mod_dir.join(&prefixed_name).with_extension("c"),
                 c_code.as_bytes(),
             )
             .to_err()?;
+            let name = Self::normalize_name(name);
             let Some(decl) = ffi_decl.remove(name) else {
                 eprintln!("don't find ffi function {name}");
                 return Err(Error::inval());
             };
-            let name = &prefixed_name[4..];
-            let decl_file = format!("decl_{name}.rs");
+            let decl_file = format!("decl_{}.rs", &prefixed_name[4..]);
             let _ = fs::write(mod_dir.join(decl_file), decl).to_err()?;
         }
         fs::write(mod_dir.join("mod.rs"), code.as_bytes()).to_err()?;
@@ -383,18 +383,33 @@ impl Feature {
     // *mut T -> Option<&'static mut T>
     fn normalize_types_rs(&self, mod_dir: &Path, nodes: &HashMap<&str, &Node>) -> Result<()> {
         let types_rs = mod_dir.join("c2rust_types.rs");
-        // 参数保持指针，unsafe代码较多，但转换速度更快.
-        if self.fast {
-            // 保存一个备份，后续更新的时候需要.
-            fs::copy(&types_rs, types_rs.with_extension("normalized")).to_err()?;
-            return Ok(());
-        }
         let content = fs::read_to_string(&types_rs).to_err()?;
         let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
-        struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>);
+        struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>, bool);
+        // _c2rust_private_仅仅体现在导出符号名中，本模块的代码仍然看到的是C代码中的名字.
+        // 本目录下生成的C源码也要删除掉_c2rust_private_前缀
         impl VisitMut for Visitor<'_> {
+            fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
+                let name = item.ident.to_string();
+                if name.starts_with("_c2rust_private_") {
+                    item.attrs = syn::Attribute::parse_outer
+                        .parse_str(&format!("#[link_name = \"{}\"]", name))
+                        .unwrap();
+                    let new_name = name.splitn(5, '_').last().unwrap();
+                    item.ident = syn::Ident::new(new_name, item.ident.span());
+                }
+            }
+
             fn visit_foreign_item_fn_mut(&mut self, item: &mut syn::ForeignItemFn) {
-                if self.0.contains_key(item.sig.ident.to_string().as_str()) {
+                let name = item.sig.ident.to_string();
+                if name.starts_with("_c2rust_private_") {
+                    item.attrs = syn::Attribute::parse_outer
+                        .parse_str(&format!("#[link_name = \"{}\"]", name))
+                        .unwrap();
+                    let new_name = name.splitn(5, '_').last().unwrap();
+                    item.sig.ident = syn::Ident::new(new_name, item.sig.ident.span());
+                }
+                if !self.1 && self.0.contains_key(item.sig.ident.to_string().as_str()) {
                     visit_foreign_item_fn_mut(self, item);
                 }
             }
@@ -414,7 +429,7 @@ impl Feature {
             }
             */
         }
-        let mut visitor = Visitor(nodes);
+        let mut visitor = Visitor(nodes, self.fast);
         visit_file_mut(&mut visitor, &mut ast);
 
         // 使用prettyplease格式化输出
@@ -454,6 +469,22 @@ impl Feature {
         Ok(())
     }
 
+    fn normalize_c_code(mut code: String) -> String {
+        let regex = regex::Regex::new("_c2rust_private_[^_]+_").unwrap();
+        let mut off = 0;
+        while let Some(m) = regex.find(&code[off..]) {
+            off += m.start();
+            code.replace_range(off..off + m.len(), "");
+        }
+        code
+    }
+
+    fn normalize_name(name: &str) -> &str {
+        if name.starts_with("_c2rust_private_") {
+            return name.splitn(5, '_').last().unwrap();
+        }
+        name
+    }
     fn normalize_type(ty: &mut syn::Type) {
         let syn::Type::Ptr(ref ptr) = ty else {
             return;
@@ -477,20 +508,11 @@ impl Feature {
                     if let syn::ForeignItem::Fn(ref item) = item {
                         let name = item.sig.ident.to_string();
                         let range = item.sig.span().byte_range();
-                        self.0.insert(
-                            name,
-                            format!(
-                                "#[unsafe(no_mangle)]\npub extern \"C\" {}",
-                                self.1[range].to_string()
-                            ),
-                        );
+                        self.0.insert(name, self.1[range].to_string());
                     } else if let syn::ForeignItem::Static(ref item) = item {
                         let name = item.ident.to_string();
                         let range = item.span().byte_range();
-                        self.0.insert(
-                            name,
-                            format!("#[unsafe(no_mangle)]\n{}", self.1[range].to_string()),
-                        );
+                        self.0.insert(name, self.1[range].to_string());
                     }
                 }
             }
@@ -560,10 +582,11 @@ impl Feature {
         };
 
         let is_fun = prefix.starts_with("fun_");
+        let name = Self::normalize_name(name);
         let is_changed = if is_fun {
-            Self::validate_fun(&mut ast, name)
+            Self::validate_fun(&mut ast, name, &prefix[4..])
         } else {
-            Self::validate_var(&mut ast, name)
+            Self::validate_var(&mut ast, name, &prefix[4..])
         };
 
         let Ok(is_changed) = is_changed else {
@@ -580,7 +603,7 @@ impl Feature {
         Ok(true)
     }
 
-    fn validate_fun(ast: &mut syn::File, name: &str) -> Result<bool> {
+    fn validate_fun(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
         let mut main_item = None;
         ast.items.iter_mut().any(|item| match item {
             syn::Item::Fn(item) if item.sig.ident.to_string() == name => {
@@ -605,13 +628,13 @@ impl Feature {
         if main_item.attrs.is_empty() {
             is_changed = true;
             main_item.attrs = syn::Attribute::parse_outer
-                .parse_str("#[unsafe(no_mangle)]")
+                .parse_str(&format!(r#"#[link_name = "{link_name}"]"#))
                 .unwrap();
         }
         Ok(is_changed)
     }
 
-    fn validate_var(ast: &mut syn::File, name: &str) -> Result<bool> {
+    fn validate_var(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
         let mut main_item = None;
         ast.items.iter_mut().any(|item| match item {
             syn::Item::Static(item) if item.ident.to_string() == name => {
@@ -627,7 +650,7 @@ impl Feature {
         if main_item.attrs.is_empty() {
             is_changed = true;
             main_item.attrs = syn::Attribute::parse_outer
-                .parse_str("#[unsafe(no_mangle)]")
+                .parse_str(&format!(r#"#[link_name = "{link_name}"]"#))
                 .unwrap();
         }
 
