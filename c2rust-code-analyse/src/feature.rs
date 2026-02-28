@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use syn::{
+    parse::Parser,
     spanned::Spanned,
     visit::{visit_file, Visit},
     visit_mut::{visit_file_mut, visit_foreign_item_fn_mut, VisitMut},
@@ -182,18 +183,18 @@ impl Feature {
                 let rust_file_path = mod_dir.join(&prefixed_name).with_extension("rs");
 
                 // 检查文件内容是否为空（去除空白字符后）
-                let is_file_empty = Self::is_file_empty(&rust_file_path)?;
-                if !is_file_empty {
+                let not_empty = Self::validate_file(&rust_file_path, name, &prefixed_name)?;
+                if not_empty {
                     translated.insert(name.to_string());
                 }
                 let has_committed = node.kind.has_committed();
 
                 // 检查状态是否一致
-                if has_committed && is_file_empty {
+                if has_committed && !not_empty {
                     // 已标记为翻译但文件为空，需要重置状态为未翻译
                     node.kind.set_git_commit(false);
                     is_updated = true;
-                } else if !has_committed && !is_file_empty {
+                } else if !has_committed && not_empty {
                     // 未标记为翻译但文件非空，需要标记为已翻译
                     println!("{name} git commit");
                     node.kind.set_git_commit(true);
@@ -462,20 +463,11 @@ impl Feature {
                     if let syn::ForeignItem::Fn(ref item) = item {
                         let name = item.sig.ident.to_string();
                         let range = item.sig.span().byte_range();
-                        self.0.insert(
-                            name,
-                            format!(
-                                "#[unsafe(no_mangle)]\npub extern \"C\" {};",
-                                self.1[range].to_string()
-                            ),
-                        );
+                        self.0.insert(name, self.1[range].to_string());
                     } else if let syn::ForeignItem::Static(ref item) = item {
                         let name = item.ident.to_string();
                         let range = item.span().byte_range();
-                        self.0.insert(
-                            name,
-                            format!("#[unsafe(no_mangle)]\n{}", self.1[range].to_string()),
-                        );
+                        self.0.insert(name, self.1[range].to_string());
                     }
                 }
             }
@@ -523,12 +515,103 @@ impl Feature {
         Ok(())
     }
 
-    // 检查文件是否为空（去除空白字符后）
-    fn is_file_empty(path: &Path) -> Result<bool> {
-        if !path.exists() {
+    // 大模型返回的文件可能不符合要求, 或者被意外破坏，需要修正.
+    fn validate_file(file: &Path, name: &str, prefix: &str) -> Result<bool> {
+        if !file.exists() {
             return Ok(true);
         }
-        let content = fs::read_to_string(path).to_err()?;
-        Ok(content.trim().is_empty())
+        let content = fs::read_to_string(file).to_err()?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Ok(false);
+        }
+
+        // 并不是有效的rust代码直接清空.
+        let mut ast = match syn::parse_file(&content) {
+            Ok(ast) => ast,
+            Err(e) => {
+                eprintln!("*** parse rust file failed: {e}");
+                let _ = fs::write(file, "");
+                return Ok(false);
+            }
+        };
+
+        let is_fun = prefix.starts_with("fun_");
+        let is_changed = if is_fun {
+            Self::validate_fun(&mut ast, name)
+        } else {
+            Self::validate_var(&mut ast, name)
+        };
+
+        let Ok(is_changed) = is_changed else {
+            eprintln!("*** don't find item {name} in {prefix}");
+            // 说明命名错误, 需要重新翻译.
+            let _ = fs::write(file, "");
+            return Ok(false);
+        };
+
+        if is_changed {
+            let formatted = prettyplease::unparse(&ast);
+            fs::write(file, formatted.as_bytes()).to_err()?;
+        }
+        Ok(true)
+    }
+
+    fn validate_fun(ast: &mut syn::File, name: &str) -> Result<bool> {
+        let mut main_item = None;
+        ast.items.iter_mut().any(|item| match item {
+            syn::Item::Fn(item) if item.sig.ident.to_string() == name => {
+                main_item = Some(item);
+                true
+            }
+            _ => false,
+        });
+        let Some(main_item) = main_item else {
+            return Err(Error::inval());
+        };
+        // 确保abi等满足要求.
+        let mut is_changed = false;
+        if main_item.sig.unsafety.is_some() {
+            is_changed = true;
+            main_item.sig.unsafety = None;
+        }
+        if main_item.sig.abi.is_none() {
+            is_changed = true;
+            main_item.sig.abi = syn::parse_str(r#"extern "C""#).unwrap();
+        }
+        if main_item.attrs.is_empty() {
+            is_changed = true;
+            main_item.attrs = syn::Attribute::parse_outer
+                .parse_str("#[unsafe(no_mangle)]")
+                .unwrap();
+        }
+        Ok(is_changed)
+    }
+
+    fn validate_var(ast: &mut syn::File, name: &str) -> Result<bool> {
+        let mut main_item = None;
+        ast.items.iter_mut().any(|item| match item {
+            syn::Item::Static(item) if item.ident.to_string() == name => {
+                main_item = Some(item);
+                false
+            }
+            _ => false,
+        });
+        let Some(main_item) = main_item else {
+            return Err(Error::inval());
+        };
+        let mut is_changed = false;
+        if main_item.attrs.is_empty() {
+            is_changed = true;
+            main_item.attrs = syn::Attribute::parse_outer
+                .parse_str("#[unsafe(no_mangle)]")
+                .unwrap();
+        }
+
+        if matches!(main_item.mutability, syn::StaticMutability::None) {
+            is_changed = true;
+            main_item.mutability = syn::parse_str("mut").unwrap();
+        }
+        Ok(is_changed)
     }
 }
