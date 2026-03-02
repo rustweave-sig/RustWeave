@@ -262,10 +262,10 @@ pub(crate) fn handle_startup_test_failure_with_files(
         println!("│ {}", current_error);
 
         // 提供与 handle_max_fix_attempts_reached 相同的选择
-        let choice = interaction::prompt_user_choice("Initial test failure", false)?;
+        let choice = interaction::prompt_failure_choice("Initial test failure")?;
 
         match choice {
-            interaction::UserChoice::Continue => {
+            interaction::FailureChoice::Skip => {
                 println!("│");
                 println!(
                     "│ {}",
@@ -325,12 +325,12 @@ pub(crate) fn handle_startup_test_failure_with_files(
                     }
                 }
             }
-            interaction::UserChoice::ManualFix => {
+            interaction::FailureChoice::ManualFix => {
                 println!("│");
                 println!("│ {}", "You chose: Manual fix".bright_cyan());
 
-                // 尝试打开 vim
-                match interaction::open_in_vim(file) {
+                // 尝试打开 vim（支持多文件选择）
+                match interaction::open_files_for_manual_fix(&files) {
                     Ok(_) => {
                         // Vim 编辑后，重复尝试构建和测试
                         loop {
@@ -367,20 +367,27 @@ pub(crate) fn handle_startup_test_failure_with_files(
                                         _ => {
                                             // 没有更多文件需要处理，询问用户是否想再试一次
                                             println!("│");
+                                            println!(
+                                                "│ {}",
+                                                format!(
+                                                    "Current file(s) being processed ({}):",
+                                                    files.len()
+                                                )
+                                                .bright_yellow()
+                                                .bold()
+                                            );
+                                            for (idx, f) in files.iter().enumerate() {
+                                                println!("│   {}. {}", idx + 1, f.display());
+                                            }
+                                            println!("│");
                                             println!("│ {}", "Build or tests still have errors. What would you like to do?".yellow());
-                                            let retry_choice = interaction::prompt_user_choice(
-                                                "Build/tests still failing",
-                                                false,
-                                            )?;
+                                            let retry_choice =
+                                                interaction::prompt_after_manual_fix_choice()?;
 
                                             match retry_choice {
-                                                interaction::UserChoice::Continue => {
-                                                    // 只需使用现有更改重试构建
-                                                    continue;
-                                                }
-                                                interaction::UserChoice::ManualFix => {
+                                                interaction::FailureChoice::ManualFix => {
                                                     println!("│ {}", "Reopening file in Vim for additional manual fixes...".bright_blue());
-                                                    match interaction::open_in_vim(file) {
+                                                    match interaction::open_files_for_manual_fix(&files) {
                                                         Ok(_) => {
                                                             // 循环将重试构建
                                                             continue;
@@ -395,17 +402,32 @@ pub(crate) fn handle_startup_test_failure_with_files(
                                                                 .red()
                                                             );
                                                             return Err(open_err).context(format!(
-                                                                "Build/tests still failing and could not reopen vim for file {}",
-                                                                file.display()
+                                                                "Build/tests still failing and could not reopen vim for {} file(s)",
+                                                                files.len()
                                                             ));
                                                         }
                                                     }
                                                 }
-                                                interaction::UserChoice::Exit => {
+                                                interaction::FailureChoice::Exit => {
                                                     return Err(e).context(format!(
-                                                        "Build/tests failed after manual fix for file {}",
-                                                        file.display()
+                                                        "Build/tests failed after manual fix for {} file(s)",
+                                                        files.len()
                                                     ));
+                                                }
+                                                interaction::FailureChoice::FixOtherFile => {
+                                                    println!(
+                                                        "│ {}",
+                                                        "Skipping current file(s) to fix other files..."
+                                                            .bright_cyan()
+                                                    );
+                                                    return Err(crate::verification::SkipFileSignal.into());
+                                                }
+                                                interaction::FailureChoice::RetryDirectly
+                                                | interaction::FailureChoice::AddSuggestion
+                                                | interaction::FailureChoice::Skip => {
+                                                    unreachable!(
+                                                        "此选项在此上下文中不受支持"
+                                                    )
                                                 }
                                             }
                                         }
@@ -417,17 +439,22 @@ pub(crate) fn handle_startup_test_failure_with_files(
                     Err(e) => {
                         println!("│ {}", format!("Failed to open vim: {}", e).red());
                         return Err(e).context(format!(
-                            "Initial test failed and could not open vim for file {}",
-                            file.display()
+                            "Initial test failed and could not open vim for {} file(s)",
+                            files.len()
                         ));
                     }
                 }
             }
-            interaction::UserChoice::Exit => {
+            interaction::FailureChoice::Exit => {
                 println!("│");
                 println!("│ {}", "You chose: Exit".yellow());
                 return Err(current_error)
                     .context("User chose to exit during startup test failure handling");
+            }
+            interaction::FailureChoice::RetryDirectly
+            | interaction::FailureChoice::AddSuggestion
+            | interaction::FailureChoice::FixOtherFile => {
+                unreachable!("RetryDirectly, AddSuggestion and FixOtherFile are not supported in this context")
             }
         }
     } // 循环结束

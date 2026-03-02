@@ -32,14 +32,6 @@ pub fn disable_auto_accept_mode() {
     AUTO_ACCEPT_MODE.store(false, Ordering::Relaxed);
 }
 
-/// 处理失败时的用户选择
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UserChoice {
-    Continue,
-    ManualFix,
-    Exit,
-}
-
 /// 编译成功且测试通过时的用户选择
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompileSuccessChoice {
@@ -55,7 +47,8 @@ pub enum FailureChoice {
     RetryDirectly, // 直接重试不输入建议
     AddSuggestion, // 添加建议后重试
     ManualFix,     // 手动修复
-    Skip,          // 跳过当前文件
+    Skip,          // 忽略本次失败，跳过当前步骤继续流程
+    FixOtherFile,  // 跳过当前文件，修复其他文件
     Exit,          // 退出
 }
 
@@ -73,30 +66,24 @@ pub enum ContinueChoice {
     Restart,  // 开始新的翻译会话
 }
 
-/// 当达到最大尝试次数时提示用户选择
-pub fn prompt_user_choice(failure_type: &str, require_suggestion: bool) -> Result<UserChoice> {
+/// 统一的失败场景提示函数
+///
+/// 在失败时提示并返回 ManualFix/Skip/Exit（上下文仅用于展示提示信息）
+pub fn prompt_failure_choice(context: &str) -> Result<FailureChoice> {
     println!("│");
     println!(
         "│ {}",
-        format!("⚠ {} - What would you like to do?", failure_type)
-            .yellow()
-            .bold()
+        format!("⚠ {} - 您想怎么做？", context).yellow().bold()
     );
     println!("│");
 
-    let continue_text = if require_suggestion {
-        "Continue trying (requires entering a fix suggestion)"
-    } else {
-        "Continue trying (optionally enter a fix suggestion)"
-    };
-
     let options = vec![
-        continue_text,
-        "Manual fix (edit the file directly)",
-        "Exit (abort the translation process)",
+        "手动修复（使用 VIM 编辑文件）",
+        "跳过（忽略失败继续）",
+        "退出（中止流程）",
     ];
 
-    let choice = Select::new("Select an option:", options.clone())
+    let choice = Select::new("请选择处理方式:", options.clone())
         .with_vim_mode(true)
         .prompt()
         .context("Failed to get user selection")?;
@@ -107,14 +94,49 @@ pub fn prompt_user_choice(failure_type: &str, require_suggestion: bool) -> Resul
         .context("Unexpected selection value")?;
 
     match choice_index {
-        0 => Ok(UserChoice::Continue),
-        1 => Ok(UserChoice::ManualFix),
-        2 => Ok(UserChoice::Exit),
+        0 => Ok(FailureChoice::ManualFix),
+        1 => Ok(FailureChoice::Skip),
+        2 => Ok(FailureChoice::Exit),
         _ => unreachable!("Invalid selection index"),
     }
 }
 
-/// 提示用户输入修复建议
+/// 手动修复后仍构建失败时的提示函数
+pub fn prompt_after_manual_fix_choice() -> Result<FailureChoice> {
+    println!("│");
+    println!(
+        "│ {}",
+        "⚠ 手动修复后构建/测试仍然失败 - 您想怎么做？"
+            .yellow()
+            .bold()
+    );
+    println!("│");
+
+    let options = vec![
+        "重新手动修复（再次打开 VIM）",
+        "修复其他文件（跳过当前文件）",
+        "退出（中止流程）",
+    ];
+
+    let choice = Select::new("请选择处理方式:", options.clone())
+        .with_vim_mode(true)
+        .prompt()
+        .context("Failed to get user selection")?;
+
+    let choice_index = options
+        .iter()
+        .position(|&o| o == choice)
+        .context("Unexpected selection value")?;
+
+    match choice_index {
+        0 => Ok(FailureChoice::ManualFix),
+        1 => Ok(FailureChoice::FixOtherFile),
+        2 => Ok(FailureChoice::Exit),
+        _ => unreachable!("Invalid selection index"),
+    }
+}
+
+
 /// 如果 require_input 为 true，用户必须提供非空输入
 pub fn prompt_suggestion(require_input: bool) -> Result<Option<String>> {
     loop {
@@ -195,6 +217,88 @@ pub fn open_in_vim(file_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 为手动修复打开一个或多个文件
+///
+/// 如果只有一个文件，直接在 vim 中打开（保持原有行为）。
+/// 如果有多个文件，展示文件选择列表供用户选择，然后打开所选文件。
+pub fn open_files_for_manual_fix(files: &[std::path::PathBuf]) -> Result<()> {
+    match files.len() {
+        0 => anyhow::bail!("No files provided for manual fix"),
+        1 => open_in_vim(&files[0]),
+        _ => {
+            println!("│");
+            println!(
+                "│ {}",
+                format!(
+                    "⚠ Error involves {} files. Select a file to edit:",
+                    files.len()
+                )
+                .bright_yellow()
+                .bold()
+            );
+            let selected = prompt_file_selection_for_edit(files)?;
+            open_in_vim(&selected)
+        }
+    }
+}
+
+/// 将选项字符串（形如 "1: /path/to/file"）映射回 PathBuf 列表。
+///
+/// 使用 1-based 索引，任何无法解析或越界的项都返回错误。
+#[cfg(test)]
+pub fn map_selections_to_files(
+    selections: &[String],
+    files: &[std::path::PathBuf],
+) -> Result<Vec<std::path::PathBuf>> {
+    let mut result = Vec::with_capacity(selections.len());
+    for s in selections {
+        let idx = s
+            .split_once(": ")
+            .and_then(|(idx_str, _)| idx_str.parse::<usize>().ok())
+            .filter(|&i| i >= 1 && i <= files.len())
+            .ok_or_else(|| anyhow::anyhow!("无法解析文件选项: {:?}", s))?;
+        result.push(files[idx - 1].clone());
+    }
+    Ok(result)
+}
+
+/// 从形如 "1: /path/to/file" 的选项字符串中解析出 1-based 文件索引，并校验范围。
+fn parse_file_option(selection: &str, file_count: usize) -> Result<usize> {
+    let (idx_str, _) = selection
+        .split_once(": ")
+        .ok_or_else(|| anyhow::anyhow!("无法解析文件选项，缺少分隔符: {:?}", selection))?;
+    let i: usize = idx_str
+        .parse()
+        .with_context(|| format!("无法将 {:?} 解析为索引数字", idx_str))?;
+    if i < 1 || i > file_count {
+        anyhow::bail!("文件索引 {} 超出范围 (有效范围: 1-{})", i, file_count);
+    }
+    Ok(i)
+}
+
+/// 提示用户选择要编辑的文件（1-based 编号展示）
+pub fn prompt_file_selection_for_edit(
+    files: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf> {
+    println!("│ {}", "选择要编辑的文件:".bright_cyan().bold());
+    println!("│ {}", "  （使用上下键选择，回车确认）".bright_blue());
+
+    let options: Vec<String> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}: {}", i + 1, f.display()))
+        .collect();
+
+    let selection = inquire::Select::new("文件:", options)
+        .with_vim_mode(true)
+        .prompt()
+        .context("Failed to get file selection")?;
+
+    let idx = parse_file_option(&selection, files.len())?;
+
+    Ok(files[idx - 1].clone())
 }
 
 /// 显示多个文件路径
@@ -430,14 +534,6 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn test_user_choice_variants() {
-        assert_eq!(UserChoice::Continue, UserChoice::Continue);
-        assert_eq!(UserChoice::ManualFix, UserChoice::ManualFix);
-        assert_eq!(UserChoice::Exit, UserChoice::Exit);
-        assert_ne!(UserChoice::Continue, UserChoice::Exit);
-    }
-
-    #[test]
     fn test_compile_success_choice_variants() {
         assert_eq!(CompileSuccessChoice::Accept, CompileSuccessChoice::Accept);
         assert_eq!(
@@ -458,10 +554,12 @@ mod tests {
         assert_eq!(FailureChoice::AddSuggestion, FailureChoice::AddSuggestion);
         assert_eq!(FailureChoice::ManualFix, FailureChoice::ManualFix);
         assert_eq!(FailureChoice::Skip, FailureChoice::Skip);
+        assert_eq!(FailureChoice::FixOtherFile, FailureChoice::FixOtherFile);
         assert_eq!(FailureChoice::Exit, FailureChoice::Exit);
         assert_ne!(FailureChoice::RetryDirectly, FailureChoice::Exit);
         assert_ne!(FailureChoice::AddSuggestion, FailureChoice::Exit);
         assert_ne!(FailureChoice::Skip, FailureChoice::Exit);
+        assert_ne!(FailureChoice::FixOtherFile, FailureChoice::Exit);
     }
 
     #[test]
@@ -490,5 +588,94 @@ mod tests {
 
         // 清理 - 确保下次测试时禁用
         disable_auto_accept_mode();
+    }
+
+    #[test]
+    fn test_map_selections_to_files_normal() {
+        let files = vec![
+            std::path::PathBuf::from("/a/foo.rs"),
+            std::path::PathBuf::from("/b/bar.rs"),
+            std::path::PathBuf::from("/c/baz.rs"),
+        ];
+        let selections = vec!["1: /a/foo.rs".to_string(), "3: /c/baz.rs".to_string()];
+        let result = map_selections_to_files(&selections, &files).unwrap();
+        assert_eq!(result, vec![files[0].clone(), files[2].clone()]);
+    }
+
+    #[test]
+    fn test_map_selections_to_files_duplicate_paths() {
+        // 两个不同索引但路径相同的文件都应正确回填
+        let files = vec![
+            std::path::PathBuf::from("/dup.rs"),
+            std::path::PathBuf::from("/dup.rs"),
+        ];
+        let selections = vec!["1: /dup.rs".to_string(), "2: /dup.rs".to_string()];
+        let result = map_selections_to_files(&selections, &files).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], files[0]);
+        assert_eq!(result[1], files[1]);
+    }
+
+    #[test]
+    fn test_map_selections_to_files_invalid_string() {
+        let files = vec![std::path::PathBuf::from("/a/foo.rs")];
+        let selections = vec!["no_colon_here".to_string()];
+        assert!(map_selections_to_files(&selections, &files).is_err());
+    }
+
+    #[test]
+    fn test_map_selections_to_files_zero_index() {
+        // 0 is out of valid 1-based range
+        let files = vec![std::path::PathBuf::from("/a/foo.rs")];
+        let selections = vec!["0: /a/foo.rs".to_string()];
+        assert!(map_selections_to_files(&selections, &files).is_err());
+    }
+
+    #[test]
+    fn test_map_selections_to_files_out_of_bounds() {
+        let files = vec![std::path::PathBuf::from("/a/foo.rs")];
+        let selections = vec!["5: /a/foo.rs".to_string()];
+        assert!(map_selections_to_files(&selections, &files).is_err());
+    }
+
+    #[test]
+    fn test_map_selections_to_files_empty_selections() {
+        let files = vec![std::path::PathBuf::from("/a/foo.rs")];
+        let selections: Vec<String> = vec![];
+        let result = map_selections_to_files(&selections, &files).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_open_files_for_manual_fix_empty_returns_error() {
+        let files: Vec<std::path::PathBuf> = vec![];
+        assert!(open_files_for_manual_fix(&files).is_err());
+    }
+
+    #[test]
+    fn test_parse_file_option_valid() {
+        assert_eq!(parse_file_option("1: /a/foo.rs", 3).unwrap(), 1);
+        assert_eq!(parse_file_option("2: /b/bar.rs", 3).unwrap(), 2);
+        assert_eq!(parse_file_option("3: /c/baz.rs", 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_parse_file_option_no_separator() {
+        assert!(parse_file_option("no_colon_here", 3).is_err());
+    }
+
+    #[test]
+    fn test_parse_file_option_non_numeric_index() {
+        assert!(parse_file_option("x: /a/foo.rs", 3).is_err());
+    }
+
+    #[test]
+    fn test_parse_file_option_zero_index() {
+        assert!(parse_file_option("0: /a/foo.rs", 3).is_err());
+    }
+
+    #[test]
+    fn test_parse_file_option_out_of_bounds() {
+        assert!(parse_file_option("5: /a/foo.rs", 3).is_err());
     }
 }

@@ -36,7 +36,7 @@ c2rust-config config --model --set model "XXX"
 c2rust-config config --model --set base_url "XXX"
 c2rust-config config --model --set api_key "XXX"
 ```
-7. 执行翻译：c2rust translate（需要python环境）
+7. 执行翻译：c2rust-xw translate（需要python环境）
 	- pip install openai httpx tomli
 	- python3 -m venv /root/c2rust_venv
 	- source /root/c2rust_venv/bin/activate

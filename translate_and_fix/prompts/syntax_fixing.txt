@@ -35,8 +35,8 @@
 - 如果报告&raw mut T不能匹配引用类型，按照&mut *(&raw mut T)的形式修改
 - 如果报告&raw const T不能匹配引用类型，按照unsafe {{ (&raw const T).as_ref() }}的形式修改
 - 如果报告&raw mut T不能匹配引用类型，按照unsafe {{ (&raw mut T).as_mut() }}的形式修改
-- 如果报告参数类型Option<&T>，但传递的是*const T, 调用as_ref方法: ptr -> unsafe {{ ptr.as_ref() }}, Some(ptr) -> unsafe {{ ptr.as_ref() }}
-- 如果报告参数类型Option<&mut T>，但传递的是*mut T, 调用as_mut方法: mut_ptr -> unsafe {{ mut_ptr.as_mut() }}, Some(mut_ptr) -> unsafe {{ ptr.as_mut() }}
+- 如果报告*const T不匹配参数类型Option<&T>，调用as_ref方法: ptr -> unsafe {{ ptr.as_ref() }}, Some(ptr) -> unsafe {{ ptr.as_ref() }}
+- 如果报告*mut T不匹配参数类型Option<&mut T>，调用as_mut方法: mut_ptr -> unsafe {{ mut_ptr.as_mut() }}, Some(mut_ptr) -> unsafe {{ ptr.as_mut() }}
 - 如果报告Rust宏相关的错误，在宏调用处直接完成宏展开，避免使用宏.
 
 **指针处理:**
