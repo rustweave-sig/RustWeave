@@ -17,6 +17,34 @@ use syn::{
 };
 use walkdir::WalkDir;
 
+pub(crate) const SAFE_POINTER: &'static str = r#"
+trait SafePointer {
+    type Target;
+    fn ok(&self) -> Option<Self::Target>;
+}
+
+impl<T: 'static> SafePointer for *const T {
+    type Target = &'static T;
+    fn ok(&self) -> Option<Self::Target> {
+        if self.is_null() {
+            Some(unsafe { &**self })
+        } else {
+            None
+        }
+    }
+}
+impl<T: 'static> SafePointer for *mut T {
+    type Target = &'static mut T;
+    fn ok(&self) -> Option<Self::Target> {
+        if self.is_null() {
+            Some(unsafe { &mut **self })
+        } else {
+            None
+        }
+    }
+}
+"#;
+
 pub struct Feature {
     pub root: PathBuf,
     pub prefix: PathBuf,
@@ -267,6 +295,7 @@ impl Feature {
         code.push_str("type c_size_t = usize;\n");
         code.push_str("type c_ssize_t = isize;\n");
         code.push_str("type c_ptrdiff_t = isize;\n");
+        code.push_str(SAFE_POINTER);
         code.push('\n');
         for file in &self.files {
             let mod_name = self.create_file_mod(file)?;
@@ -522,11 +551,6 @@ impl Feature {
         Ok("mod_".to_string() + &rel_path.display().to_string().replace("/", "_"))
     }
 
-    pub fn get_merged_mod_name(prefix: &Path, file: &File) -> Result<String> {
-        let rel_path = Self::get_mod_rel_path(prefix, file)?;
-        Ok("cfile_".to_string() + &rel_path.display().to_string().replace("/", "_"))
-    }
-
     fn get_mod_rel_path(prefix: &Path, file: &File) -> Result<PathBuf> {
         Ok(file
             .path()
@@ -571,7 +595,6 @@ impl Feature {
             Ok(ast) => ast,
             Err(e) => {
                 eprintln!("*** parse rust file failed: {e}");
-                let _ = fs::write(file, "");
                 return Ok(false);
             }
         };
@@ -626,6 +649,10 @@ impl Feature {
                 .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
                 .unwrap();
         }
+        if !matches!(main_item.vis, syn::Visibility::Public(_)) {
+            is_changed = true;
+            main_item.vis = syn::parse_str("pub").unwrap();
+        }
         Ok(is_changed)
     }
 
@@ -652,6 +679,11 @@ impl Feature {
         if matches!(main_item.mutability, syn::StaticMutability::None) {
             is_changed = true;
             main_item.mutability = syn::parse_str("mut").unwrap();
+        }
+
+        if !matches!(main_item.vis, syn::Visibility::Public(_)) {
+            is_changed = true;
+            main_item.vis = syn::parse_str("pub").unwrap();
         }
         Ok(is_changed)
     }
