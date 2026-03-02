@@ -17,45 +17,6 @@ use syn::{
 };
 use walkdir::WalkDir;
 
-pub(crate) const SAFE_POINTER: &'static str = r#"
-trait ArgPointer {
-    type Target;
-    unsafe fn ok(self) -> Option<Self::Target>;
-}
-impl<T: 'static> ArgPointer for *const T {
-    type Target = &'static T;
-    unsafe fn ok(self) -> Option<Self::Target> {
-        if !self.is_null() {
-            Some(unsafe { &*self })
-        } else {
-            None
-        }
-    }
-}
-impl<T: 'static> ArgPointer for *mut T {
-    type Target = &'static mut T;
-    unsafe fn ok(self) -> Option<Self::Target> {
-        if !self.is_null() {
-            Some(unsafe { &mut *self })
-        } else {
-            None
-        }
-    }
-}
-impl<T: 'static> ArgPointer for &T {
-    type Target = &'static T;
-    unsafe fn ok(self) -> Option<Self::Target> {
-        Some(unsafe { &*(self as *const T) })
-    }
-}
-impl<T: 'static> ArgPointer for &mut T {
-    type Target = &'static T;
-    unsafe fn ok(self) -> Option<Self::Target> {
-        Some(unsafe { &mut *(self as *mut T) })
-    }
-}
-"#;
-
 pub struct Feature {
     pub root: PathBuf,
     pub prefix: PathBuf,
@@ -256,7 +217,9 @@ impl Feature {
                 // 保存file的JSON状态
                 file.save_json()?;
                 let code = file.export_c_code(&c_root)?;
-                fs::write(file.path().with_extension("c"), code.as_bytes()).to_err()?;
+                let c_file = file.path().with_extension("c");
+                fs::write(&c_file, code.as_bytes())
+                    .log_err(&format!("update {}", c_file.display()))?;
                 println!(
                     "Saved JSON state and exported C code for file: {}",
                     mod_name
@@ -308,7 +271,6 @@ impl Feature {
         code.push_str("type c_size_t = usize;\n");
         code.push_str("type c_ssize_t = isize;\n");
         code.push_str("type c_ptrdiff_t = isize;\n");
-        code.push_str(SAFE_POINTER);
         code.push('\n');
         for file in &self.files {
             let mod_name = self.create_file_mod(file)?;
@@ -527,7 +489,8 @@ impl Feature {
             return;
         };
         let inner = &mut *ptr.elem;
-        Self::normalize_type(inner);
+        // 多级指针只处理最外层
+        //Self::normalize_type(inner);
         if ptr.const_token.is_some() {
             *ty = syn::parse2(quote!(Option<& #inner>)).unwrap();
         } else {

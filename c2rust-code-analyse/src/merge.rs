@@ -1,4 +1,4 @@
-use crate::{Feature, File, Result, ToError, SAFE_POINTER};
+use crate::{Feature, File, Result, ToError};
 use hierr::Error;
 use quote::quote;
 use std::collections::{HashMap, HashSet};
@@ -527,7 +527,6 @@ impl Feature {
         content.push_str("#![allow(non_upper_case_globals)]\n");
         content.push_str("#![allow(dead_code)]\n");
         content.push_str("#![allow(unused_imports)]\n");
-        content.push_str(SAFE_POINTER);
         content.push_str("use core::ffi::*;\n");
         content.push('\n');
         content.push_str(&formatted);
