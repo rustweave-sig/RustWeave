@@ -33,10 +33,10 @@
 - 如果报告引用类型不支持某些方法，尝试将数据类型转为指针使用, 比如ref.add -> (ref as *const T).add
 - 如果报告&raw const T不能匹配引用类型，按照&*(&raw const T)的形式修改
 - 如果报告&raw mut T不能匹配引用类型，按照&mut *(&raw mut T)的形式修改
-- 如果报告参数类型Option<&T>，但传递的是*const T, 调用ok方法 -> ptr.ok()
-- 如果报告参数类型Option<&mut T>，但传递的是*mut T, 调用ok方法 -> mut_ptr.ok()
-- 如果报告参数类型Option<&T>，但传递的是&T, 调用ok方法 -> ref.ok()
-- 如果报告参数类型Option<&mut T>，但传递的是&mut T, 调用ok方法 -> ref_mut.ok()
+- 如果报告参数类型Option<&T>，但传递的是*const T, 调用ok方法: ptr -> unsafe {{ ptr.ok() }}, Some(ptr) -> unsafe {{ ptr.ok() }}
+- 如果报告参数类型Option<&mut T>，但传递的是*mut T, 调用ok方法: mut_ptr -> unsafe {{ mut_ptr.ok() }}, Some(mut_ptr) -> unsafe {{ ptr.ok() }}
+- 如果报告参数类型Option<&T>，但传递的是&T, 调用ok方法: ref -> unsafe {{ ref.ok() }}
+- 如果报告参数类型Option<&mut T>，但传递的是&mut T, 调用ok方法: ref_mut -> unsafe {{ ref_mut.ok() }}
 - 如果报告Rust宏相关的错误，在宏调用处直接完成宏展开，避免使用宏.
 
 **指针处理:**
