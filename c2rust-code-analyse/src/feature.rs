@@ -299,6 +299,8 @@ impl Feature {
         code.push_str("#![allow(non_camel_case_types)]\n");
         code.push_str("#![allow(non_snake_case)]\n");
         code.push_str("#![allow(non_upper_case_globals)]\n");
+        // 会生成_Float128浮点数的API，先抑制这类告警.
+        code.push_str("#![allow(improper_ctypes)]\n");
         // 提示词可以简化为任何未知类型都从super::<name>导入.
         code.push_str("#![allow(unused_imports)]\n");
         code.push_str("#![allow(dead_code)]\n");
