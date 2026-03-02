@@ -6,61 +6,20 @@ use std::env;
 use std::process::Command;
 use std::time::Instant;
 
-/// 在每个特性的 Rust 项目目录 `<feature>/rust` 中运行 `cargo build`
+/// 统一的 cargo build 函数
 ///
-/// 每个特性在 `<feature>/rust` 下都有自己的 Rust 项目（有自己的
-/// `Cargo.toml`、依赖项和构建产物），而不是共享单个
-/// `.c2rust/` 目录。这避免了特性之间的冲突（例如，
-/// 不同的依赖版本或特性标志），并允许每个特性独立地构建、
-/// 测试和迭代。
+/// # 参数
+/// - `feature`: 特性名称
+/// - `suppress_warnings`: true=抑制警告(-A warnings), false=显示警告
+/// - `_show_full_output`: 保留参数，暂未实现，传入值不影响当前输出行为
 ///
-/// 注意：`_show_full_output` 参数当前未使用，因为 cargo build 错误
-/// 已经通过 bail! 宏完整显示。保留该参数是为了与其他
-/// 显示函数保持 API 一致性以及未来可能的使用。
-pub fn cargo_build(feature: &str, _show_full_output: bool) -> Result<()> {
-    util::validate_feature_name(feature)?;
-
-    let project_root = util::find_project_root()?;
-    let build_dir = project_root.join(".c2rust").join(feature).join("rust");
-
-    let start_time = Instant::now();
-
-    let output = Command::new("cargo")
-        .arg("build")
-        .current_dir(&build_dir)
-        .env("RUSTFLAGS", "-A warnings")
-        .output()
-        .context("Failed to execute cargo build")?;
-
-    let duration = start_time.elapsed();
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Build error: {}", stderr);
-    }
-
-    println!(
-        "  {} (took {:.2}s)",
-        "Build completed".bright_green(),
-        duration.as_secs_f64()
-    );
-
-    Ok(())
-}
-
-/// Run cargo build without suppressing warnings, capture and return warning output.
-///
-/// Unlike `cargo_build`, this function does not set `RUSTFLAGS="-A warnings"`,
-/// so the compiler emits all warnings.
-///
-/// - Returns `Ok(Some(warnings_text))` if the build succeeds and warnings are present.
-/// - Returns `Ok(None)` if the build succeeds with no warnings.
-/// - Returns `Err` if the build fails (errors present).
-///
-/// Note: `_show_full_output` is not currently used; it is kept for API consistency
-/// with other build functions and for potential future use.
-pub fn cargo_build_check_warnings(
+/// # 返回
+/// - `Ok(None)`: 构建成功且无警告（或警告被抑制）
+/// - `Ok(Some(warnings))`: 构建成功但有警告
+/// - `Err`: 构建失败
+pub fn cargo_build(
     feature: &str,
+    suppress_warnings: bool,
     _show_full_output: bool,
 ) -> Result<Option<String>> {
     util::validate_feature_name(feature)?;
@@ -70,12 +29,14 @@ pub fn cargo_build_check_warnings(
 
     let start_time = Instant::now();
 
-    let output = Command::new("cargo")
-        .arg("build")
-        .current_dir(&build_dir)
-        .output()
-        .context("Failed to execute cargo build")?;
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build").current_dir(&build_dir);
 
+    if suppress_warnings {
+        cmd.env("RUSTFLAGS", "-A warnings");
+    }
+
+    let output = cmd.output().context("Failed to execute cargo build")?;
     let duration = start_time.elapsed();
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -90,17 +51,17 @@ pub fn cargo_build_check_warnings(
         duration.as_secs_f64()
     );
 
-    // Check for warnings in stderr. Use `contains` to handle any leading whitespace
-    // or indentation that may appear in multi-line warning output.
-    let has_warnings = stderr
-        .lines()
-        .any(|line| line.contains("warning[") || line.contains("warning:"));
+    if !suppress_warnings {
+        let has_warnings = stderr
+            .lines()
+            .any(|line| line.contains("warning[") || line.contains("warning:"));
 
-    if has_warnings {
-        Ok(Some(stderr))
-    } else {
-        Ok(None)
+        if has_warnings {
+            return Ok(Some(stderr));
+        }
     }
+
+    Ok(None)
 }
 
 /// 从 c2rust-config 获取特定的配置值
@@ -531,6 +492,46 @@ pub fn run_hybrid_build_interactive(
     }
 }
 
+/// 收集手动修复所需的文件列表
+///
+/// 解析错误消息以获取所有涉及的文件，确保 rs_file 始终包含在列表中。
+/// 返回文件列表，rs_file 始终在第一位（如果不已存在）。
+/// 解析失败时回退到只包含 rs_file 的列表。
+pub(crate) fn get_manual_fix_files(
+    feature: &str,
+    rs_file: &std::path::Path,
+    error_str: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut files = match crate::error_handler::parse_error_for_files(error_str, feature) {
+        Ok(parsed) => parsed,
+        Err(parse_err) => {
+            eprintln!(
+                "[debug] Failed to parse error for related files (feature: {}): {parse_err}",
+                feature
+            );
+            Vec::new()
+        }
+    };
+
+    // 规范化 rs_file 以进行比较（parse_error_for_files 返回的路径也是规范化的）
+    let canonical_rs = rs_file.canonicalize().ok();
+
+    // 如果 rs_file 不在列表中，则添加到列表首位
+    let already_present = match &canonical_rs {
+        Some(c) => files.contains(c),
+        None => files.iter().any(|f| f == rs_file),
+    };
+
+    if !already_present {
+        let to_insert = canonical_rs
+            .clone()
+            .unwrap_or_else(|| rs_file.to_path_buf());
+        files.insert(0, to_insert);
+    }
+
+    files
+}
+
 /// 交互式处理构建失败
 /// Handles build failures in hybrid build phase interactively
 ///
@@ -687,8 +688,13 @@ pub(crate) fn handle_build_failure_interactive(
                                 println!("│ {}", "You chose: Manually edit the code".bright_cyan());
                                 println!("│ {}", "Opening vim for manual fixes...".bright_blue());
 
-                                // 打开 vim 允许用户手动编辑代码
-                                match interaction::open_in_vim(rs_file) {
+                                // 打开 vim 允许用户手动编辑代码（支持多文件选择）
+                                let fix_files = get_manual_fix_files(
+                                    feature,
+                                    rs_file,
+                                    &current_error.to_string(),
+                                );
+                                match interaction::open_files_for_manual_fix(&fix_files) {
                                     Ok(_) => {
                                         println!("│");
                                         println!(
@@ -732,15 +738,17 @@ pub(crate) fn handle_build_failure_interactive(
                                                     interaction::FailureChoice::ManualFix => {
                                                         // 重新打开 vim
                                                         println!("│ {}", "Reopening Vim for another manual fix attempt...".bright_blue());
-                                                        interaction::open_in_vim(rs_file)
+                                                        let fix_files = get_manual_fix_files(feature, rs_file, &e.to_string());
+                                                        interaction::open_files_for_manual_fix(&fix_files)
                                                             .context("Failed to reopen vim for additional manual fix")?;
                                                         // 更新错误并继续外部循环以重新构建
                                                         current_error = e;
                                                         continue;
                                                     }
-                                                    interaction::FailureChoice::Skip => {
+                                                    interaction::FailureChoice::Skip
+                                                    | interaction::FailureChoice::FixOtherFile => {
                                                         unreachable!(
-                                                            "Skip is not offered in this context"
+                                                            "Skip and FixOtherFile are not offered in this context"
                                                         )
                                                     }
                                                     interaction::FailureChoice::Exit => {
@@ -765,8 +773,9 @@ pub(crate) fn handle_build_failure_interactive(
                                     }
                                 }
                             }
-                            interaction::FailureChoice::Skip => {
-                                unreachable!("Skip is not offered in this context")
+                            interaction::FailureChoice::Skip
+                            | interaction::FailureChoice::FixOtherFile => {
+                                unreachable!("Skip and FixOtherFile are not offered in this context")
                             }
                             interaction::FailureChoice::Exit => {
                                 return Err(current_error)
@@ -782,7 +791,8 @@ pub(crate) fn handle_build_failure_interactive(
             println!("│ {}", "You chose: Manual fix".bright_cyan());
 
             // 尝试打开 vim
-            match interaction::open_in_vim(rs_file) {
+            let fix_files = get_manual_fix_files(feature, rs_file, &build_error.to_string());
+            match interaction::open_files_for_manual_fix(&fix_files) {
                 Ok(_) => {
                     loop {
                         println!("│");
@@ -826,7 +836,8 @@ pub(crate) fn handle_build_failure_interactive(
                                             "Reopening Vim for another manual fix attempt..."
                                                 .bright_blue()
                                         );
-                                        interaction::open_in_vim(rs_file).context(
+                                        let fix_files = get_manual_fix_files(feature, rs_file, &e.to_string());
+                                        interaction::open_files_for_manual_fix(&fix_files).context(
                                             "Failed to reopen vim for additional manual fix",
                                         )?;
                                         // Vim 关闭后，继续循环重新构建和重新测试
@@ -842,8 +853,9 @@ pub(crate) fn handle_build_failure_interactive(
                                             feature, file_type, rs_file, e,
                                         );
                                     }
-                                    interaction::FailureChoice::Skip => {
-                                        unreachable!("Skip is not offered in this context")
+                                    interaction::FailureChoice::Skip
+                                    | interaction::FailureChoice::FixOtherFile => {
+                                        unreachable!("Skip and FixOtherFile are not offered in this context")
                                     }
                                     interaction::FailureChoice::Exit => {
                                         return Err(e).context(
@@ -865,7 +877,10 @@ pub(crate) fn handle_build_failure_interactive(
                 }
             }
         }
-        interaction::FailureChoice::Skip => unreachable!("Skip is not offered in this context"),
+        interaction::FailureChoice::Skip
+        | interaction::FailureChoice::FixOtherFile => {
+            unreachable!("Skip and FixOtherFile are not offered in this context")
+        }
         interaction::FailureChoice::Exit => {
             println!("│");
             println!("│ {}", "You chose: Exit".yellow());
@@ -1034,7 +1049,12 @@ pub(crate) fn handle_test_failure_interactive(
                                 println!("│ {}", "Opening vim for manual fixes...".bright_blue());
 
                                 // 打开 vim 允许用户手动编辑代码
-                                match interaction::open_in_vim(rs_file) {
+                                let fix_files = get_manual_fix_files(
+                                    feature,
+                                    rs_file,
+                                    &current_error.to_string(),
+                                );
+                                match interaction::open_files_for_manual_fix(&fix_files) {
                                     Ok(_) => {
                                         println!("│");
                                         println!(
@@ -1076,8 +1096,9 @@ pub(crate) fn handle_test_failure_interactive(
                                     }
                                 }
                             }
-                            interaction::FailureChoice::Skip => {
-                                unreachable!("Skip is not offered in this context")
+                            interaction::FailureChoice::Skip
+                            | interaction::FailureChoice::FixOtherFile => {
+                                unreachable!("Skip and FixOtherFile are not offered in this context")
                             }
                             interaction::FailureChoice::Exit => {
                                 return Err(current_error)
@@ -1093,7 +1114,8 @@ pub(crate) fn handle_test_failure_interactive(
             println!("│ {}", "You chose: Manual fix".bright_cyan());
 
             // 尝试打开 vim
-            match interaction::open_in_vim(rs_file) {
+            let fix_files = get_manual_fix_files(feature, rs_file, &test_error.to_string());
+            match interaction::open_files_for_manual_fix(&fix_files) {
                 Ok(_) => {
                     loop {
                         println!("│");
@@ -1133,7 +1155,8 @@ pub(crate) fn handle_test_failure_interactive(
                                             "Reopening Vim for another manual fix attempt..."
                                                 .bright_blue()
                                         );
-                                        interaction::open_in_vim(rs_file).context(
+                                        let fix_files = get_manual_fix_files(feature, rs_file, &e.to_string());
+                                        interaction::open_files_for_manual_fix(&fix_files).context(
                                             "Failed to reopen vim for additional manual fix",
                                         )?;
                                         // Vim 关闭后，继续循环重新构建和重新测试
@@ -1146,8 +1169,9 @@ pub(crate) fn handle_test_failure_interactive(
                                         );
                                         return Err(e).context("Tests still failing after manual fix; user chose to add a suggestion");
                                     }
-                                    interaction::FailureChoice::Skip => {
-                                        unreachable!("Skip is not offered in this context")
+                                    interaction::FailureChoice::Skip
+                                    | interaction::FailureChoice::FixOtherFile => {
+                                        unreachable!("Skip and FixOtherFile are not offered in this context")
                                     }
                                     interaction::FailureChoice::Exit => {
                                         return Err(e).context(
@@ -1169,7 +1193,10 @@ pub(crate) fn handle_test_failure_interactive(
                 }
             }
         }
-        interaction::FailureChoice::Skip => unreachable!("Skip is not offered in this context"),
+        interaction::FailureChoice::Skip
+        | interaction::FailureChoice::FixOtherFile => {
+            unreachable!("Skip and FixOtherFile are not offered in this context")
+        }
         interaction::FailureChoice::Exit => {
             println!("│");
             println!("│ {}", "You chose: Exit".yellow());
@@ -1212,7 +1239,7 @@ pub fn run_full_build_and_test_interactive(
     println!("│ {}", "Updating code analysis...".bright_blue());
     analyzer::update_code_analysis(feature)?;
     println!("│ {}", "✓ Code analysis updated".bright_green());
-    match cargo_build(feature, true) {
+    match cargo_build(feature, true, false) {
         Ok(_) => {
             println!("│ {}", "  ✓ Rust build successful".bright_green());
         }
@@ -1331,5 +1358,66 @@ mod tests {
             .lines()
             .any(|l| l.contains("warning[") || l.contains("warning:"));
         assert!(!has);
+    }
+
+    /// Test that get_manual_fix_files always includes the primary rs_file
+    #[test]
+    fn test_get_manual_fix_files_always_includes_rs_file() {
+        // When parsing fails (e.g. invalid feature name), rs_file is returned
+        let rs_file = std::path::Path::new("/nonexistent/fun_test.rs");
+        let error_str = "error: some build error";
+        let files = super::get_manual_fix_files("invalid/feature", rs_file, error_str);
+        assert!(!files.is_empty(), "Result should not be empty");
+        assert!(
+            files.iter().any(|f| f == rs_file),
+            "rs_file should always be in the result"
+        );
+    }
+
+    /// Test that get_manual_fix_files does not duplicate rs_file
+    #[test]
+    #[serial_test::serial]
+    fn test_get_manual_fix_files_no_duplicate_rs_file() {
+        use std::env;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let project_root = temp_dir.path();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(project_root).unwrap();
+        let _restore = scopeguard::guard(original_dir, |dir| {
+            let _ = env::set_current_dir(dir);
+        });
+
+        let feature = "test_feature";
+        let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let rs_file_path = src_dir.join("fun_test.rs");
+        fs::write(&rs_file_path, "// test").unwrap();
+
+        // Error message referencing the same file
+        let error_str = format!(
+            "error[E0308]: mismatched types\n  --> src/fun_test.rs:10:5\n  |\n10 |     x\n"
+        );
+
+        let files =
+            super::get_manual_fix_files(feature, &rs_file_path, &error_str);
+
+        // rs_file should appear only once
+        let canonical_rs = rs_file_path.canonicalize().ok();
+        let count = files
+            .iter()
+            .filter(|f| {
+                if let Some(ref c) = canonical_rs {
+                    *f == c
+                } else {
+                    *f == &rs_file_path
+                }
+            })
+            .count();
+        assert_eq!(count, 1, "rs_file should appear exactly once in the result");
     }
 }
