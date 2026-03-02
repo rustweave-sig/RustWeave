@@ -18,29 +18,40 @@ use syn::{
 use walkdir::WalkDir;
 
 pub(crate) const SAFE_POINTER: &'static str = r#"
-trait SafePointer {
+trait ArgPointer {
     type Target;
-    fn ok(&self) -> Option<Self::Target>;
+    unsafe fn ok(self) -> Option<Self::Target>;
 }
-
-impl<T: 'static> SafePointer for *const T {
+impl<T: 'static> ArgPointer for *const T {
     type Target = &'static T;
-    fn ok(&self) -> Option<Self::Target> {
-        if self.is_null() {
-            Some(unsafe { &**self })
+    unsafe fn ok(self) -> Option<Self::Target> {
+        if !self.is_null() {
+            Some(unsafe { &*self })
         } else {
             None
         }
     }
 }
-impl<T: 'static> SafePointer for *mut T {
+impl<T: 'static> ArgPointer for *mut T {
     type Target = &'static mut T;
-    fn ok(&self) -> Option<Self::Target> {
-        if self.is_null() {
-            Some(unsafe { &mut **self })
+    unsafe fn ok(self) -> Option<Self::Target> {
+        if !self.is_null() {
+            Some(unsafe { &mut *self })
         } else {
             None
         }
+    }
+}
+impl<T: 'static> ArgPointer for &T {
+    type Target = &'static T;
+    unsafe fn ok(self) -> Option<Self::Target> {
+        Some(unsafe { &*(self as *const T) })
+    }
+}
+impl<T: 'static> ArgPointer for &mut T {
+    type Target = &'static T;
+    unsafe fn ok(self) -> Option<Self::Target> {
+        Some(unsafe { &mut *(self as *mut T) })
     }
 }
 "#;
