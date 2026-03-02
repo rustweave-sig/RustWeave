@@ -812,6 +812,10 @@ pub(crate) fn apply_warning_fix<F>(
 where
     F: Fn(&str) -> String,
 {
+    let c_file = rs_file.with_extension("c");
+    if !c_file.exists() {
+        return Ok(());
+    }
     println!(
         "│ {}",
         "⚠ Warnings detected, attempting to fix...".yellow().bold()

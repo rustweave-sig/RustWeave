@@ -9,17 +9,10 @@ use feature::*;
 mod merge;
 
 trait ToError<T> {
-    fn to_err(self) -> Result<T>;
     fn log_err(self, info: &str) -> Result<T>;
 }
 
 impl<T, E: core::error::Error> ToError<T> for core::result::Result<T, E> {
-    fn to_err(self) -> Result<T> {
-        self.map_err(|e| {
-            eprintln!("Error--> {}", e);
-            Error::last()
-        })
-    }
     fn log_err(self, info: &str) -> Result<T> {
         self.map_err(|e| {
             eprintln!("Error--> {} : {info}", e);

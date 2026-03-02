@@ -1,4 +1,4 @@
-use crate::{Feature, File, Result, ToError, SAFE_POINTER};
+use crate::{Feature, File, Result, ToError};
 use hierr::Error;
 use quote::quote;
 use std::collections::{HashMap, HashSet};
@@ -261,7 +261,7 @@ impl Feature {
         let content = format!("use super::*;\n\n{}", formatted);
 
         let merged_mod_dir = self.root.join("rust/src.2");
-        fs::create_dir(&merged_mod_dir).to_err()?;
+        fs::create_dir(&merged_mod_dir).log_err(&format!("create {}", merged_mod_dir.display()))?;
         let merged_rs = merged_mod_dir.join(&mod_name).with_extension("rs");
         fs::write(&merged_rs, content.as_bytes())
             .log_err(&format!("write {}", merged_rs.display()))?;
@@ -295,7 +295,7 @@ impl Feature {
     fn parse_rust_files(rs_files: &[PathBuf]) -> Result<Vec<syn::Item>> {
         let mut all_items = Vec::new();
         for rs_file in rs_files {
-            let content = fs::read_to_string(rs_file).to_err()?;
+            let content = fs::read_to_string(rs_file).log_err(&format!("read {}", rs_file.display()))?;
             let ast = syn::parse_file(&content).map_err(|e| {
                 eprintln!("Failed to parse {}: {}", rs_file.display(), e);
                 Error::inval()
@@ -454,7 +454,7 @@ impl Feature {
 
         for types_file in types_files {
             println!("Parsing mod.rs: {}", types_file.display());
-            let content = fs::read_to_string(types_file).to_err()?;
+            let content = fs::read_to_string(types_file).log_err(&format!("read {}", types_file.display()))?;
             let ast = syn::parse_file(&content).map_err(|e| {
                 eprintln!("Failed to parse {}: {}", types_file.display(), e);
                 Error::inval()
@@ -527,7 +527,6 @@ impl Feature {
         content.push_str("#![allow(non_upper_case_globals)]\n");
         content.push_str("#![allow(dead_code)]\n");
         content.push_str("#![allow(unused_imports)]\n");
-        content.push_str(SAFE_POINTER);
         content.push_str("use core::ffi::*;\n");
         content.push('\n');
         content.push_str(&formatted);
