@@ -142,7 +142,7 @@ impl VisitMut for NormalizeFile {
             return;
         }
         let last_mod = path.segments.get(len - 2).unwrap();
-        if !matches!(&last_mod.ident.to_string()[..4], "var_" | "fun_") {
+        if !NormalizeFile::is_var_fun_ident(&last_mod.ident) {
             return;
         }
         let last = match path.segments.pop().unwrap() {
