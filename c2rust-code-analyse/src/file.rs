@@ -9,7 +9,7 @@ use std::process::Command;
 pub type Node = clang_ast::Node<Kind>;
 
 fn read_file_range(path: &Path, start: usize, end: usize) -> Result<String> {
-    let file = fs::File::open(path).to_err()?;
+    let file = fs::File::open(path).log_err(&format!("open {}", path.display()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|_| Error::last())? };
     if start >= mmap.len() || end <= start {
         return Ok(String::new());
@@ -513,7 +513,7 @@ impl File {
             // let _ = fs::remove_file(p);
         });
         let new_c2rust_file = path.with_extension("c2rust_global");
-        fs::write(&*new_c2rust_file, code.as_bytes()).to_err()?;
+        fs::write(&*new_c2rust_file, code.as_bytes()).log_err(&format!("write {}", new_c2rust_file.display()))?;
         // 输入已经是预处理后的文件，这里无条件使用clang只实现宏展开，不会引入clang特有的内容.
         let output = Command::new(get_clang())
             .arg("-xc")
@@ -524,7 +524,7 @@ impl File {
             .arg("-o")
             .arg(&*new_c_file)
             .output()
-            .to_err()?;
+            .log_err("clang -xc -E -P -fno-builtin")?;
         if !output.status.success() {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return Err(Error::last());
@@ -550,7 +550,7 @@ impl File {
             .arg("-fsyntax-only")
             .arg(rel_path)
             .output()
-            .to_err()?;
+            .log_err("clang -xc -Xclang -ast-dump=json -fsyntax-only")?;
         // clang解析gcc预处理文件是可能出错，但是忽略，直接查看输出的json文件是否可用.
         let mut err_msg = String::new();
         if !output.status.success() {
@@ -570,7 +570,7 @@ impl File {
     }
 
     fn md5_file(path: &Path) -> Result<String> {
-        let content = fs::read_to_string(path).to_err()?;
+        let content = fs::read_to_string(path).log_err(&format!("read {}", path.display()))?;
         let digest = md5::compute(content.as_bytes());
         Ok(format!("{:x}", digest))
     }
