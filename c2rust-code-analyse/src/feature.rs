@@ -12,7 +12,7 @@ use std::process::Command;
 use syn::{
     parse::Parser,
     spanned::Spanned,
-    visit::{visit_file, Visit},
+    visit::{visit_file, visit_signature, Visit},
     visit_mut::{visit_file_mut, visit_foreign_item_fn_mut, VisitMut},
 };
 use walkdir::WalkDir;
@@ -523,10 +523,11 @@ impl Feature {
         name
     }
     fn normalize_type(ty: &mut syn::Type) {
-        let syn::Type::Ptr(ref ptr) = ty else {
+        let syn::Type::Ptr(ref mut ptr) = ty else {
             return;
         };
-        let inner = &*ptr.elem;
+        let inner = &mut *ptr.elem;
+        Self::normalize_type(inner);
         if ptr.const_token.is_some() {
             *ty = syn::parse2(quote!(Option<& #inner>)).unwrap();
         } else {
@@ -607,7 +608,7 @@ impl Feature {
         let mut ast = match syn::parse_file(&content) {
             Ok(ast) => ast,
             Err(e) => {
-                eprintln!("*** parse rust file failed: {e}");
+                eprintln!("*** parse rust file failed: {e}\n{content}");
                 return Ok(false);
             }
         };
@@ -635,9 +636,21 @@ impl Feature {
     }
 
     fn validate_fun(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
+        struct Visitor(bool);
+        impl Visit<'_> for Visitor {
+            fn visit_return_type(&mut self, _: &syn::ReturnType) {}
+            fn visit_type_ptr(&mut self, _: &syn::TypePtr) {
+                self.0 = true;
+            }
+        }
+
         let mut main_item = None;
+        let mut is_unsafe = false;
         ast.items.iter_mut().any(|item| match item {
             syn::Item::Fn(item) if item.sig.ident.to_string() == name => {
+                let mut visitor = Visitor(false);
+                visit_signature(&mut visitor, &item.sig);
+                is_unsafe = visitor.0;
                 main_item = Some(item);
                 true
             }
@@ -647,10 +660,14 @@ impl Feature {
             return Err(Error::inval());
         };
         // 确保abi等满足要求.
-        let mut is_changed = false;
-        if main_item.sig.unsafety.is_some() {
+        let mut is_changed = Self::remove_no_mangle_attr(&mut main_item.attrs);
+        if main_item.sig.unsafety.is_some() ^ is_unsafe {
             is_changed = true;
-            main_item.sig.unsafety = None;
+            if is_unsafe {
+                main_item.sig.unsafety = syn::parse_str("unsafe").unwrap();
+            } else {
+                main_item.sig.unsafety = None;
+            }
         }
         if main_item.sig.abi.is_none() {
             is_changed = true;
@@ -658,9 +675,11 @@ impl Feature {
         }
         if !Self::has_export_name_attr(&main_item.attrs) {
             is_changed = true;
-            main_item.attrs = syn::Attribute::parse_outer
-                .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
-                .unwrap();
+            main_item.attrs.extend(
+                syn::Attribute::parse_outer
+                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
+                    .unwrap(),
+            );
         }
         if !matches!(main_item.vis, syn::Visibility::Public(_)) {
             is_changed = true;
@@ -681,12 +700,14 @@ impl Feature {
         let Some(main_item) = main_item else {
             return Err(Error::inval());
         };
-        let mut is_changed = false;
+        let mut is_changed = Self::remove_no_mangle_attr(&mut main_item.attrs);
         if !Self::has_export_name_attr(&main_item.attrs) {
             is_changed = true;
-            main_item.attrs = syn::Attribute::parse_outer
-                .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
-                .unwrap();
+            main_item.attrs.extend(
+                syn::Attribute::parse_outer
+                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
+                    .unwrap(),
+            );
         }
 
         if matches!(main_item.mutability, syn::StaticMutability::None) {
@@ -709,5 +730,13 @@ impl Feature {
             }
         }
         false
+    }
+    fn remove_no_mangle_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
+        let len = attrs.len();
+        attrs.retain(|attr| {
+            let s = attr.to_token_stream().to_string();
+            !s.contains("no_mangle")
+        });
+        len != attrs.len()
     }
 }
