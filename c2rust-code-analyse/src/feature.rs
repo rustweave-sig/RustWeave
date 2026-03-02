@@ -1,23 +1,67 @@
-use crate::{get_root, File, Result, ToError};
+use crate::{get_root, File, Node, Result, ToError};
 use hierr::Error;
 use higuard::Guard;
+use quote::{quote, ToTokens};
 use std::collections::HashMap;
+use std::env::var_os;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use syn::{
+    parse::Parser,
     spanned::Spanned,
-    visit::{visit_file, Visit},
+    visit::{visit_file, visit_signature, Visit},
+    visit_mut::{visit_file_mut, visit_foreign_item_fn_mut, VisitMut},
 };
 use walkdir::WalkDir;
+
+pub(crate) const SAFE_POINTER: &'static str = r#"
+trait ArgPointer {
+    type Target;
+    unsafe fn ok(self) -> Option<Self::Target>;
+}
+impl<T: 'static> ArgPointer for *const T {
+    type Target = &'static T;
+    unsafe fn ok(self) -> Option<Self::Target> {
+        if !self.is_null() {
+            Some(unsafe { &*self })
+        } else {
+            None
+        }
+    }
+}
+impl<T: 'static> ArgPointer for *mut T {
+    type Target = &'static mut T;
+    unsafe fn ok(self) -> Option<Self::Target> {
+        if !self.is_null() {
+            Some(unsafe { &mut *self })
+        } else {
+            None
+        }
+    }
+}
+impl<T: 'static> ArgPointer for &T {
+    type Target = &'static T;
+    unsafe fn ok(self) -> Option<Self::Target> {
+        Some(unsafe { &*(self as *const T) })
+    }
+}
+impl<T: 'static> ArgPointer for &mut T {
+    type Target = &'static T;
+    unsafe fn ok(self) -> Option<Self::Target> {
+        Some(unsafe { &mut *(self as *mut T) })
+    }
+}
+"#;
 
 pub struct Feature {
     pub root: PathBuf,
     pub prefix: PathBuf,
     pub name: String,
     pub files: Vec<File>,
+    fast: bool,
 }
 
 impl Feature {
@@ -29,9 +73,14 @@ impl Feature {
             name: name.to_string(),
             prefix,
             files: vec![],
+            fast: Self::fast_policy(),
         };
         this.get_files()?;
         Ok(this)
+    }
+
+    fn fast_policy() -> bool {
+        var_os("C2RUST_POLICY").as_deref() != Some(OsStr::new("safe"))
     }
 
     fn get_files(&mut self) -> Result<()> {
@@ -160,6 +209,7 @@ impl Feature {
 
             // 收集需要更新的节点及其新状态
             let mut is_updated = false;
+            let mut translated = HashMap::new();
             for node in file.iter_mut() {
                 // 只处理函数和变量定义
                 if !Self::is_node_definition(node) {
@@ -179,27 +229,30 @@ impl Feature {
                 let rust_file_path = mod_dir.join(&prefixed_name).with_extension("rs");
 
                 // 检查文件内容是否为空（去除空白字符后）
-                let is_file_empty = Self::is_file_empty(&rust_file_path)?;
-
+                let not_empty = Self::validate_file(&rust_file_path, name, &prefixed_name)?;
+                if not_empty {
+                    translated.insert(Self::normalize_name(name).to_string(), prefixed_name);
+                }
                 let has_committed = node.kind.has_committed();
 
                 // 检查状态是否一致
-                if has_committed && is_file_empty {
+                if has_committed && !not_empty {
                     // 已标记为翻译但文件为空，需要重置状态为未翻译
                     node.kind.set_git_commit(false);
                     is_updated = true;
-                } else if !has_committed && !is_file_empty {
+                } else if !has_committed && not_empty {
                     // 未标记为翻译但文件非空，需要标记为已翻译
-                    println!("{name} git commit");
                     node.kind.set_git_commit(true);
                     is_updated = true;
                 }
+
                 // 其他情况（状态一致）不需要处理
             }
 
             // 应用更新到file的节点
             if is_updated {
                 changed = true;
+                Self::update_mod_rs(&mod_dir, translated)?;
                 // 保存file的JSON状态
                 file.save_json()?;
                 let code = file.export_c_code(&c_root)?;
@@ -236,7 +289,8 @@ impl Feature {
         fs::create_dir(&cargo).to_err()?;
         let lint = std::env::var_os("C2RUST_HOME").ok_or(Error::inval())?;
         let lint = Path::new(&lint);
-        fs::copy(lint.join("conf/lint.toml"), cargo.join("config.toml")).log_err("failed to copy $C2RUST_HOME/conf/lint.toml")?;
+        fs::copy(lint.join("conf/lint.toml"), cargo.join("config.toml"))
+            .log_err("failed to copy $C2RUST_HOME/conf/lint.toml")?;
         Ok(())
     }
 
@@ -245,12 +299,16 @@ impl Feature {
         code.push_str("#![allow(non_camel_case_types)]\n");
         code.push_str("#![allow(non_snake_case)]\n");
         code.push_str("#![allow(non_upper_case_globals)]\n");
-        code.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
+        // 会生成_Float128浮点数的API，先抑制这类告警.
+        code.push_str("#![allow(improper_ctypes)]\n");
         // 提示词可以简化为任何未知类型都从super::<name>导入.
+        code.push_str("#![allow(unused_imports)]\n");
+        code.push_str("#![allow(dead_code)]\n");
         code.push_str("use core::ffi::*;\n");
         code.push_str("type c_size_t = usize;\n");
         code.push_str("type c_ssize_t = isize;\n");
         code.push_str("type c_ptrdiff_t = isize;\n");
+        code.push_str(SAFE_POINTER);
         code.push('\n');
         for file in &self.files {
             let mod_name = self.create_file_mod(file)?;
@@ -266,10 +324,6 @@ impl Feature {
         let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
         let mod_dir = self.root.join("rust/src").join(&mod_name);
         fs::create_dir_all(&mod_dir).to_err()?;
-
-        println!("{mod_name}: Generating type information with bindgen...");
-        self.generate_types_rs(file, &mod_dir)?;
-        println!("{mod_name}: Type information generated");
 
         let mut nodes = HashMap::new();
         for node in file.iter() {
@@ -290,38 +344,39 @@ impl Feature {
                 .or_insert(node);
         }
 
-        let ffi_decl = Self::get_ffi_decl(&mod_dir)?;
+        println!("{mod_name}: Generating type information with bindgen...");
+        self.generate_mod_rs(file, &mod_dir, &nodes)?;
+        println!("{mod_name}: Type information generated");
+
+        let mut ffi_decl = Self::get_ffi_decl(&mod_dir)?;
         let c_root = self.root.join("c");
-        let mut code = "// generated by c2rust\n\n".to_string();
-        code.push_str("use super::*;\n");
-        code.push_str("mod c2rust_types;\n");
-        code.push_str("use c2rust_types::*;\n");
         for (name, node) in nodes {
             // 根据节点类型添加前缀
             let prefixed_name = Self::prefixed_filename(node).unwrap_or_else(|| name.to_string());
-            code.push_str("mod ");
-            code.push_str(&prefixed_name);
-            code.push_str(";\n");
             fs::File::create(mod_dir.join(&prefixed_name).with_extension("rs")).to_err()?;
-            let c_code = node.kind.c_code(&c_root)?;
+            let c_code = Self::normalize_c_code(node.kind.c_code(&c_root)?);
             fs::write(
                 mod_dir.join(&prefixed_name).with_extension("c"),
                 c_code.as_bytes(),
             )
             .to_err()?;
-            let name = &prefixed_name[4..];
-            let decl_file = format!("decl_{name}.rs");
-            let _ = fs::write(
-                mod_dir.join(decl_file),
-                ffi_decl.get(name).unwrap_or(&String::new()),
-            )
-            .to_err()?;
+            let name = Self::normalize_name(name);
+            let Some(decl) = ffi_decl.remove(name) else {
+                eprintln!("don't find ffi function {name}");
+                return Err(Error::inval());
+            };
+            let decl_file = format!("decl_{}.rs", &prefixed_name[4..]);
+            let _ = fs::write(mod_dir.join(decl_file), decl).to_err()?;
         }
-        fs::write(mod_dir.join("mod.rs"), code.as_bytes()).to_err()?;
         Ok(mod_name)
     }
 
-    pub fn generate_types_rs(&self, file: &File, mod_dir: &Path) -> Result<()> {
+    pub fn generate_mod_rs(
+        &self,
+        file: &File,
+        mod_dir: &Path,
+        nodes: &HashMap<&str, &Node>,
+    ) -> Result<()> {
         let types_h = mod_dir.join("types.h");
         let header = file.export_header(&self.root.join("c"))?;
         fs::write(&types_h, header.as_bytes()).to_err()?;
@@ -330,7 +385,7 @@ impl Feature {
             .current_dir(mod_dir)
             .arg(types_h)
             .arg("-o")
-            .arg("c2rust_types.rs")
+            .arg("mod.rs")
             .arg("--no-layout-tests")
             .arg("--default-enum-style")
             .arg("consts")
@@ -349,11 +404,139 @@ impl Feature {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return Err(Error::last());
         }
+        self.normalize_mod_rs(mod_dir, nodes)
+    }
+
+    // 修改函数入参和返回值
+    // *const T -> Option<&'static T>
+    // *mut T -> Option<&'static mut T>
+    fn normalize_mod_rs(&self, mod_dir: &Path, nodes: &HashMap<&str, &Node>) -> Result<()> {
+        let mod_rs = mod_dir.join("mod.rs");
+        let content = fs::read_to_string(&mod_rs).to_err()?;
+        let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
+        struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>, bool);
+        // _c2rust_private_仅仅体现在导出符号名中，本模块的代码仍然看到的是C代码中的名字.
+        // 本目录下生成的C源码也要删除掉_c2rust_private_前缀
+        impl VisitMut for Visitor<'_> {
+            fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
+                let name = item.ident.to_string();
+                if name.starts_with("_c2rust_private_") {
+                    item.attrs = syn::Attribute::parse_outer
+                        .parse_str(&format!("#[link_name = \"{}\"]", name))
+                        .unwrap();
+                    let new_name = name.splitn(5, '_').last().unwrap();
+                    item.ident = syn::Ident::new(new_name, item.ident.span());
+                }
+            }
+
+            fn visit_foreign_item_fn_mut(&mut self, item: &mut syn::ForeignItemFn) {
+                let name = item.sig.ident.to_string();
+                if name.starts_with("_c2rust_private_") {
+                    item.attrs = syn::Attribute::parse_outer
+                        .parse_str(&format!("#[link_name = \"{}\"]", name))
+                        .unwrap();
+                    let new_name = name.splitn(5, '_').last().unwrap();
+                    item.sig.ident = syn::Ident::new(new_name, item.sig.ident.span());
+                }
+                if !self.1 && self.0.contains_key(name.as_str()) {
+                    visit_foreign_item_fn_mut(self, item);
+                }
+            }
+            fn visit_fn_arg_mut(&mut self, arg: &mut syn::FnArg) {
+                let syn::FnArg::Typed(arg) = arg else {
+                    return;
+                };
+                Feature::normalize_type(&mut arg.ty);
+            }
+            // 返回值不能修改，引用的生命周期未知，如果采用'static，可能导致无法完成翻译.
+            /*
+            fn visit_return_type_mut(&mut self, retn: &mut syn::ReturnType) {
+                let syn::ReturnType::Type(_, ref mut ty) = retn else {
+                    return;
+                };
+                Feature::normalize_type(&mut **ty);
+            }
+            */
+        }
+        let mut visitor = Visitor(nodes, self.fast);
+        visit_file_mut(&mut visitor, &mut ast);
+
+        // 使用prettyplease格式化输出
+        let formatted = prettyplease::unparse(&ast);
+        fs::write(&mod_rs, formatted.as_bytes()).to_err()?;
+        // 保存一个备份，后续更新的时候需要.
+        fs::copy(&mod_rs, mod_rs.with_extension("normalized")).to_err()?;
         Ok(())
     }
 
+    fn update_mod_rs(mod_dir: &Path, translated: HashMap<String, String>) -> Result<()> {
+        let mod_rs = mod_dir.join("mod.rs");
+        // 需要从备份文件中读取完整信息
+        let content = fs::read_to_string(mod_rs.with_extension("normalized")).to_err()?;
+        let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
+        for item in &mut ast.items {
+            let syn::Item::ForeignMod(item) = item else {
+                continue;
+            };
+            item.items.retain(|item| {
+                if let syn::ForeignItem::Fn(item) = item {
+                    return !translated.contains_key(&item.sig.ident.to_string());
+                } else if let syn::ForeignItem::Static(item) = item {
+                    return !translated.contains_key(&item.ident.to_string());
+                }
+                true
+            });
+        }
+        ast.items.retain(|item| {
+            let syn::Item::ForeignMod(item) = item else {
+                return true;
+            };
+            !item.items.is_empty()
+        });
+        let mut modules = Vec::new();
+        for module in translated.values() {
+            modules.push(syn::parse_str(&format!("mod {module};")).unwrap());
+            modules.push(syn::parse_str(&format!("pub use {module}::*;")).unwrap());
+        }
+        modules.push(syn::parse_str(&format!("#[allow(unused_imports)]\nuse super::*;")).unwrap());
+        ast.items.extend(modules);
+
+        let formatted = prettyplease::unparse(&ast);
+        fs::write(&mod_rs, formatted.as_bytes()).to_err()?;
+        Ok(())
+    }
+
+    fn normalize_c_code(mut code: String) -> String {
+        let regex = regex::Regex::new("_c2rust_private_[^_]+_").unwrap();
+        let mut off = 0;
+        while let Some(m) = regex.find(&code[off..]) {
+            off += m.start();
+            code.replace_range(off..off + m.len(), "");
+        }
+        code
+    }
+
+    fn normalize_name(name: &str) -> &str {
+        if name.starts_with("_c2rust_private_") {
+            return name.splitn(5, '_').last().unwrap();
+        }
+        name
+    }
+    fn normalize_type(ty: &mut syn::Type) {
+        let syn::Type::Ptr(ref mut ptr) = ty else {
+            return;
+        };
+        let inner = &mut *ptr.elem;
+        Self::normalize_type(inner);
+        if ptr.const_token.is_some() {
+            *ty = syn::parse2(quote!(Option<& #inner>)).unwrap();
+        } else {
+            *ty = syn::parse2(quote!(Option<&mut #inner>)).unwrap();
+        }
+    }
+
     fn get_ffi_decl(mod_dir: &Path) -> Result<HashMap<String, String>> {
-        let content = fs::read_to_string(mod_dir.join("c2rust_types.rs")).to_err()?;
+        let content = fs::read_to_string(mod_dir.join("mod.normalized")).to_err()?;
         let ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
         struct Visitor<'a>(HashMap<String, String>, &'a str);
         let mut visitor = Visitor(HashMap::new(), &content);
@@ -363,20 +546,11 @@ impl Feature {
                     if let syn::ForeignItem::Fn(ref item) = item {
                         let name = item.sig.ident.to_string();
                         let range = item.sig.span().byte_range();
-                        self.0.insert(
-                            name,
-                            format!(
-                                "#[unsafe(no_mangle)]\npub unsafe extern \"C\" {};",
-                                self.1[range].to_string()
-                            ),
-                        );
+                        self.0.insert(name, self.1[range].to_string());
                     } else if let syn::ForeignItem::Static(ref item) = item {
                         let name = item.ident.to_string();
                         let range = item.span().byte_range();
-                        self.0.insert(
-                            name,
-                            format!("#[unsafe(no_mangle)]\n{}", self.1[range].to_string()),
-                        );
+                        self.0.insert(name, self.1[range].to_string());
                     }
                 }
             }
@@ -389,11 +563,6 @@ impl Feature {
     pub fn get_mod_name_for_file(prefix: &Path, file: &File) -> Result<String> {
         let rel_path = Self::get_mod_rel_path(prefix, file)?;
         Ok("mod_".to_string() + &rel_path.display().to_string().replace("/", "_"))
-    }
-
-    pub fn get_merged_mod_name(prefix: &Path, file: &File) -> Result<String> {
-        let rel_path = Self::get_mod_rel_path(prefix, file)?;
-        Ok("cfile_".to_string() + &rel_path.display().to_string().replace("/", "_"))
     }
 
     fn get_mod_rel_path(prefix: &Path, file: &File) -> Result<PathBuf> {
@@ -424,12 +593,150 @@ impl Feature {
         Ok(())
     }
 
-    // 检查文件是否为空（去除空白字符后）
-    fn is_file_empty(path: &Path) -> Result<bool> {
-        if !path.exists() {
+    // 大模型返回的文件可能不符合要求, 或者被意外破坏，需要修正.
+    fn validate_file(file: &Path, name: &str, prefix: &str) -> Result<bool> {
+        if !file.exists() {
             return Ok(true);
         }
-        let content = fs::read_to_string(path).to_err()?;
-        Ok(content.trim().is_empty())
+        let content = fs::read_to_string(file).to_err()?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Ok(false);
+        }
+
+        // 并不是有效的rust代码直接清空.
+        let mut ast = match syn::parse_file(&content) {
+            Ok(ast) => ast,
+            Err(e) => {
+                eprintln!("*** parse rust file failed: {e}\n{content}");
+                return Ok(false);
+            }
+        };
+
+        let is_fun = prefix.starts_with("fun_");
+        let name = Self::normalize_name(name);
+        let is_changed = if is_fun {
+            Self::validate_fun(&mut ast, name, &prefix[4..])
+        } else {
+            Self::validate_var(&mut ast, name, &prefix[4..])
+        };
+
+        let Ok(is_changed) = is_changed else {
+            eprintln!("*** don't find item {name} in {prefix}");
+            // 说明命名错误, 需要重新翻译.
+            let _ = fs::write(file, "");
+            return Ok(false);
+        };
+
+        if is_changed {
+            let formatted = prettyplease::unparse(&ast);
+            fs::write(file, formatted.as_bytes()).to_err()?;
+        }
+        Ok(true)
+    }
+
+    fn validate_fun(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
+        struct Visitor(bool);
+        impl Visit<'_> for Visitor {
+            fn visit_return_type(&mut self, _: &syn::ReturnType) {}
+            fn visit_type_ptr(&mut self, _: &syn::TypePtr) {
+                self.0 = true;
+            }
+        }
+
+        let mut main_item = None;
+        let mut is_unsafe = false;
+        ast.items.iter_mut().any(|item| match item {
+            syn::Item::Fn(item) if item.sig.ident.to_string() == name => {
+                let mut visitor = Visitor(false);
+                visit_signature(&mut visitor, &item.sig);
+                is_unsafe = visitor.0;
+                main_item = Some(item);
+                true
+            }
+            _ => false,
+        });
+        let Some(main_item) = main_item else {
+            return Err(Error::inval());
+        };
+        // 确保abi等满足要求.
+        let mut is_changed = Self::remove_no_mangle_attr(&mut main_item.attrs);
+        if main_item.sig.unsafety.is_some() ^ is_unsafe {
+            is_changed = true;
+            if is_unsafe {
+                main_item.sig.unsafety = syn::parse_str("unsafe").unwrap();
+            } else {
+                main_item.sig.unsafety = None;
+            }
+        }
+        if main_item.sig.abi.is_none() {
+            is_changed = true;
+            main_item.sig.abi = syn::parse_str(r#"extern "C""#).unwrap();
+        }
+        if !Self::has_export_name_attr(&main_item.attrs) {
+            is_changed = true;
+            main_item.attrs.extend(
+                syn::Attribute::parse_outer
+                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
+                    .unwrap(),
+            );
+        }
+        if !matches!(main_item.vis, syn::Visibility::Public(_)) {
+            is_changed = true;
+            main_item.vis = syn::parse_str("pub").unwrap();
+        }
+        Ok(is_changed)
+    }
+
+    fn validate_var(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
+        let mut main_item = None;
+        ast.items.iter_mut().any(|item| match item {
+            syn::Item::Static(item) if item.ident.to_string() == name => {
+                main_item = Some(item);
+                false
+            }
+            _ => false,
+        });
+        let Some(main_item) = main_item else {
+            return Err(Error::inval());
+        };
+        let mut is_changed = Self::remove_no_mangle_attr(&mut main_item.attrs);
+        if !Self::has_export_name_attr(&main_item.attrs) {
+            is_changed = true;
+            main_item.attrs.extend(
+                syn::Attribute::parse_outer
+                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
+                    .unwrap(),
+            );
+        }
+
+        if matches!(main_item.mutability, syn::StaticMutability::None) {
+            is_changed = true;
+            main_item.mutability = syn::parse_str("mut").unwrap();
+        }
+
+        if !matches!(main_item.vis, syn::Visibility::Public(_)) {
+            is_changed = true;
+            main_item.vis = syn::parse_str("pub").unwrap();
+        }
+        Ok(is_changed)
+    }
+
+    fn has_export_name_attr(attrs: &[syn::Attribute]) -> bool {
+        for attr in attrs {
+            let s = attr.to_token_stream().to_string();
+            if s.contains("export_name") {
+                return true;
+            }
+        }
+        false
+    }
+    fn remove_no_mangle_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
+        let len = attrs.len();
+        attrs.retain(|attr| {
+            let s = attr.to_token_stream().to_string();
+            !s.contains("no_mangle")
+        });
+        len != attrs.len()
     }
 }
