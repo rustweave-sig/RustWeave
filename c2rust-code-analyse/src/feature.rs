@@ -80,7 +80,7 @@ impl Feature {
     }
 
     fn fast_policy() -> bool {
-        var_os("C2RUST_POLICY").as_deref() == Some(OsStr::new("fast"))
+        var_os("C2RUST_POLICY").as_deref() != Some(OsStr::new("safe"))
     }
 
     fn get_files(&mut self) -> Result<()> {
