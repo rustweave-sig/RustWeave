@@ -1,4 +1,4 @@
-use crate::{Feature, File, Result, ToError};
+use crate::{Feature, File, Result, ToError, SAFE_POINTER};
 use hierr::Error;
 use quote::quote;
 use std::collections::{HashMap, HashSet};
@@ -6,40 +6,121 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{
+    punctuated::Pair,
     visit::{visit_foreign_item, visit_item, Visit},
     visit_mut::{visit_item_mut, VisitMut},
 };
 use walkdir::WalkDir;
 
-struct NormalizeFile;
+struct NormalizeFile(HashSet<String>);
 
-// _c2rust_private_xxxx_symbol需要更名为symbol
+impl NormalizeFile {
+    fn new() -> Self {
+        let mut names = HashSet::new();
+        names.insert("crate".to_string());
+        names.insert("super".to_string());
+        Self(names)
+    }
+    fn normalize_use_path(&mut self, path: &mut syn::UsePath) {
+        match &mut *path.tree {
+            syn::UseTree::Path(sub) => {
+                if Self::is_var_fun_ident(&sub.ident) {
+                    *path.tree = *sub.tree.clone();
+                    return;
+                }
+                self.normalize_use_path(sub)
+            }
+            syn::UseTree::Name(name) => {
+                if let Some(rename) = Self::normalize_use_name(name) {
+                    *path.tree = syn::parse2(quote! { {#rename} }).unwrap();
+                } else {
+                    self.0.insert(name.ident.to_string());
+                }
+            }
+            syn::UseTree::Rename(rename) => {
+                if let Some(new_rename) = Self::normalize_use_rename(rename) {
+                    *path.tree = syn::parse2(quote! { {#new_rename} }).unwrap();
+                } else {
+                    self.0.insert(rename.rename.to_string());
+                }
+            }
+            syn::UseTree::Glob(_) => {}
+            syn::UseTree::Group(grp) => {
+                self.normalize_use_group(grp);
+            }
+        }
+    }
+
+    fn normalize_use_group(&mut self, grp: &mut syn::UseGroup) {
+        for tree in grp.items.iter_mut() {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    if Self::is_var_fun_ident(&path.ident) {
+                        *tree = *path.tree.clone();
+                        continue;
+                    }
+                    self.normalize_use_path(path);
+                }
+                syn::UseTree::Name(name) => {
+                    if let Some(rename) = Self::normalize_use_name(name) {
+                        *tree = rename;
+                    }
+                }
+                syn::UseTree::Rename(rename) => {
+                    if let Some(rename) = Self::normalize_use_rename(rename) {
+                        *tree = rename;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn normalize_use_name(name: &syn::UseName) -> Option<syn::UseTree> {
+        let name = name.ident.to_string();
+        if Self::is_var_fun_name(&name) {
+            return Some(syn::parse_str(&format!("self as {name}")).unwrap());
+        }
+        None
+    }
+
+    fn normalize_use_rename(rename: &syn::UseRename) -> Option<syn::UseTree> {
+        if Self::is_var_fun_ident(&rename.ident) {
+            return Some(
+                syn::parse_str(&format!("self as {}", rename.rename.to_string())).unwrap(),
+            );
+        }
+        None
+    }
+
+    fn is_var_fun_ident(ident: &syn::Ident) -> bool {
+        Self::is_var_fun_name(&ident.to_string())
+    }
+
+    fn is_var_fun_name(name: &str) -> bool {
+        name.starts_with("fun_") || name.starts_with("var_")
+    }
+}
+// 合并后没有var_和fun_开头的模块, 需要从UsePath和Path中删除.
 impl VisitMut for NormalizeFile {
-    fn visit_ident_mut(&mut self, ident: &mut syn::Ident) {
-        let name = ident.to_string();
-        if name.starts_with("_c2rust_private_") {
-            *ident = syn::Ident::new(name.splitn(5, '_').last().unwrap(), ident.span());
+    fn visit_use_path_mut(&mut self, path: &mut syn::UsePath) {
+        // 可能是如下几种形式:
+        // use crate::mod_xxx::var_xxx -> use crate::mod_xxx::{self as var_xxx};
+        // use crate::mod_xxx::var_xxx as xxx -> use crate::mod_xxx::{ self as xxx};
+        // use crate::mod_xxx::var_xxx::xxx -> user crate::mod_xxx::xxx;
+        // use crate::mod_xxx::{var_xxx, fun_xxx::xxx} -> use crate::mod_xxx::{self as var_xxx, xxx};
+        // use crate::mod_xxx;
+        // use mod_xxx::var_xxx;
+        if self.0.contains(&path.ident.to_string()) {
+            self.normalize_use_path(path);
         }
     }
 
-    fn visit_use_rename_mut(&mut self, rename: &mut syn::UseRename) {
-        // 遇到过有大模型生成use _c2rust_private_xxxx_symbol as symbol的场景.
-        let name = rename.ident.to_string();
-        if !name.starts_with("_c2rust_private_") {
-            return;
-        }
-        let name = name.splitn(5, '_').last().unwrap();
-        rename.ident = syn::Ident::new(name, rename.ident.span());
-        if rename.rename.to_string() == name {
-            rename.rename = syn::Ident::new("_", rename.rename.span());
-        }
-    }
-
-    // 对于宏只能通过字符串替换, 未处理 use _c2rust_private_xxx_symbol as symbol的场景.
+    // 对于宏只能通过字符串替换, 只能处理<::var_xxx>的场景, 存在误伤的可能性. 出现就只能手工修改了.
     fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
         let mut macro_str = mac.tokens.to_string();
         let mut changed = false;
-        let regex = regex::Regex::new(r"_c2rust_private_[^_]+_").unwrap();
+        let regex = regex::Regex::new(r"::(var|fun)_[^:\s]+").unwrap();
         while let Some(m) = regex.find(&macro_str) {
             macro_str.replace_range(m.start()..m.start() + m.len(), "");
             changed = true;
@@ -48,6 +129,28 @@ impl VisitMut for NormalizeFile {
             use std::str::FromStr;
             mac.tokens = proc_macro2::TokenStream::from_str(&macro_str).unwrap();
         }
+    }
+
+    fn visit_path_mut(&mut self, path: &mut syn::Path) {
+        // path出现的时候，只能是crate::mod_xxx::var_xxxx::var
+        let len = path.segments.len();
+        if len < 3 {
+            return;
+        }
+        let root = path.segments.get(0).unwrap();
+        if self.0.contains(&root.ident.to_string()) {
+            return;
+        }
+        let last_mod = path.segments.get(len - 2).unwrap();
+        if !NormalizeFile::is_var_fun_ident(&last_mod.ident) {
+            return;
+        }
+        let last = match path.segments.pop().unwrap() {
+            Pair::Punctuated(val, _) => val,
+            Pair::End(val) => val,
+        };
+        path.segments.pop();
+        path.segments.push(last);
     }
 }
 
@@ -104,7 +207,7 @@ impl Feature {
 
         self.merge_types_rs(&types_rs_files, &mut used_names)?;
 
-        self.link_lib_rs()?;
+        self.link_src()?;
 
         println!("Feature '{}' merged successfully", self.name);
         Ok(())
@@ -139,7 +242,7 @@ impl Feature {
         // 解析所有rs文件，合并内容
         let mut items = Self::parse_rust_files(&rs_files)?;
         // 规范化处理rs文件.
-        let mut normalize = NormalizeFile;
+        let mut normalize = NormalizeFile::new();
         let mut depend = DepNames(used_names);
         for item in items.iter_mut() {
             visit_item_mut(&mut normalize, item);
@@ -157,15 +260,13 @@ impl Feature {
         let formatted = prettyplease::unparse(&merged_file);
         let content = format!("use super::*;\n\n{}", formatted);
 
-        let mod_name = Self::get_merged_mod_name(&self.prefix, file)?;
-        let mod_path = self
-            .root
-            .join("rust/src")
-            .join(&mod_name)
-            .with_extension("rs");
-        fs::write(&mod_path, content.as_bytes()).log_err(&format!("write {mod_name}.rs"))?;
+        let merged_mod_dir = self.root.join("rust/src.2");
+        fs::create_dir(&merged_mod_dir).to_err()?;
+        let merged_rs = merged_mod_dir.join(&mod_name).with_extension("rs");
+        fs::write(&merged_rs, content.as_bytes())
+            .log_err(&format!("write {}", merged_rs.display()))?;
 
-        println!("File merged successfully: {}", mod_path.display());
+        println!("File merged successfully: {}", merged_rs.display());
 
         Ok(true)
     }
@@ -352,7 +453,7 @@ impl Feature {
         let mut merged_foreign_mod = None;
 
         for types_file in types_files {
-            println!("Parsing c2rust_types.rs: {}", types_file.display());
+            println!("Parsing mod.rs: {}", types_file.display());
             let content = fs::read_to_string(types_file).to_err()?;
             let ast = syn::parse_file(&content).map_err(|e| {
                 eprintln!("Failed to parse {}: {}", types_file.display(), e);
@@ -424,29 +525,28 @@ impl Feature {
         content.push_str("#![allow(non_camel_case_types)]\n");
         content.push_str("#![allow(non_snake_case)]\n");
         content.push_str("#![allow(non_upper_case_globals)]\n");
-        content.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
+        content.push_str("#![allow(dead_code)]\n");
+        content.push_str("#![allow(unused_imports)]\n");
+        content.push_str(SAFE_POINTER);
         content.push_str("use core::ffi::*;\n");
         content.push('\n');
         content.push_str(&formatted);
         content.push('\n');
         for file in &self.files {
-            let mod_name = Self::get_merged_mod_name(&self.prefix, file)?;
+            let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
             content.push_str("mod ");
             content.push_str(&mod_name);
-            content.push_str(";\nuse ");
+            content.push_str(";\npub use ");
             content.push_str(&mod_name);
             content.push_str("::*;\n");
         }
 
         // 写入src/lib.rs
-        let merge_dir = self.root.join("rust/src");
-        let lib_rs_path = merge_dir.join("lib.rs.2");
-        fs::write(&lib_rs_path, content.as_bytes()).log_err("write lib.rs.2")?;
+        let merge_dir = self.root.join("rust/src.2");
+        let lib_rs_path = merge_dir.join("lib.rs");
+        fs::write(&lib_rs_path, content.as_bytes()).log_err("write src.2/lib.rs")?;
 
-        println!(
-            "Merged c2rust_types.rs written to: {}",
-            lib_rs_path.display()
-        );
+        println!("Merged mod.rs written to: {}", lib_rs_path.display());
 
         Ok(())
     }
@@ -479,17 +579,88 @@ impl Feature {
         });
     }
 
-    fn link_lib_rs(&self) -> Result<()> {
-        let lib = self.root.join("rust/src/lib.rs");
-        if lib.is_symlink() {
-            fs::remove_file(&lib).log_err("remove link[lib.rs]")?;
+    fn link_src(&self) -> Result<()> {
+        let src = self.root.join("rust/src");
+        if src.is_symlink() {
+            fs::remove_file(&src).log_err("remove link[rust/src]")?;
         } else {
-            let old_lib = self.root.join("rust/src/lib.rs.1");
-            let _ = fs::remove_file(&old_lib);
-            let _ = fs::rename(&lib, &old_lib).log_err("rename[lib.rs -> lib.rs.1]")?;
+            let old_src = self.root.join("rust/src.1");
+            let _ = fs::remove_dir_all(&old_src);
+            let _ = fs::rename(&src, &old_src).log_err("rename[src -> src.1]")?;
         }
-        let new_lib = self.root.join("rust/src/lib.rs.2");
-        let _ = std::os::unix::fs::symlink(new_lib, lib).log_err("link[lib.rs -> lib.rs.2]")?;
+        let new_src = self.root.join("rust/src.2");
+        let _ = std::os::unix::fs::symlink(new_src, src).log_err("link[src -> src.2]")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use quote::ToTokens;
+    use syn::visit_mut::visit_item_use_mut;
+    #[test]
+    fn test1() {
+        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx::var_xxx::xxx;").unwrap();
+        let expect: syn::ItemUse = syn::parse_str("use crate::mod_xxx::xxx;").unwrap();
+        visit_item_use_mut(&mut NormalizeFile::new(), &mut path);
+        assert_eq!(
+            path.to_token_stream().to_string(),
+            expect.to_token_stream().to_string()
+        );
+    }
+    #[test]
+    fn test2() {
+        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx::var_xxx;").unwrap();
+        let expect: syn::ItemUse =
+            syn::parse_str("use crate::mod_xxx::{self as var_xxx};").unwrap();
+        visit_item_use_mut(&mut NormalizeFile::new(), &mut path);
+        assert_eq!(
+            path.to_token_stream().to_string(),
+            expect.to_token_stream().to_string()
+        );
+    }
+    #[test]
+    fn test3() {
+        let mut path: syn::ItemUse =
+            syn::parse_str("use crate::mod_xxx::{var_xxx, fun_xxx as xxx, fun_yyy::yyy};").unwrap();
+        let expect: syn::ItemUse =
+            syn::parse_str("use crate::mod_xxx::{self as var_xxx, self as xxx, yyy};").unwrap();
+        visit_item_use_mut(&mut NormalizeFile::new(), &mut path);
+        assert_eq!(
+            path.to_token_stream().to_string(),
+            expect.to_token_stream().to_string()
+        );
+    }
+
+    #[test]
+    fn test4() {
+        let mut normalize = NormalizeFile::new();
+        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx;").unwrap();
+        visit_item_use_mut(&mut normalize, &mut path);
+        let mut path: syn::ItemUse =
+            syn::parse_str("use mod_xxx::{var_xxx, fun_xxx as xxx, fun_yyy::yyy};").unwrap();
+        let expect: syn::ItemUse =
+            syn::parse_str("use mod_xxx::{self as var_xxx, self as xxx, yyy};").unwrap();
+        visit_item_use_mut(&mut normalize, &mut path);
+        assert_eq!(
+            path.to_token_stream().to_string(),
+            expect.to_token_stream().to_string()
+        );
+    }
+    #[test]
+    fn test5() {
+        let mut normalize = NormalizeFile::new();
+        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx as zzz;").unwrap();
+        visit_item_use_mut(&mut normalize, &mut path);
+        let mut path: syn::ItemUse =
+            syn::parse_str("use zzz::{var_xxx, fun_xxx as xxx, fun_yyy::yyy};").unwrap();
+        let expect: syn::ItemUse =
+            syn::parse_str("use zzz::{self as var_xxx, self as xxx, yyy};").unwrap();
+        visit_item_use_mut(&mut normalize, &mut path);
+        assert_eq!(
+            path.to_token_stream().to_string(),
+            expect.to_token_stream().to_string()
+        );
     }
 }
