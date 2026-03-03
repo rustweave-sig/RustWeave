@@ -2,7 +2,7 @@ use crate::{get_root, File, Node, Result, ToError};
 use hierr::Error;
 use higuard::Guard;
 use quote::{quote, ToTokens};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::var_os;
 use std::ffi::OsStr;
 use std::fs;
@@ -105,6 +105,11 @@ impl Feature {
         }
     }
 
+    pub fn decl_filename(name: &str) -> String {
+        let name = Self::normalize_name(name);
+        format!("decl_{name}.rs")
+    }
+
     ///
     /// 如果全部初始化成功才删除已经存在的内容.
     ///
@@ -186,10 +191,10 @@ impl Feature {
                 let prefixed_name = Self::prefixed_filename(node)?;
 
                 // 构建对应的Rust文件路径
-                let rust_file_path = mod_dir.join(&prefixed_name).with_extension("rs");
+                let rust_file = mod_dir.join(&prefixed_name).with_extension("rs");
 
                 // 检查文件内容是否为空（去除空白字符后）
-                let not_empty = Self::validate_file(&rust_file_path, name, &prefixed_name)?;
+                let not_empty = Self::validate_file(&rust_file, name, &prefixed_name)?;
                 if not_empty {
                     translated.insert(Self::normalize_name(name).to_string(), prefixed_name);
                 }
@@ -263,7 +268,6 @@ impl Feature {
         code.push_str("#![allow(non_upper_case_globals)]\n");
         // 会生成_Float128浮点数的API，先抑制这类告警.
         code.push_str("#![allow(improper_ctypes)]\n");
-        // 提示词可以简化为任何未知类型都从super::<name>导入.
         code.push_str("#![allow(unused_imports)]\n");
         code.push_str("#![allow(dead_code)]\n");
         code.push_str("use core::ffi::*;\n");
@@ -326,7 +330,7 @@ impl Feature {
                 eprintln!("don't find ffi function {name}");
                 return Err(Error::inval());
             };
-            let decl_file = format!("decl_{}.rs", &prefixed_name[4..]);
+            let decl_file = Self::decl_filename(&name);
             let decl_file = mod_dir.join(decl_file);
             let _ =
                 fs::write(&decl_file, decl).log_err(&format!("write {}", decl_file.display()))?;
@@ -376,7 +380,7 @@ impl Feature {
     fn normalize_mod_rs(&self, mod_dir: &Path, nodes: &HashMap<&str, &Node>) -> Result<()> {
         let mod_rs = mod_dir.join("mod.rs");
         let content = fs::read_to_string(&mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
-        let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
+        let mut ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
         struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>, bool);
         // _c2rust_private_仅仅体现在导出符号名中，本模块的代码仍然看到的是C代码中的名字.
         // 本目录下生成的C源码也要删除掉_c2rust_private_前缀
@@ -443,7 +447,8 @@ impl Feature {
         let normalized_rs = mod_rs.with_extension("normalized");
         let content = fs::read_to_string(&normalized_rs)
             .log_err(&format!("read {}", normalized_rs.display()))?;
-        let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
+        let mut ast =
+            syn::parse_file(&content).log_err(&format!("parse {}", normalized_rs.display()))?;
         for item in &mut ast.items {
             let syn::Item::ForeignMod(item) = item else {
                 continue;
@@ -510,7 +515,8 @@ impl Feature {
         let normalized_rs = mod_dir.join("mod.normalized");
         let content = fs::read_to_string(&normalized_rs)
             .log_err(&format!("read {}", normalized_rs.display()))?;
-        let ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
+        let ast =
+            syn::parse_file(&content).log_err(&format!("parse {}", normalized_rs.display()))?;
         struct Visitor<'a>(HashMap<String, String>, &'a str);
         let mut visitor = Visitor(HashMap::new(), &content);
         impl Visit<'_> for Visitor<'_> {
@@ -577,14 +583,13 @@ impl Feature {
             return Ok(false);
         }
 
-        // 并不是有效的rust代码直接清空.
-        let mut ast = match syn::parse_file(&content) {
-            Ok(ast) => ast,
-            Err(e) => {
-                eprintln!("*** parse rust file failed: {e}\n{content}");
-                return Ok(false);
-            }
+        let Ok(mut ast) = syn::parse_file(&content)
+            .log(|e| eprintln!("parse {} -> {}", file.display(), e.into_compile_error()))
+        else {
+            // 大模型生成的代码语法错误，需要大模型修正，直接返回.
+            return Ok(true);
         };
+        Self::remove_foreign_mod(&mut ast, &file.with_file_name("mod.rs"))?;
 
         let is_fun = prefix.starts_with("fun_");
         let name = Self::normalize_name(link_name);
@@ -608,7 +613,7 @@ impl Feature {
         Ok(true)
     }
 
-    fn validate_fun(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
+    fn has_ptr_arg(sig: &syn::Signature) -> bool {
         struct Visitor(bool);
         impl Visit<'_> for Visitor {
             fn visit_return_type(&mut self, _: &syn::ReturnType) {}
@@ -617,13 +622,15 @@ impl Feature {
             }
         }
 
+        let mut visitor = Visitor(false);
+        visit_signature(&mut visitor, sig);
+        visitor.0
+    }
+
+    fn validate_fun(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
         let mut main_item = None;
-        let mut is_unsafe = false;
         ast.items.iter_mut().any(|item| match item {
             syn::Item::Fn(item) if item.sig.ident.to_string() == name => {
-                let mut visitor = Visitor(false);
-                visit_signature(&mut visitor, &item.sig);
-                is_unsafe = visitor.0;
                 main_item = Some(item);
                 true
             }
@@ -632,6 +639,7 @@ impl Feature {
         let Some(main_item) = main_item else {
             return Err(Error::inval());
         };
+        let is_unsafe = Self::has_ptr_arg(&main_item.sig);
         // 确保abi等满足要求.
         let mut is_changed = Self::remove_no_mangle_attr(&mut main_item.attrs);
         if main_item.sig.unsafety.is_some() ^ is_unsafe {
@@ -711,5 +719,34 @@ impl Feature {
             !s.contains("no_mangle")
         });
         len != attrs.len()
+    }
+
+    fn remove_foreign_mod(ast: &mut syn::File, mod_rs: &Path) -> Result<()> {
+        let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
+        let mod_ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
+        struct Visitor(HashSet<String>);
+        impl Visit<'_> for Visitor {
+            fn visit_foreign_item_fn(&mut self, f: &syn::ForeignItemFn) {
+                self.0.insert(f.sig.ident.to_string());
+            }
+            fn visit_foreign_item_static(&mut self, v: &syn::ForeignItemStatic) {
+                self.0.insert(v.ident.to_string());
+            }
+        }
+        let mut ffi_names = Visitor(HashSet::new());
+        visit_file(&mut ffi_names, &mod_ast);
+
+        impl VisitMut for Visitor {
+            fn visit_item_foreign_mod_mut(&mut self, m: &mut syn::ItemForeignMod) {
+                m.items.retain(|item| match item {
+                    syn::ForeignItem::Fn(f) => !self.0.contains(&f.sig.ident.to_string()),
+                    syn::ForeignItem::Static(v) => !self.0.contains(&v.ident.to_string()),
+                    _ => true,
+                });
+            }
+        }
+        visit_file_mut(&mut ffi_names, ast);
+
+        Ok(())
     }
 }
