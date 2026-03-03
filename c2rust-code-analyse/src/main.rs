@@ -8,14 +8,26 @@ mod feature;
 use feature::*;
 mod merge;
 
-trait ToError<T> {
+trait ToError<T, E> {
     fn log_err(self, info: &str) -> Result<T>;
+    fn log<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce(E);
 }
 
-impl<T, E: core::error::Error> ToError<T> for core::result::Result<T, E> {
+impl<T, E: core::error::Error> ToError<T, E> for core::result::Result<T, E> {
     fn log_err(self, info: &str) -> Result<T> {
         self.map_err(|e| {
             eprintln!("Error--> {} : {info}", e);
+            Error::last()
+        })
+    }
+    fn log<F>(self, f: F) -> Result<T>
+    where
+        F: FnOnce(E),
+    {
+        self.map_err(|e| {
+            f(e);
             Error::last()
         })
     }

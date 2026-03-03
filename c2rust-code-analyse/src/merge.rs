@@ -1,5 +1,4 @@
 use crate::{Feature, File, Result, ToError};
-use hierr::Error;
 use quote::quote;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -199,13 +198,13 @@ impl Feature {
         }
 
         // 首先收集所有模块的c2rust_types.rs文件路径
-        let types_rs_files = self.collect_types_rs_files()?;
+        let mod_rs_files = self.collect_mod_rs_files()?;
         println!(
             "Found {} c2rust_types.rs files to merge",
-            types_rs_files.len()
+            mod_rs_files.len()
         );
 
-        self.merge_types_rs(&types_rs_files, &mut used_names)?;
+        self.merge_mod_rs(&mod_rs_files, &mut used_names)?;
 
         self.link_src()?;
 
@@ -295,11 +294,9 @@ impl Feature {
     fn parse_rust_files(rs_files: &[PathBuf]) -> Result<Vec<syn::Item>> {
         let mut all_items = Vec::new();
         for rs_file in rs_files {
-            let content = fs::read_to_string(rs_file).log_err(&format!("read {}", rs_file.display()))?;
-            let ast = syn::parse_file(&content).map_err(|e| {
-                eprintln!("Failed to parse {}: {}", rs_file.display(), e);
-                Error::inval()
-            })?;
+            let content =
+                fs::read_to_string(rs_file).log_err(&format!("read {}", rs_file.display()))?;
+            let ast = syn::parse_file(&content).log_err(&format!("parse {}", rs_file.display()))?;
             // 去掉前缀var_或fun_的名字
             let file_name = rs_file
                 .with_extension("")
@@ -307,6 +304,9 @@ impl Feature {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
+            if !file_name.starts_with("fun_") && !file_name.starts_with("var_") {
+                continue;
+            }
             let main_item_name = &file_name[4..];
             let mut main_item = None;
             let mut other_items = Vec::new();
@@ -328,7 +328,12 @@ impl Feature {
                 }
             }
             if let Some(syn::Item::Fn(mut fn_item)) = main_item {
-                Self::move_items_2_fn(other_items, &mut fn_item);
+                let decl_file = Self::decl_filename(main_item_name);
+                Self::move_items_2_fn(
+                    other_items,
+                    &mut fn_item,
+                    &rs_file.with_file_name(decl_file),
+                )?;
                 all_items.push(syn::Item::Fn(fn_item));
             } else if let Some(syn::Item::Static(mut var_item)) = main_item {
                 Self::move_items_2_static(other_items, &mut var_item);
@@ -355,39 +360,29 @@ impl Feature {
         false
     }
 
-    fn move_items_2_fn(items: Vec<syn::Item>, fn_item: &mut syn::ItemFn) {
-        if fn_item
-            .sig
-            .ident
-            .to_string()
-            .starts_with("_c2rust_private_")
-        {
-            fn_item.vis = syn::Visibility::Inherited;
-            fn_item.attrs.clear();
-        }
+    fn move_items_2_fn(
+        items: Vec<syn::Item>,
+        fn_item: &mut syn::ItemFn,
+        decl_file: &Path,
+    ) -> Result<()> {
         if items.is_empty() {
-            return;
+            return Ok(());
         }
+        // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
+        let content =
+            fs::read_to_string(decl_file).log_err(&format!("read {}", decl_file.display()))?;
+        fn_item.sig = syn::parse_str(&content)
+            .log_err(&format!("parse {} -> {content}", decl_file.display()))?;
         let block = &fn_item.block;
         let new_block = quote! {{
             #(#items)*
             #block
         }};
         fn_item.block = syn::parse2(new_block).unwrap();
+        Ok(())
     }
 
     fn move_items_2_static(items: Vec<syn::Item>, static_item: &mut syn::ItemStatic) {
-        // C的静态变量都是可写的.
-        // 可能翻译的时候忘记mut修饰符了.
-        static_item.mutability = syn::StaticMutability::Mut(syn::parse2(quote!(mut)).unwrap());
-        if static_item
-            .ident
-            .to_string()
-            .starts_with("_c2rust_private_")
-        {
-            static_item.vis = syn::Visibility::Inherited;
-            static_item.attrs.clear();
-        }
         if items.is_empty() {
             return;
         }
@@ -400,7 +395,7 @@ impl Feature {
     }
 
     /// 收集所有模块目录下的c2rust_types.rs文件
-    fn collect_types_rs_files(&self) -> Result<Vec<PathBuf>> {
+    fn collect_mod_rs_files(&self) -> Result<Vec<PathBuf>> {
         let mut types_files = Vec::new();
         let rust_src = self.root.join("rust/src");
 
@@ -415,7 +410,7 @@ impl Feature {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if entry.depth() == 2 && path.file_name() == Some(OsStr::new("c2rust_types.rs")) {
+            if entry.depth() == 2 && path.file_name() == Some(OsStr::new("mod.rs")) {
                 types_files.push(path.to_path_buf());
             }
         }
@@ -442,7 +437,7 @@ impl Feature {
     }
 
     /// 合并所有c2rust_types.rs文件，去重后写入src/lib.rs
-    fn merge_types_rs(
+    fn merge_mod_rs(
         &self,
         types_files: &[PathBuf],
         used_names: &mut HashSet<String>,
@@ -454,11 +449,10 @@ impl Feature {
 
         for types_file in types_files {
             println!("Parsing mod.rs: {}", types_file.display());
-            let content = fs::read_to_string(types_file).log_err(&format!("read {}", types_file.display()))?;
-            let ast = syn::parse_file(&content).map_err(|e| {
-                eprintln!("Failed to parse {}: {}", types_file.display(), e);
-                Error::inval()
-            })?;
+            let content = fs::read_to_string(types_file)
+                .log_err(&format!("read {}", types_file.display()))?;
+            let ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", types_file.display()))?;
 
             for mut item in ast.items {
                 // 收集extern块
