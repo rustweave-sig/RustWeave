@@ -95,14 +95,14 @@ impl Feature {
     }
 
     // 根据节点类型生成带前缀的文件名
-    fn prefixed_filename(node: &crate::Node) -> Option<String> {
-        let name = node.kind.name()?;
-        let prefixed_name = match node.kind {
-            crate::Kind::VarDecl(_) => format!("var_{}", name),
-            crate::Kind::FunctionDecl(_) => format!("fun_{}", name),
-            _ => name.to_string(),
-        };
-        Some(prefixed_name)
+    fn prefixed_filename(node: &crate::Node) -> Result<String> {
+        let name = node.kind.name().ok_or(Error::inval())?;
+        let name = Self::normalize_name(name);
+        match node.kind {
+            crate::Kind::VarDecl(_) => Ok(format!("var_{}", name)),
+            crate::Kind::FunctionDecl(_) => Ok(format!("fun_{}", name)),
+            _ => Err(Error::inval()),
+        }
     }
 
     ///
@@ -183,8 +183,7 @@ impl Feature {
                 };
 
                 // 根据节点类型添加前缀
-                let prefixed_name =
-                    Self::prefixed_filename(node).unwrap_or_else(|| name.to_string());
+                let prefixed_name = Self::prefixed_filename(node)?;
 
                 // 构建对应的Rust文件路径
                 let rust_file_path = mod_dir.join(&prefixed_name).with_extension("rs");
@@ -278,10 +277,8 @@ impl Feature {
             code.push_str(&mod_name);
             code.push_str(";\n");
         }
-        fs::write(self.root.join("rust/src/lib.rs"), code.as_bytes()).log_err(&format!(
-            "write {}",
-            self.root.join("rust/src/lib.rs").display()
-        ))?;
+        let lib_rs = self.root.join("rust/src/lib.rs");
+        fs::write(&lib_rs, code.as_bytes()).log_err(&format!("write {}", lib_rs.display()))?;
         Ok(())
     }
 
@@ -317,13 +314,9 @@ impl Feature {
         let c_root = self.root.join("c");
         for (name, node) in nodes {
             // 根据节点类型添加前缀
-            let prefixed_name = Self::prefixed_filename(node).unwrap_or_else(|| name.to_string());
-            fs::File::create(mod_dir.join(&prefixed_name).with_extension("rs")).log_err(
-                &format!(
-                    "create {}",
-                    mod_dir.join(&prefixed_name).with_extension("rs").display()
-                ),
-            )?;
+            let prefixed_name = Self::prefixed_filename(node)?;
+            let rs_file = mod_dir.join(&prefixed_name).with_extension("rs");
+            fs::File::create(&rs_file).log_err(&format!("create {}", rs_file.display()))?;
             let c_code = Self::normalize_c_code(node.kind.c_code(&c_root)?);
             let c_file = mod_dir.join(&prefixed_name).with_extension("c");
             fs::write(&c_file, c_code.as_bytes())
@@ -435,10 +428,11 @@ impl Feature {
         let formatted = prettyplease::unparse(&ast);
         fs::write(&mod_rs, formatted.as_bytes()).log_err(&format!("write {}", mod_rs.display()))?;
         // 保存一个备份，后续更新的时候需要.
-        fs::copy(&mod_rs, mod_rs.with_extension("normalized")).log_err(&format!(
+        let normalized_rs = mod_rs.with_extension("normalized");
+        fs::copy(&mod_rs, &normalized_rs).log_err(&format!(
             "copy {} -> {}",
             mod_rs.display(),
-            mod_rs.with_extension("normalized").display()
+            normalized_rs.display()
         ))?;
         Ok(())
     }
@@ -446,10 +440,9 @@ impl Feature {
     fn update_mod_rs(mod_dir: &Path, translated: HashMap<String, String>) -> Result<()> {
         let mod_rs = mod_dir.join("mod.rs");
         // 需要从备份文件中读取完整信息
-        let content = fs::read_to_string(mod_rs.with_extension("normalized")).log_err(&format!(
-            "read {}",
-            mod_rs.with_extension("normalized").display()
-        ))?;
+        let normalized_rs = mod_rs.with_extension("normalized");
+        let content = fs::read_to_string(&normalized_rs)
+            .log_err(&format!("read {}", normalized_rs.display()))?;
         let mut ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
         for item in &mut ast.items {
             let syn::Item::ForeignMod(item) = item else {
@@ -514,10 +507,9 @@ impl Feature {
     }
 
     fn get_ffi_decl(mod_dir: &Path) -> Result<HashMap<String, String>> {
-        let content = fs::read_to_string(mod_dir.join("mod.normalized")).log_err(&format!(
-            "read {}",
-            mod_dir.join("mod.normalized").display()
-        ))?;
+        let normalized_rs = mod_dir.join("mod.normalized");
+        let content = fs::read_to_string(&normalized_rs)
+            .log_err(&format!("read {}", normalized_rs.display()))?;
         let ast = syn::parse_file(&content).map_err(|_| Error::inval())?;
         struct Visitor<'a>(HashMap<String, String>, &'a str);
         let mut visitor = Visitor(HashMap::new(), &content);
@@ -575,7 +567,7 @@ impl Feature {
     }
 
     // 大模型返回的文件可能不符合要求, 或者被意外破坏，需要修正.
-    fn validate_file(file: &Path, name: &str, prefix: &str) -> Result<bool> {
+    fn validate_file(file: &Path, link_name: &str, prefix: &str) -> Result<bool> {
         if !file.exists() {
             return Ok(true);
         }
@@ -595,11 +587,11 @@ impl Feature {
         };
 
         let is_fun = prefix.starts_with("fun_");
-        let name = Self::normalize_name(name);
+        let name = Self::normalize_name(link_name);
         let is_changed = if is_fun {
-            Self::validate_fun(&mut ast, name, &prefix[4..])
+            Self::validate_fun(&mut ast, name, link_name)
         } else {
-            Self::validate_var(&mut ast, name, &prefix[4..])
+            Self::validate_var(&mut ast, name, link_name)
         };
 
         let Ok(is_changed) = is_changed else {
