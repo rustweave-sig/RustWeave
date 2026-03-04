@@ -1,5 +1,5 @@
 use crate::{Error, Feature, File, Result, ToError};
-use quote::quote;
+use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -356,14 +356,14 @@ impl Feature {
             }
             if let Some(syn::Item::Fn(mut fn_item)) = main_item {
                 let decl_file = Self::decl_filename(main_item_name);
-                Self::move_items_2_fn(
+                Self::merge_item_fn(
                     other_items,
                     &mut fn_item,
                     &rs_file.with_file_name(decl_file),
                 )?;
                 all_items.push(syn::Item::Fn(fn_item));
             } else if let Some(syn::Item::Static(mut var_item)) = main_item {
-                Self::move_items_2_static(other_items, &mut var_item);
+                Self::merge_item_static(other_items, &mut var_item);
                 all_items.push(syn::Item::Static(var_item));
             } else {
                 eprintln!(
@@ -387,13 +387,14 @@ impl Feature {
         false
     }
 
-    fn move_items_2_fn(
+    fn merge_item_fn(
         items: Vec<syn::Item>,
         fn_item: &mut syn::ItemFn,
         decl_file: &Path,
     ) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
+        if Self::remove_private_attr(&mut fn_item.attrs) {
+            fn_item.vis = syn::Visibility::Inherited;
+            fn_item.sig.abi = None;
         }
         // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
         let content =
@@ -403,6 +404,9 @@ impl Feature {
         new_sig.unsafety = fn_item.sig.unsafety;
         new_sig.abi = fn_item.sig.abi.clone();
         fn_item.sig = new_sig;
+        if items.is_empty() {
+            return Ok(());
+        }
         let block = &fn_item.block;
         let new_block = quote! {{
             #(#items)*
@@ -412,7 +416,10 @@ impl Feature {
         Ok(())
     }
 
-    fn move_items_2_static(items: Vec<syn::Item>, static_item: &mut syn::ItemStatic) {
+    fn merge_item_static(items: Vec<syn::Item>, static_item: &mut syn::ItemStatic) {
+        if Self::remove_private_attr(&mut static_item.attrs) {
+            static_item.vis = syn::Visibility::Inherited;
+        }
         if items.is_empty() {
             return;
         }
@@ -622,6 +629,15 @@ impl Feature {
         let new_src = self.root.join("rust/src.2");
         let _ = std::os::unix::fs::symlink(new_src, src).log_err("link[src -> src.2]")?;
         Ok(())
+    }
+
+    fn remove_private_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
+        let len = attrs.len();
+        attrs.retain(|attr| {
+            let s = attr.to_token_stream().to_string();
+            !s.contains("_c2rust_private_")
+        });
+        len != attrs.len()
     }
 }
 
