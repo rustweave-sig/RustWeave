@@ -1,4 +1,4 @@
-use crate::{Feature, File, Result, ToError};
+use crate::{Error, Feature, File, Result, ToError};
 use quote::quote;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -153,9 +153,29 @@ impl VisitMut for NormalizeFile {
     }
 }
 
-struct DepNames<'a>(&'a mut HashSet<String>);
+struct DepNames {
+    used_names: HashSet<String>,
+    mac_tokens: String,
+}
 
-impl Visit<'_> for DepNames<'_> {
+impl DepNames {
+    fn new() -> Self {
+        Self {
+            used_names: HashSet::new(),
+            mac_tokens: String::new(),
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        if self.used_names.contains(name) {
+            return true;
+        }
+        let regex = regex::Regex::new(&format!("[^a-zA-Z_]{name}[^a-zA-Z_]")).unwrap();
+        regex.find(&self.mac_tokens).is_some()
+    }
+}
+
+impl Visit<'_> for DepNames {
     // 类型
     fn visit_type_path(&mut self, ty: &syn::TypePath) {
         let Some(ident) = ty.path.segments.last() else {
@@ -163,7 +183,7 @@ impl Visit<'_> for DepNames<'_> {
         };
         let name = ident.ident.to_string();
         if !name.starts_with("_c2rust_private_") {
-            self.0.insert(name);
+            self.used_names.insert(name);
         }
     }
 
@@ -174,8 +194,13 @@ impl Visit<'_> for DepNames<'_> {
         };
         let name = ident.ident.to_string();
         if !name.starts_with("_c2rust_private_") {
-            self.0.insert(name);
+            self.used_names.insert(name);
         }
+    }
+
+    // macro只能通过字符串匹配
+    fn visit_macro(&mut self, mac: &syn::Macro) {
+        self.mac_tokens.push_str(&mac.tokens.to_string());
     }
 }
 
@@ -185,26 +210,28 @@ impl Feature {
     /// 1. 依赖的外表FFI声明去重
     /// 1. 根据名字恢复C代码中符号可见性
     /// 1. 合并后需要编译，可能存在因为符号冲突导致的编译错误，需要手工修正.
-    /// 1. 合并各个模块的c2rust_types.rs文件，去重后写入src/lib.rs
+    /// 1. 合并各个模块的mod.rs文件，去重后写入src/lib.rs
     pub fn merge(&mut self) -> Result<()> {
         println!("Starting merge for feature '{}'", self.name);
 
         // 简化处理不区分名字空间，可能会导致实际未使用的符号仍然保留下来，可以接受.
-        let mut used_names = HashSet::new();
+        let mut dep = DepNames::new();
 
         // 处理每个file的Rust文件合并
         for file in &self.files {
-            self.merge_file(file, &mut used_names)?;
+            self.merge_file(file, &mut dep)?;
         }
 
-        // 首先收集所有模块的c2rust_types.rs文件路径
+        // 首先收集所有模块的mod.rs文件路径
         let mod_rs_files = self.collect_mod_rs_files()?;
-        println!(
-            "Found {} c2rust_types.rs files to merge",
-            mod_rs_files.len()
-        );
 
-        self.merge_mod_rs(&mod_rs_files, &mut used_names)?;
+        println!("Found {} mod.rs files to merge", mod_rs_files.len());
+
+        if mod_rs_files.is_empty() {
+            return Err(Error::inval());
+        }
+
+        self.merge_mod_rs(&mod_rs_files, &mut dep)?;
 
         self.link_src()?;
 
@@ -213,7 +240,7 @@ impl Feature {
     }
 
     // 合并单个File对应的Rust文件
-    fn merge_file(&self, file: &File, used_names: &mut HashSet<String>) -> Result<bool> {
+    fn merge_file(&self, file: &File, dep: &mut DepNames) -> Result<bool> {
         // 获取File对应的mod目录名
         let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
         let mod_dir = self.root.join("rust/src").join(&mod_name);
@@ -227,25 +254,24 @@ impl Feature {
         // 收集目录下的所有.rs文件（排除mod.rs）
         let rs_files = Self::collect_rust_files(&mod_dir)?;
 
-        // 如果没有rs文件，跳过
-        if rs_files.is_empty() {
-            return Ok(false);
-        }
-
         println!(
             "Merging {} .rs files for mod: {} ...",
             rs_files.len(),
             mod_name
         );
 
+        // 如果没有rs文件，跳过
+        if rs_files.is_empty() {
+            return Err(Error::inval());
+        }
+
         // 解析所有rs文件，合并内容
         let mut items = Self::parse_rust_files(&rs_files)?;
         // 规范化处理rs文件.
         let mut normalize = NormalizeFile::new();
-        let mut depend = DepNames(used_names);
         for item in items.iter_mut() {
             visit_item_mut(&mut normalize, item);
-            visit_item(&mut depend, item);
+            visit_item(dep, item);
         }
 
         // 创建合并后的文件AST
@@ -260,7 +286,8 @@ impl Feature {
         let content = format!("use super::*;\n\n{}", formatted);
 
         let merged_mod_dir = self.root.join("rust/src.2");
-        fs::create_dir(&merged_mod_dir).log_err(&format!("create {}", merged_mod_dir.display()))?;
+        // 可能已经存在
+        let _ = fs::create_dir(&merged_mod_dir);
         let merged_rs = merged_mod_dir.join(&mod_name).with_extension("rs");
         fs::write(&merged_rs, content.as_bytes())
             .log_err(&format!("write {}", merged_rs.display()))?;
@@ -371,8 +398,11 @@ impl Feature {
         // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
         let content =
             fs::read_to_string(decl_file).log_err(&format!("read {}", decl_file.display()))?;
-        fn_item.sig = syn::parse_str(&content)
+        let mut new_sig: syn::Signature = syn::parse_str(&content)
             .log_err(&format!("parse {} -> {content}", decl_file.display()))?;
+        new_sig.unsafety = fn_item.sig.unsafety;
+        new_sig.abi = fn_item.sig.abi.clone();
+        fn_item.sig = new_sig;
         let block = &fn_item.block;
         let new_block = quote! {{
             #(#items)*
@@ -394,7 +424,7 @@ impl Feature {
         static_item.expr = syn::parse2(new_expr).unwrap();
     }
 
-    /// 收集所有模块目录下的c2rust_types.rs文件
+    /// 收集所有模块目录下的mod.rs文件
     fn collect_mod_rs_files(&self) -> Result<Vec<PathBuf>> {
         let mut types_files = Vec::new();
         let rust_src = self.root.join("rust/src");
@@ -418,31 +448,27 @@ impl Feature {
         Ok(types_files)
     }
 
-    fn item_name(item: &syn::Item) -> String {
+    fn item_name(item: &syn::Item) -> Option<String> {
         match item {
-            syn::Item::Struct(item) => item.ident.to_string(),
-            syn::Item::Union(item) => item.ident.to_string(),
-            syn::Item::Const(item) => item.ident.to_string(),
-            syn::Item::Type(item) => item.ident.to_string(),
-            _ => unreachable!(),
+            syn::Item::Struct(item) => Some(item.ident.to_string()),
+            syn::Item::Union(item) => Some(item.ident.to_string()),
+            syn::Item::Const(item) => Some(item.ident.to_string()),
+            syn::Item::Type(item) => Some(item.ident.to_string()),
+            _ => None,
         }
     }
 
-    fn foreign_item_name(item: &syn::ForeignItem) -> String {
+    fn foreign_item_name(item: &syn::ForeignItem) -> Option<String> {
         match item {
-            syn::ForeignItem::Fn(item) => item.sig.ident.to_string(),
-            syn::ForeignItem::Static(item) => item.ident.to_string(),
-            _ => unreachable!(),
+            syn::ForeignItem::Fn(item) => Some(item.sig.ident.to_string()),
+            syn::ForeignItem::Static(item) => Some(item.ident.to_string()),
+            _ => None,
         }
     }
 
-    /// 合并所有c2rust_types.rs文件，去重后写入src/lib.rs
-    fn merge_mod_rs(
-        &self,
-        types_files: &[PathBuf],
-        used_names: &mut HashSet<String>,
-    ) -> Result<()> {
-        // 收集所有c2rust_types.rs的内容
+    /// 合并所有mod.rs文件，去重后写入src/lib.rs
+    fn merge_mod_rs(&self, types_files: &[PathBuf], dep: &mut DepNames) -> Result<()> {
+        // 收集所有mod.rs的内容
         let mut all_items = HashMap::new();
         let mut foreign_items = HashMap::new();
         let mut merged_foreign_mod = None;
@@ -458,12 +484,16 @@ impl Feature {
                 // 收集extern块
                 if let syn::Item::ForeignMod(ref mut foreign_mod) = item {
                     for item in foreign_mod.items.clone() {
-                        foreign_items.insert(Self::foreign_item_name(&item), item);
+                        if let Some(name) = Self::foreign_item_name(&item) {
+                            foreign_items.insert(name, item);
+                        }
                     }
                     foreign_mod.items = Vec::new();
                     merged_foreign_mod = Some(foreign_mod.clone());
                 } else {
-                    all_items.insert(Self::item_name(&item), item);
+                    if let Some(name) = Self::item_name(&item) {
+                        all_items.insert(name, item);
+                    }
                 }
             }
         }
@@ -495,7 +525,7 @@ impl Feature {
         Self::filter_merged_items(
             all_items,
             foreign_items,
-            used_names,
+            dep,
             &mut dep_items,
             &mut dep_foreign_items,
         );
@@ -546,26 +576,34 @@ impl Feature {
 
     fn filter_merged_items(
         mut all_items: HashMap<String, syn::Item>,
-        mut foreign_items: HashMap<String, syn::ForeignItem>,
-        used_names: &mut HashSet<String>,
+        foreign_items: HashMap<String, syn::ForeignItem>,
+        dep: &mut DepNames,
         dep_items: &mut Vec<syn::Item>,
         dep_foreign_items: &mut Vec<syn::ForeignItem>,
     ) {
-        while !used_names.is_empty() {
-            let mut dep_names = HashSet::new();
-            let mut depend = DepNames(&mut dep_names);
-            for name in used_names.iter() {
-                if let Some(item) = all_items.remove(name) {
-                    visit_item(&mut depend, &item);
-                    dep_items.push(item);
-                }
-                if let Some(item) = foreign_items.remove(name) {
-                    visit_foreign_item(&mut depend, &item);
-                    dep_foreign_items.push(item);
-                }
+        // 首先收集依赖的全部类型.
+        for (name, item) in foreign_items {
+            if dep.contains(&name) {
+                visit_foreign_item(dep, &item);
+                dep_foreign_items.push(item);
             }
-            std::mem::swap(used_names, &mut dep_names);
         }
+
+        // 收集全部的类型依赖，知道没有新增任何间接依赖.
+        let mut new_dep = true;
+        while new_dep {
+            new_dep = false;
+            all_items.retain(|name, item| {
+                if dep.contains(name) {
+                    visit_item(dep, item);
+                    dep_items.push(item.clone());
+                    new_dep = true;
+                    return false;
+                }
+                true
+            });
+        }
+
         dep_items.sort_by(|item1, item2| Self::item_name(item2).cmp(&Self::item_name(item1)));
         dep_foreign_items.sort_by(|item1, item2| {
             Self::foreign_item_name(item2).cmp(&Self::foreign_item_name(item1))
