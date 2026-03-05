@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use syn::visit::{visit_foreign_item, visit_item, Visit};
+use syn::visit::{visit_foreign_item, visit_item, visit_path, Visit};
 use walkdir::WalkDir;
 
 struct DepNames {
@@ -30,26 +30,15 @@ impl DepNames {
 }
 
 impl Visit<'_> for DepNames {
-    // 类型
-    fn visit_type_path(&mut self, ty: &syn::TypePath) {
-        let Some(ident) = ty.path.segments.last() else {
-            return;
-        };
-        let name = ident.ident.to_string();
-        if !name.starts_with("_c2rust_private_") {
-            self.used_names.insert(name);
+    fn visit_path(&mut self, path: &syn::Path) {
+        if let Some(ident) = path.segments.last() {
+            let name = ident.ident.to_string();
+            if !name.starts_with("_c2rust_private_") {
+                self.used_names.insert(name);
+            }
         }
-    }
-
-    // 变量，函数
-    fn visit_expr_path(&mut self, expr: &syn::ExprPath) {
-        let Some(ident) = expr.path.segments.last() else {
-            return;
-        };
-        let name = ident.ident.to_string();
-        if !name.starts_with("_c2rust_private_") {
-            self.used_names.insert(name);
-        }
+        // Option<&T>形式，还需要处理T.
+        visit_path(self, path);
     }
 
     // macro只能通过字符串匹配
