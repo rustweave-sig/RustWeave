@@ -716,7 +716,7 @@ impl Feature {
         let len = attrs.len();
         attrs.retain(|attr| {
             let s = attr.to_token_stream().to_string();
-            !s.contains("no_mangle")
+            !s.contains("no_mangle") && !s.contains("link_name")
         });
         len != attrs.len()
     }
