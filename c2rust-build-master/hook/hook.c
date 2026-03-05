@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/file.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -143,14 +144,25 @@ static void preprocess_cfile(const char* cc, int argc, char* argv[], const char*
         // 预处理命令, gcc和clang有差异. 不能强制用clang来替代，如果当前是gcc会导致混合构建的时候出错.
         // clang解析gcc生成的文件可能出现错误，但是仍然能够生成json文件, 具有一定容错性.
         // -P避免生成行号信息,混合构建时定位信息指向新生成的文件.
-        cmd_len = snprintf(cmd, sizeof(cmd), "%s -E \"%s\" -o \"%s\" -P", cc, cfile, full_path);
-        if (cmd_len >= sizeof(cmd)) return;
 
-        for (int i = 0; i < argc; ++i) {
-                cmd_len += snprintf(cmd + cmd_len, sizeof(cmd) - cmd_len, " \"%s\"", argv[i]);
-                if (cmd_len >= sizeof(cmd)) return;
+        pid_t pid = fork();
+        if (pid == 0) {
+            const char* new_argv[argc + 7];
+            int pos = 0;
+            new_argv[pos++] = cc;
+            new_argv[pos++] = "-E";
+            new_argv[pos++] = cfile;
+            new_argv[pos++] = "-o";
+            new_argv[pos++] = full_path;
+            new_argv[pos++] = "-P";
+            for (int i = 0; i < argc; ++i) {
+                    new_argv[pos++] = argv[i];
+            }
+            new_argv[pos++] = 0;
+            execvp(cc, (char**)new_argv);
+        } else if (pid != -1) {
+                waitpid(pid, 0, 0);
         }
-        system(cmd);
 }
 
 static void discover_cfile(int argc, char* argv[], const char* project_root, const char* feature_root) {
