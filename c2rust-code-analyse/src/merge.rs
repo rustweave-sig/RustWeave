@@ -4,154 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use syn::{
-    punctuated::Pair,
-    visit::{visit_foreign_item, visit_item, Visit},
-    visit_mut::{visit_item_mut, VisitMut},
-};
+use syn::visit::{visit_foreign_item, visit_item, Visit};
 use walkdir::WalkDir;
-
-struct NormalizeFile(HashSet<String>);
-
-impl NormalizeFile {
-    fn new() -> Self {
-        let mut names = HashSet::new();
-        names.insert("crate".to_string());
-        names.insert("super".to_string());
-        Self(names)
-    }
-    fn normalize_use_path(&mut self, path: &mut syn::UsePath) {
-        match &mut *path.tree {
-            syn::UseTree::Path(sub) => {
-                if Self::is_var_fun_ident(&sub.ident) {
-                    *path.tree = *sub.tree.clone();
-                    return;
-                }
-                self.normalize_use_path(sub)
-            }
-            syn::UseTree::Name(name) => {
-                if let Some(rename) = Self::normalize_use_name(name) {
-                    *path.tree = syn::parse2(quote! { {#rename} }).unwrap();
-                } else {
-                    self.0.insert(name.ident.to_string());
-                }
-            }
-            syn::UseTree::Rename(rename) => {
-                if let Some(new_rename) = Self::normalize_use_rename(rename) {
-                    *path.tree = syn::parse2(quote! { {#new_rename} }).unwrap();
-                } else {
-                    self.0.insert(rename.rename.to_string());
-                }
-            }
-            syn::UseTree::Glob(_) => {}
-            syn::UseTree::Group(grp) => {
-                self.normalize_use_group(grp);
-            }
-        }
-    }
-
-    fn normalize_use_group(&mut self, grp: &mut syn::UseGroup) {
-        for tree in grp.items.iter_mut() {
-            match tree {
-                syn::UseTree::Path(path) => {
-                    if Self::is_var_fun_ident(&path.ident) {
-                        *tree = *path.tree.clone();
-                        continue;
-                    }
-                    self.normalize_use_path(path);
-                }
-                syn::UseTree::Name(name) => {
-                    if let Some(rename) = Self::normalize_use_name(name) {
-                        *tree = rename;
-                    }
-                }
-                syn::UseTree::Rename(rename) => {
-                    if let Some(rename) = Self::normalize_use_rename(rename) {
-                        *tree = rename;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn normalize_use_name(name: &syn::UseName) -> Option<syn::UseTree> {
-        let name = name.ident.to_string();
-        if Self::is_var_fun_name(&name) {
-            return Some(syn::parse_str(&format!("self as {name}")).unwrap());
-        }
-        None
-    }
-
-    fn normalize_use_rename(rename: &syn::UseRename) -> Option<syn::UseTree> {
-        if Self::is_var_fun_ident(&rename.ident) {
-            return Some(
-                syn::parse_str(&format!("self as {}", rename.rename.to_string())).unwrap(),
-            );
-        }
-        None
-    }
-
-    fn is_var_fun_ident(ident: &syn::Ident) -> bool {
-        Self::is_var_fun_name(&ident.to_string())
-    }
-
-    fn is_var_fun_name(name: &str) -> bool {
-        name.starts_with("fun_") || name.starts_with("var_")
-    }
-}
-// 合并后没有var_和fun_开头的模块, 需要从UsePath和Path中删除.
-impl VisitMut for NormalizeFile {
-    fn visit_use_path_mut(&mut self, path: &mut syn::UsePath) {
-        // 可能是如下几种形式:
-        // use crate::mod_xxx::var_xxx -> use crate::mod_xxx::{self as var_xxx};
-        // use crate::mod_xxx::var_xxx as xxx -> use crate::mod_xxx::{ self as xxx};
-        // use crate::mod_xxx::var_xxx::xxx -> user crate::mod_xxx::xxx;
-        // use crate::mod_xxx::{var_xxx, fun_xxx::xxx} -> use crate::mod_xxx::{self as var_xxx, xxx};
-        // use crate::mod_xxx;
-        // use mod_xxx::var_xxx;
-        if self.0.contains(&path.ident.to_string()) {
-            self.normalize_use_path(path);
-        }
-    }
-
-    // 对于宏只能通过字符串替换, 只能处理<::var_xxx>的场景, 存在误伤的可能性. 出现就只能手工修改了.
-    fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
-        let mut macro_str = mac.tokens.to_string();
-        let mut changed = false;
-        let regex = regex::Regex::new(r"::(var|fun)_[^:\s]+").unwrap();
-        while let Some(m) = regex.find(&macro_str) {
-            macro_str.replace_range(m.start()..m.start() + m.len(), "");
-            changed = true;
-        }
-        if changed {
-            use std::str::FromStr;
-            mac.tokens = proc_macro2::TokenStream::from_str(&macro_str).unwrap();
-        }
-    }
-
-    fn visit_path_mut(&mut self, path: &mut syn::Path) {
-        // path出现的时候，只能是crate::mod_xxx::var_xxxx::var
-        let len = path.segments.len();
-        if len < 3 {
-            return;
-        }
-        let root = path.segments.get(0).unwrap();
-        if self.0.contains(&root.ident.to_string()) {
-            return;
-        }
-        let last_mod = path.segments.get(len - 2).unwrap();
-        if !NormalizeFile::is_var_fun_ident(&last_mod.ident) {
-            return;
-        }
-        let last = match path.segments.pop().unwrap() {
-            Pair::Punctuated(val, _) => val,
-            Pair::End(val) => val,
-        };
-        path.segments.pop();
-        path.segments.push(last);
-    }
-}
 
 struct DepNames {
     used_names: HashSet<String>,
@@ -216,10 +70,11 @@ impl Feature {
 
         // 简化处理不区分名字空间，可能会导致实际未使用的符号仍然保留下来，可以接受.
         let mut dep = DepNames::new();
+        let mut use_items = String::new();
 
         // 处理每个file的Rust文件合并
         for file in &self.files {
-            self.merge_file(file, &mut dep)?;
+            self.merge_file(file, &mut dep, &mut use_items)?;
         }
 
         // 首先收集所有模块的mod.rs文件路径
@@ -231,7 +86,7 @@ impl Feature {
             return Err(Error::inval());
         }
 
-        self.merge_mod_rs(&mod_rs_files, &mut dep)?;
+        self.merge_mod_rs(&mod_rs_files, &mut dep, &use_items)?;
 
         self.link_src()?;
 
@@ -240,7 +95,7 @@ impl Feature {
     }
 
     // 合并单个File对应的Rust文件
-    fn merge_file(&self, file: &File, dep: &mut DepNames) -> Result<bool> {
+    fn merge_file(&self, file: &File, dep: &mut DepNames, use_items: &mut String) -> Result<bool> {
         // 获取File对应的mod目录名
         let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
         let mod_dir = self.root.join("rust/src").join(&mod_name);
@@ -265,12 +120,13 @@ impl Feature {
             return Err(Error::inval());
         }
 
-        // 解析所有rs文件，合并内容
-        let mut items = Self::parse_rust_files(&rs_files)?;
-        // 规范化处理rs文件.
-        let mut normalize = NormalizeFile::new();
+        let mut items = Vec::new();
+        for rs_file in &rs_files {
+            Self::parse_rust_file(rs_file, &mut items, use_items)?;
+        }
+
+        // 提取转换后代码依赖的类型和FFI接口.
         for item in items.iter_mut() {
-            visit_item_mut(&mut normalize, item);
             visit_item(dep, item);
         }
 
@@ -318,62 +174,71 @@ impl Feature {
     }
 
     // 解析所有Rust文件，收集items和已定义的函数名
-    fn parse_rust_files(rs_files: &[PathBuf]) -> Result<Vec<syn::Item>> {
-        let mut all_items = Vec::new();
-        for rs_file in rs_files {
-            let content =
-                fs::read_to_string(rs_file).log_err(&format!("read {}", rs_file.display()))?;
-            let ast = syn::parse_file(&content).log_err(&format!("parse {}", rs_file.display()))?;
-            // 去掉前缀var_或fun_的名字
-            let file_name = rs_file
-                .with_extension("")
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-            if !file_name.starts_with("fun_") && !file_name.starts_with("var_") {
-                continue;
-            }
-            let main_item_name = &file_name[4..];
-            let mut main_item = None;
-            let mut other_items = Vec::new();
+    fn parse_rust_file(
+        rs_file: &Path,
+        all_items: &mut Vec<syn::Item>,
+        use_items: &mut String,
+    ) -> Result<()> {
+        let content =
+            fs::read_to_string(rs_file).log_err(&format!("read {}", rs_file.display()))?;
+        let ast = syn::parse_file(&content).log_err(&format!("parse {}", rs_file.display()))?;
+        // 去掉前缀var_或fun_的名字
+        let file_name = rs_file
+            .with_extension("")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        if !file_name.starts_with("fun_") && !file_name.starts_with("var_") {
+            return Ok(());
+        }
+        let main_item_name = &file_name[4..];
+        let mut main_item = None;
+        let mut other_items = Vec::new();
 
-            for item in ast.items {
-                match item {
-                    syn::Item::Fn(ref item_fn)
-                        if item_fn.sig.ident.to_string() == main_item_name =>
-                    {
-                        main_item = Some(item)
-                    }
-                    syn::Item::Static(ref item_static)
-                        if item_static.ident.to_string() == main_item_name =>
-                    {
-                        main_item = Some(item)
-                    }
-                    syn::Item::Use(ref item_use) if Self::is_use_super(item_use) => {}
-                    _ => other_items.push(item),
+        for item in ast.items {
+            match item {
+                syn::Item::Fn(ref item_fn) if item_fn.sig.ident.to_string() == main_item_name => {
+                    main_item = Some(item)
                 }
-            }
-            if let Some(syn::Item::Fn(mut fn_item)) = main_item {
-                let decl_file = Self::decl_filename(main_item_name);
-                Self::merge_item_fn(
-                    other_items,
-                    &mut fn_item,
-                    &rs_file.with_file_name(decl_file),
-                )?;
-                all_items.push(syn::Item::Fn(fn_item));
-            } else if let Some(syn::Item::Static(mut var_item)) = main_item {
-                Self::merge_item_static(other_items, &mut var_item);
-                all_items.push(syn::Item::Static(var_item));
-            } else {
-                eprintln!(
-                    "Failed to parse {}: not found symbole {}",
-                    rs_file.display(),
-                    main_item_name
-                );
+                syn::Item::Static(ref item_static)
+                    if item_static.ident.to_string() == main_item_name =>
+                {
+                    main_item = Some(item)
+                }
+                syn::Item::Use(ref item_use) if Self::is_use_super(item_use) => {}
+                _ => other_items.push(item),
             }
         }
-        Ok(all_items)
+        if let Some(syn::Item::Fn(mut fn_item)) = main_item {
+            let decl_file = Self::decl_filename(main_item_name);
+            Self::merge_item_fn(
+                other_items,
+                &mut fn_item,
+                &rs_file.with_file_name(decl_file),
+            )?;
+            all_items.push(syn::Item::Fn(fn_item));
+        } else if let Some(syn::Item::Static(mut var_item)) = main_item {
+            Self::merge_item_static(other_items, &mut var_item);
+            all_items.push(syn::Item::Static(var_item));
+        } else {
+            eprintln!(
+                "Failed to parse {}: not found symbole {}",
+                rs_file.display(),
+                main_item_name
+            );
+        }
+        // 大模型生成的代码可能引用了模块`file_name`, 合并后需要利用`use`语句保证不影响已有代码.
+        // 这里路径格式一定满足要求, 直接调用unwrap
+        let mod_name = rs_file
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        use_items.push_str(&format!("use {mod_name} as {file_name};\n"));
+        Ok(())
     }
 
     fn is_use_super(item_use: &syn::ItemUse) -> bool {
@@ -385,6 +250,21 @@ impl Feature {
                 && matches!(&*path.tree, syn::UseTree::Glob(_));
         }
         false
+    }
+
+    // 只交换类型
+    fn merge_fn_signature(fn_item: &mut syn::ItemFn, sig: &mut syn::Signature) {
+        fn_item
+            .sig
+            .inputs
+            .iter_mut()
+            .zip(sig.inputs.iter_mut())
+            .for_each(|args| {
+                if let (syn::FnArg::Typed(ref mut arg), syn::FnArg::Typed(ref mut decl)) = args {
+                    core::mem::swap(&mut arg.ty, &mut decl.ty);
+                }
+            });
+        core::mem::swap(&mut fn_item.sig.output, &mut sig.output);
     }
 
     fn merge_item_fn(
@@ -399,11 +279,9 @@ impl Feature {
         // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
         let content =
             fs::read_to_string(decl_file).log_err(&format!("read {}", decl_file.display()))?;
-        let mut new_sig: syn::Signature = syn::parse_str(&content)
+        let mut sig: syn::Signature = syn::parse_str(&content)
             .log_err(&format!("parse {} -> {content}", decl_file.display()))?;
-        new_sig.unsafety = fn_item.sig.unsafety;
-        new_sig.abi = fn_item.sig.abi.clone();
-        fn_item.sig = new_sig;
+        Self::merge_fn_signature(fn_item, &mut sig);
         if items.is_empty() {
             return Ok(());
         }
@@ -474,18 +352,22 @@ impl Feature {
     }
 
     /// 合并所有mod.rs文件，去重后写入src/lib.rs
-    fn merge_mod_rs(&self, types_files: &[PathBuf], dep: &mut DepNames) -> Result<()> {
+    fn merge_mod_rs(
+        &self,
+        mod_rs_files: &[PathBuf],
+        dep: &mut DepNames,
+        use_items: &str,
+    ) -> Result<()> {
         // 收集所有mod.rs的内容
         let mut all_items = HashMap::new();
         let mut foreign_items = HashMap::new();
         let mut merged_foreign_mod = None;
 
-        for types_file in types_files {
-            println!("Parsing mod.rs: {}", types_file.display());
-            let content = fs::read_to_string(types_file)
-                .log_err(&format!("read {}", types_file.display()))?;
-            let ast =
-                syn::parse_file(&content).log_err(&format!("parse {}", types_file.display()))?;
+        for mod_rs in mod_rs_files {
+            println!("Parsing mod.rs: {}", mod_rs.display());
+            let content =
+                fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
+            let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
 
             for mut item in ast.items {
                 // 收集extern块
@@ -570,6 +452,7 @@ impl Feature {
             content.push_str(&mod_name);
             content.push_str("::*;\n");
         }
+        content.push_str(use_items);
 
         // 写入src/lib.rs
         let merge_dir = self.root.join("rust/src.2");
