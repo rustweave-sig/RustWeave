@@ -147,10 +147,11 @@ static void preprocess_cfile(const char* cc, int argc, char* argv[], const char*
 
         pid_t pid = fork();
         if (pid == 0) {
-            const char* new_argv[argc + 7];
+            const char* new_argv[argc + 8];
             int pos = 0;
             new_argv[pos++] = cc;
             new_argv[pos++] = "-E";
+            new_argv[pos++] = "-C";
             new_argv[pos++] = cfile;
             new_argv[pos++] = "-o";
             new_argv[pos++] = full_path;

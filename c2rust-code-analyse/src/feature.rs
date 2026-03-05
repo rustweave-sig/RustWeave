@@ -13,7 +13,7 @@ use syn::{
     parse::Parser,
     spanned::Spanned,
     visit::{visit_file, visit_signature, Visit},
-    visit_mut::{visit_file_mut, visit_foreign_item_fn_mut, VisitMut},
+    visit_mut::{visit_file_mut, visit_item_foreign_mod_mut, visit_foreign_item_fn_mut, VisitMut},
 };
 use walkdir::WalkDir;
 
@@ -178,7 +178,7 @@ impl Feature {
             let mut translated = HashMap::new();
             for node in file.iter_mut() {
                 // 只处理函数和变量定义
-                if !Self::is_node_definition(node) {
+                if !Self::is_node_definition(node) || node.kind.is_variadic() {
                     continue;
                 }
 
@@ -385,6 +385,11 @@ impl Feature {
         // _c2rust_private_仅仅体现在导出符号名中，本模块的代码仍然看到的是C代码中的名字.
         // 本目录下生成的C源码也要删除掉_c2rust_private_前缀
         impl VisitMut for Visitor<'_> {
+            fn visit_item_mut(&mut self, item: &mut syn::Item) {
+                if let syn::Item::ForeignMod(m) = item {
+                    visit_item_foreign_mod_mut(self, m);
+                }
+            }
             fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
                 let name = item.ident.to_string();
                 if name.starts_with("_c2rust_private_") {
