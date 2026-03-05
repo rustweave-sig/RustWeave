@@ -219,16 +219,7 @@ impl Kind {
 
     // 部分attribute在类型定义之后，这部分clang生成的json文件中不包括，但是必须的不可能省略，否则可能导致编译问题
     fn tail_code(&self, root: &Path, end: Option<&SourceRange>) -> Result<String> {
-        let mut code = read_code_between(root, self.range(), end)?;
-        if let Some(mac) = self.rename_macro() {
-            // tail_code可能包括下个语句的特殊前缀，比如__extension, 因此需要准确查找插入位置.
-            // 如果有';'结束，则添加到其之后，如果没有找到，则应该添加到最前面.
-            if let Some(pos) = code.find(';') {
-                code.insert_str(pos + 1, &mac);
-            } else {
-                code.insert_str(0, &mac);
-            }
-        }
+        let code = read_code_between(root, self.range(), end)?;
         Ok(code)
     }
 
@@ -518,6 +509,7 @@ impl File {
         let output = Command::new(get_clang())
             .arg("-xc")
             .arg("-E")
+            .arg("-C") //保留注释
             .arg("-P") //去除行号, 混合构建需要调试应该直接定位到这里生成的文件而不是原文件.
             .arg("-fno-builtin")
             .arg(&*new_c2rust_file)
@@ -712,7 +704,7 @@ impl File {
             last = Some(node);
 
             // 当前不支持添加line_info信息
-            // 原因是tail_code中可能包括上一个语句的attribute，以及rename_macro，也可能包括本语句的特殊前缀__extension，不包含在json文件中.
+            // 原因是tail_code中可能包括上一个语句的attribute，也可能包括本语句的特殊前缀__extension，不包含在json文件中.
             // line_info的插入位置难以确定.
             let mut code = node.kind.c_code(root)?;
             if code.is_empty() {
@@ -734,7 +726,10 @@ impl File {
                     code.insert_str(0, "extern ");
                 }
             }
-
+            //rename_macro都需要插入到最前面.
+            if let Some(rename) = node.kind.rename_macro() {
+                content.insert_str(0, &format!("{rename}\n"));
+            }
             content.push_str(&code);
         }
         if let Some(last) = last {
