@@ -195,6 +195,10 @@ impl Feature {
 
                 // 构建对应的Rust文件路径
                 let rust_file = mod_dir.join(&prefixed_name).with_extension("rs");
+                // 对于const常量，简单类型bindgen的时候会生成为rust的常量，不存在需要翻译的文件.
+                if !rust_file.exists() {
+                    continue;
+                }
 
                 // 检查文件内容是否为空（去除空白字符后）
                 let not_empty = Self::validate_file(&rust_file, name, &prefixed_name)?;
@@ -321,7 +325,8 @@ impl Feature {
         let mut ffi_decl = Self::get_ffi_decl(&mod_dir)?;
         let c_root = self.root.join("c");
         for (name, node) in nodes {
-            let Some(decl) = ffi_decl.remove(name) else {
+            let normalized_name = Self::normalize_name(name);
+            let Some(decl) = ffi_decl.remove(normalized_name) else {
                 // Rust中生成的是const常量无需翻译.
                 continue;
             };
@@ -333,7 +338,6 @@ impl Feature {
             let c_file = mod_dir.join(&prefixed_name).with_extension("c");
             fs::write(&c_file, c_code.as_bytes())
                 .log_err(&format!("write {}", c_file.display()))?;
-            let name = Self::normalize_name(name);
             let decl_file = Self::decl_filename(&name);
             let decl_file = mod_dir.join(decl_file);
             let _ =
@@ -414,11 +418,11 @@ impl Feature {
 
             fn visit_item_const_mut(&mut self, item: &mut syn::ItemConst) {
                 let name = item.ident.to_string();
+                item.vis = syn::Visibility::Inherited;
                 if name.starts_with("_c2rust_private_") {
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.ident = syn::Ident::new(new_name, item.ident.span());
                 }
-                item.vis = syn::Visibility::Inherited;
             }
 
             fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
