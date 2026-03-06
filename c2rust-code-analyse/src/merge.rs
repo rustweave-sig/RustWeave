@@ -427,6 +427,8 @@ impl Feature {
         content.push_str("#![allow(non_camel_case_types)]\n");
         content.push_str("#![allow(non_snake_case)]\n");
         content.push_str("#![allow(non_upper_case_globals)]\n");
+        content.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
+        content.push_str("#![allow(improper_ctypes)]\n");
         content.push_str("#![allow(dead_code)]\n");
         content.push_str("#![allow(unused_imports)]\n");
         content.push_str("use core::ffi::*;\n");

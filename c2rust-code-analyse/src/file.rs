@@ -712,14 +712,19 @@ impl File {
             }
 
             if is_header || node.kind.has_committed() {
-                // 需要声明
-                let deli = match node.kind {
-                    Kind::FunctionDecl(_) => '{',
-                    Kind::VarDecl(_) => '=',
-                    _ => '\0',
-                };
-                if deli != '\0' {
-                    if let Some(pos) = code.find(deli) {
+                if let Kind::FunctionDecl(_) = node.kind {
+                    if let Some(pos) = code.find('{') {
+                        code.drain(pos..);
+                        code.push(';');
+                    }
+                    code.insert_str(0, "extern ");
+                }
+            }
+            if node.kind.has_committed() {
+                // 全局变量可能是static int g_i32[] = { ... }
+                // 这种形式需要全部传递给bindgen，否则不知道其数组大小.
+                if let Kind::VarDecl(_) = node.kind {
+                    if let Some(pos) = code.find('=') {
                         code.drain(pos..);
                         code.push(';');
                     }
