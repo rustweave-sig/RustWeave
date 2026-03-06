@@ -13,7 +13,10 @@ use syn::{
     parse::Parser,
     spanned::Spanned,
     visit::{visit_file, visit_signature, Visit},
-    visit_mut::{visit_file_mut, visit_item_foreign_mod_mut, visit_foreign_item_fn_mut, VisitMut},
+    visit_mut::{
+        visit_file_mut, visit_foreign_item_fn_mut, visit_item_const_mut,
+        visit_item_foreign_mod_mut, VisitMut,
+    },
 };
 use walkdir::WalkDir;
 
@@ -266,6 +269,7 @@ impl Feature {
         code.push_str("#![allow(non_camel_case_types)]\n");
         code.push_str("#![allow(non_snake_case)]\n");
         code.push_str("#![allow(non_upper_case_globals)]\n");
+        code.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
         // 会生成_Float128浮点数的API，先抑制这类告警.
         code.push_str("#![allow(improper_ctypes)]\n");
         code.push_str("#![allow(unused_imports)]\n");
@@ -317,6 +321,10 @@ impl Feature {
         let mut ffi_decl = Self::get_ffi_decl(&mod_dir)?;
         let c_root = self.root.join("c");
         for (name, node) in nodes {
+            let Some(decl) = ffi_decl.remove(name) else {
+                // Rust中生成的是const常量无需翻译.
+                continue;
+            };
             // 根据节点类型添加前缀
             let prefixed_name = Self::prefixed_filename(node)?;
             let rs_file = mod_dir.join(&prefixed_name).with_extension("rs");
@@ -326,10 +334,6 @@ impl Feature {
             fs::write(&c_file, c_code.as_bytes())
                 .log_err(&format!("write {}", c_file.display()))?;
             let name = Self::normalize_name(name);
-            let Some(decl) = ffi_decl.remove(name) else {
-                eprintln!("don't find ffi function {name}");
-                return Err(Error::inval());
-            };
             let decl_file = Self::decl_filename(&name);
             let decl_file = mod_dir.join(decl_file);
             let _ =
@@ -374,7 +378,7 @@ impl Feature {
         self.normalize_mod_rs(mod_dir, nodes)
     }
 
-    // 修改函数入参和返回值
+    // 改名以及修改函数入参和返回值
     // *const T -> Option<&'static T>
     // *mut T -> Option<&'static mut T>
     fn normalize_mod_rs(&self, mod_dir: &Path, nodes: &HashMap<&str, &Node>) -> Result<()> {
@@ -384,18 +388,44 @@ impl Feature {
         struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>, bool);
         // _c2rust_private_仅仅体现在导出符号名中，本模块的代码仍然看到的是C代码中的名字.
         // 本目录下生成的C源码也要删除掉_c2rust_private_前缀
+        impl Visitor<'_> {
+            fn foreign_item_attrs(name: &str) -> Vec<syn::Attribute> {
+                syn::Attribute::parse_outer
+                    .parse_str(&format!("#[allow(warnings)]\n#[link_name = \"{}\"]", name))
+                    .unwrap()
+            }
+        }
+        // 如果有多个文件，这些文件当前机制下是相互独立的，同一个类型，同一个FFI函数会重复声明
+        // 这里抑制这些重复FFI声明可能导致的告警
+        // TODO: 后续应该比较Rust的类型定义和FFI声明，如果相同，提取到lib.rs中.
         impl VisitMut for Visitor<'_> {
             fn visit_item_mut(&mut self, item: &mut syn::Item) {
-                if let syn::Item::ForeignMod(m) = item {
-                    visit_item_foreign_mod_mut(self, m);
+                match item {
+                    syn::Item::ForeignMod(m) => visit_item_foreign_mod_mut(self, m),
+                    syn::Item::Const(c) => visit_item_const_mut(self, c),
+                    syn::Item::Fn(item) => item.vis = syn::Visibility::Inherited,
+                    syn::Item::Struct(item) => item.vis = syn::Visibility::Inherited,
+                    syn::Item::Union(item) => item.vis = syn::Visibility::Inherited,
+                    syn::Item::Type(item) => item.vis = syn::Visibility::Inherited,
+                    syn::Item::Use(item) => item.vis = syn::Visibility::Inherited,
+                    _ => {}
                 }
             }
-            fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
+
+            fn visit_item_const_mut(&mut self, item: &mut syn::ItemConst) {
                 let name = item.ident.to_string();
                 if name.starts_with("_c2rust_private_") {
-                    item.attrs = syn::Attribute::parse_outer
-                        .parse_str(&format!("#[link_name = \"{}\"]", name))
-                        .unwrap();
+                    let new_name = name.splitn(5, '_').last().unwrap();
+                    item.ident = syn::Ident::new(new_name, item.ident.span());
+                }
+                item.vis = syn::Visibility::Inherited;
+            }
+
+            fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
+                let name = item.ident.to_string();
+                item.attrs = Self::foreign_item_attrs(&name);
+                item.vis = syn::Visibility::Inherited;
+                if name.starts_with("_c2rust_private_") {
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.ident = syn::Ident::new(new_name, item.ident.span());
                 }
@@ -403,10 +433,9 @@ impl Feature {
 
             fn visit_foreign_item_fn_mut(&mut self, item: &mut syn::ForeignItemFn) {
                 let name = item.sig.ident.to_string();
+                item.attrs = Self::foreign_item_attrs(&name);
+                item.vis = syn::Visibility::Inherited;
                 if name.starts_with("_c2rust_private_") {
-                    item.attrs = syn::Attribute::parse_outer
-                        .parse_str(&format!("#[link_name = \"{}\"]", name))
-                        .unwrap();
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.sig.ident = syn::Ident::new(new_name, item.sig.ident.span());
                 }
