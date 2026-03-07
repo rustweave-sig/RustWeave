@@ -748,9 +748,12 @@ impl File {
                     code.insert_str(0, "extern ");
                 }
             }
-            //rename_macro都需要插入到最前面.
             if let Some(rename) = node.kind.rename_macro() {
-                content.insert_str(0, &format!("{rename}\n"));
+                let insert_pos = content
+                    .rfind(|c| c == ';' || c == '}')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                content.insert_str(insert_pos, &format!("\n{rename}"));
             }
             content.push_str(&code);
         }
