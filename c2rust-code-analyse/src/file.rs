@@ -297,6 +297,22 @@ impl Kind {
         };
     }
 
+    pub fn get_last_not_empty(&self) -> bool {
+        match self {
+            Kind::FunctionDecl(ref item) => item.last_not_empty.unwrap_or(false),
+            Kind::VarDecl(ref item) => item.last_not_empty.unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    pub fn set_last_not_empty(&mut self, not_empty: bool) {
+        match self {
+            Kind::FunctionDecl(ref mut item) => item.last_not_empty = Some(not_empty),
+            Kind::VarDecl(ref mut item) => item.last_not_empty = Some(not_empty),
+            _ => {}
+        };
+    }
+
     /// 变量中应该翻译带初始化值的那一个, 如果都没有初始化，且非`extern`需要任意翻译一个.
     pub fn is_inited(&self) -> bool {
         match self {
@@ -422,6 +438,8 @@ pub struct VarDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
+    #[serde(default)]
+    last_not_empty: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -444,6 +462,8 @@ pub struct FunctionDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
+    #[serde(default)]
+    last_not_empty: Option<bool>,
 }
 
 pub(crate) struct File {
@@ -504,7 +524,8 @@ impl File {
             // let _ = fs::remove_file(p);
         });
         let new_c2rust_file = path.with_extension("c2rust_global");
-        fs::write(&*new_c2rust_file, code.as_bytes()).log_err(&format!("write {}", new_c2rust_file.display()))?;
+        fs::write(&*new_c2rust_file, code.as_bytes())
+            .log_err(&format!("write {}", new_c2rust_file.display()))?;
         // 输入已经是预处理后的文件，这里无条件使用clang只实现宏展开，不会引入clang特有的内容.
         let output = Command::new(get_clang())
             .arg("-xc")
@@ -686,11 +707,7 @@ impl File {
         Ok(new_header)
     }
 
-    fn generate_c_code(
-        root: &Path,
-        nodes: &[Node],
-        is_header: bool,
-    ) -> Result<String> {
+    fn generate_c_code(root: &Path, nodes: &[Node], is_header: bool) -> Result<String> {
         let mut content = String::new();
         let mut last: Option<&Node> = None;
         for node in nodes {

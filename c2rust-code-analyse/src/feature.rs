@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::env::var_os;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use syn::{
     parse::Parser,
     spanned::Spanned,
@@ -18,6 +18,7 @@ use syn::{
         visit_item_foreign_mod_mut, VisitMut,
     },
 };
+use toml_edit::{Array, Document, Item, Table};
 use walkdir::WalkDir;
 
 pub struct Feature {
@@ -185,35 +186,38 @@ impl Feature {
                     continue;
                 }
 
-                // 获取节点名
                 let Some(name) = node.kind.name() else {
                     continue;
                 };
+                let name = name.to_string();
 
-                // 根据节点类型添加前缀
                 let prefixed_name = Self::prefixed_filename(node)?;
 
-                // 构建对应的Rust文件路径
                 let rust_file = mod_dir.join(&prefixed_name).with_extension("rs");
-                // 对于const常量，简单类型bindgen的时候会生成为rust的常量，不存在需要翻译的文件.
                 if !rust_file.exists() {
                     continue;
                 }
 
-                // 检查文件内容是否为空（去除空白字符后）
-                let not_empty = Self::validate_file(&rust_file, name, &prefixed_name)?;
+                let need_validate = Self::needs_validation(&rust_file)?;
+
+                let not_empty = if need_validate {
+                    let result = Self::validate_file(&rust_file, &name, &prefixed_name)?;
+                    Self::update_c_file_mtime(&rust_file)?;
+                    node.kind.set_last_not_empty(result);
+                    result
+                } else {
+                    node.kind.get_last_not_empty()
+                };
+
                 if not_empty {
-                    translated.insert(Self::normalize_name(name).to_string(), prefixed_name);
+                    translated.insert(Self::normalize_name(&name).to_string(), prefixed_name);
                 }
                 let has_committed = node.kind.has_committed();
 
-                // 检查状态是否一致
                 if has_committed && !not_empty {
-                    // 已标记为翻译但文件为空，需要重置状态为未翻译
                     node.kind.set_git_commit(false);
                     is_updated = true;
                 } else if !has_committed && not_empty {
-                    // 未标记为翻译但文件非空，需要标记为已翻译
                     node.kind.set_git_commit(true);
                     is_updated = true;
                 }
@@ -247,14 +251,23 @@ impl Feature {
     }
 
     fn set_staticlib(&self) -> Result<()> {
-        // TODO: 后续通过toml文件操作API实现读写
-        // 当前简单追加写实现
-        let mut file = fs::File::options()
-            .append(true)
-            .open(self.root.join("rust/Cargo.toml"))
-            .log_err("open rust/Cargo.toml")?;
-        file.write(b"\n[lib]\ncrate-type = [\"staticlib\"]\n")
-            .log_err("write staticlib to Cargo.toml")?;
+        let toml_path = self.root.join("rust/Cargo.toml");
+        let content =
+            fs::read_to_string(&toml_path).log_err(&format!("read {}", toml_path.display()))?;
+
+        let mut doc =
+            Document::from_str(&content).log_err(&format!("parse {}", toml_path.display()))?;
+
+        let lib = doc["lib"].or_insert(Item::Table(Table::new()));
+        let lib = lib.as_table_mut().ok_or(Error::inval())?;
+
+        let mut crate_type = Array::new();
+        crate_type.push("staticlib");
+        lib.insert("crate-type", Item::Value(crate_type.into()));
+
+        let toml_string = doc.to_string();
+        fs::write(&toml_path, toml_string.as_bytes())
+            .log_err(&format!("write {}", toml_path.display()))?;
         Ok(())
     }
 
@@ -607,6 +620,50 @@ impl Feature {
         }
 
         println!("Cargo build succeeded!");
+        Ok(())
+    }
+
+    fn needs_validation(rust_file: &Path) -> Result<bool> {
+        let c_file = rust_file.with_extension("c");
+
+        let rust_mtime = fs::metadata(rust_file)
+            .log_err(&format!("metadata {}", rust_file.display()))?
+            .modified()
+            .log_err("get modified time")?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .log_err("duration since")?
+            .as_secs();
+
+        if !c_file.exists() {
+            return Ok(true);
+        }
+
+        let c_mtime = fs::metadata(&c_file)
+            .log_err(&format!("metadata {}", c_file.display()))?
+            .modified()
+            .log_err("get modified time")?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .log_err("duration since")?
+            .as_secs();
+
+        if rust_mtime == c_mtime {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn update_c_file_mtime(rust_file: &Path) -> Result<()> {
+        let c_file = rust_file.with_extension("c");
+        let rust_metadata =
+            fs::metadata(rust_file).log_err(&format!("metadata {}", rust_file.display()))?;
+        filetime::set_file_mtime(
+            &c_file,
+            filetime::FileTime::from_system_time(
+                rust_metadata.modified().log_err("get modified time")?,
+            ),
+        )
+        .log_err(&format!("set mtime for {}", c_file.display()))?;
         Ok(())
     }
 

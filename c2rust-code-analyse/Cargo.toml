@@ -20,6 +20,7 @@ higuard = "0.1.1"
 hiopt = "0.1.0"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 prettyplease = "0.2"
+filetime = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
