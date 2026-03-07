@@ -749,7 +749,7 @@ impl Feature {
             is_changed = true;
             main_item.sig.abi = syn::parse_str(r#"extern "C""#).unwrap();
         }
-        if !Self::has_export_name_attr(&main_item.attrs) {
+        if !Self::has_export_name_attr(&mut main_item.attrs, link_name) {
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
@@ -777,7 +777,7 @@ impl Feature {
             return Err(Error::inval());
         };
         let mut is_changed = Self::remove_no_mangle_attr(&mut main_item.attrs);
-        if !Self::has_export_name_attr(&main_item.attrs) {
+        if !Self::has_export_name_attr(&mut main_item.attrs, link_name) {
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
@@ -798,14 +798,33 @@ impl Feature {
         Ok(is_changed)
     }
 
-    fn has_export_name_attr(attrs: &[syn::Attribute]) -> bool {
-        for attr in attrs {
+    fn has_export_name_attr(attrs: &mut Vec<syn::Attribute>, expected_name: &str) -> bool {
+        let mut found_wrong = false;
+        attrs.retain(|attr| {
             let s = attr.to_token_stream().to_string();
             if s.contains("export_name") {
-                return true;
+                if let Some(start) = s.find("export_name") {
+                    let rest = &s[start..];
+                    if let Some(quote_start) = rest.find('"') {
+                        let rest = &rest[quote_start + 1..];
+                        if let Some(quote_end) = rest.find('"') {
+                            let value = &rest[..quote_end];
+                            if value != expected_name {
+                                found_wrong = true;
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
+            true
+        });
+        if found_wrong {
+            return false;
         }
-        false
+        !attrs
+            .iter()
+            .any(|attr| attr.to_token_stream().to_string().contains("export_name"))
     }
     fn remove_no_mangle_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
         let len = attrs.len();
