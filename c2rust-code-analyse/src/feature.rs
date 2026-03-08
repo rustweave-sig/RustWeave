@@ -154,6 +154,13 @@ impl Feature {
         guard.discard();
         let _ = fs::remove_dir_all(rust_old);
         println!("Cleaned up backup directory");
+        let lib_rs = self.root.join("rust/src/lib.rs");
+        let lib_normalized = lib_rs.with_extension("normalized");
+        fs::copy(&lib_rs, &lib_normalized).log_err(&format!(
+            "copy {} -> {}",
+            lib_rs.display(),
+            lib_normalized.display()
+        ))?;
         println!("Feature '{}' reinitialized successfully", self.name);
         Ok(())
     }
@@ -247,6 +254,7 @@ impl Feature {
         } else {
             println!("Feature '{}' already up to date", self.name);
         }
+        self.deduplicate_mod_rs()?;
         Ok(())
     }
 
@@ -304,6 +312,9 @@ impl Feature {
         }
         let lib_rs = self.root.join("rust/src/lib.rs");
         fs::write(&lib_rs, code.as_bytes()).log_err(&format!("write {}", lib_rs.display()))?;
+        let lib_normalized = self.root.join("rust/src/lib.normalized");
+        fs::write(&lib_normalized, code.as_bytes())
+            .log_err(&format!("write {}", lib_normalized.display()))?;
         Ok(())
     }
 
@@ -500,6 +511,7 @@ impl Feature {
             .log_err(&format!("read {}", normalized_rs.display()))?;
         let mut ast =
             syn::parse_file(&content).log_err(&format!("parse {}", normalized_rs.display()))?;
+        // translated中只包含FFI内容
         for item in &mut ast.items {
             let syn::Item::ForeignMod(item) = item else {
                 continue;
@@ -513,12 +525,6 @@ impl Feature {
                 true
             });
         }
-        ast.items.retain(|item| {
-            let syn::Item::ForeignMod(item) = item else {
-                return true;
-            };
-            !item.items.is_empty()
-        });
         let mut modules = Vec::new();
         for module in translated.values() {
             modules.push(syn::parse_str(&format!("mod {module};")).unwrap());
@@ -862,5 +868,212 @@ impl Feature {
         visit_file_mut(&mut ffi_names, ast);
 
         Ok(())
+    }
+
+    pub fn deduplicate_mod_rs(&self) -> Result<()> {
+        let rust_src = self.root.join("rust/src");
+        if !rust_src.exists() {
+            return Ok(());
+        }
+
+        let mod_rs_files: Vec<PathBuf> = WalkDir::new(&rust_src)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file() && e.path().file_name().map_or(false, |n| n == "mod.rs"))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        if mod_rs_files.is_empty() {
+            return Ok(());
+        }
+
+        // 命名类型: name -> Vec<syn::Item>
+        let mut named_items: HashMap<String, Vec<syn::Item>> = HashMap::new();
+        // FFI: link_name -> Vec<syn::ForeignItem>
+        let mut ffi_items: HashMap<String, Vec<syn::ForeignItem>> = HashMap::new();
+        // 遇到的第一个 ForeignMod
+        let mut first_foreign_mod: Option<syn::ItemForeignMod> = None;
+
+        for mod_rs_path in &mod_rs_files {
+            let content = fs::read_to_string(mod_rs_path)
+                .log_err(&format!("read {}", mod_rs_path.display()))?;
+            let ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+            for item in ast.items.into_iter() {
+                match item {
+                    syn::Item::Struct(s) => {
+                        let name = s.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Struct(s));
+                    }
+                    syn::Item::Union(u) => {
+                        let name = u.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Union(u));
+                    }
+                    syn::Item::Const(c) => {
+                        let name = c.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Const(c));
+                    }
+                    syn::Item::Type(t) => {
+                        let name = t.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Type(t));
+                    }
+                    syn::Item::ForeignMod(fm) => {
+                        if first_foreign_mod.is_none() {
+                            let mut fm_clone = fm.clone();
+                            fm_clone.items.clear();
+                            first_foreign_mod = Some(fm_clone);
+                        }
+                        for foreign_item in fm.items.into_iter() {
+                            let link_name = match &foreign_item {
+                                syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
+                                    .unwrap_or_else(|| f.sig.ident.to_string()),
+                                syn::ForeignItem::Static(s) => Self::extract_link_name(&s.attrs)
+                                    .unwrap_or_else(|| s.ident.to_string()),
+                                _ => continue,
+                            };
+                            ffi_items.entry(link_name).or_default().push(foreign_item);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut named_to_extract: Vec<syn::Item> = Vec::new();
+        let mut ffi_to_extract: Vec<syn::ForeignItem> = Vec::new();
+        let mut named_remove_set: HashSet<String> = HashSet::new();
+        let mut ffi_remove_set: HashSet<String> = HashSet::new();
+
+        // named_items 处理: 多个mod.rs存在且内容完全相同才提取
+        for (name, items) in &named_items {
+            if items.len() > 1 {
+                let first_tokens = items[0].to_token_stream().to_string();
+                if items
+                    .iter()
+                    .all(|item| item.to_token_stream().to_string() == first_tokens)
+                {
+                    named_to_extract.push(items[0].clone());
+                    named_remove_set.insert(name.clone());
+                }
+            }
+        }
+
+        // ffi_items 处理: 多个mod.rs存在才提取
+        for (link_name, items) in &ffi_items {
+            if items.len() > 1 {
+                ffi_to_extract.push(items[0].clone());
+                ffi_remove_set.insert(link_name.clone());
+            }
+        }
+
+        if named_to_extract.is_empty() && ffi_to_extract.is_empty() {
+            return Ok(());
+        }
+
+        let lib_normalized_path = rust_src.join("lib.normalized");
+        let lib_rs_path = rust_src.join("lib.rs");
+
+        let base_content = if lib_normalized_path.exists() {
+            fs::read_to_string(&lib_normalized_path)
+                .log_err(&format!("read {}", lib_normalized_path.display()))?
+        } else {
+            fs::read_to_string(&lib_rs_path).log_err(&format!("read {}", lib_rs_path.display()))?
+        };
+
+        let mut lib_ast =
+            syn::parse_file(&base_content).log_err(&format!("parse {}", lib_rs_path.display()))?;
+
+        // 添加 named items
+        for item in named_to_extract {
+            lib_ast.items.push(item);
+        }
+
+        // 添加 ffi items (使用 first_foreign_mod 作为基础)
+        if !ffi_to_extract.is_empty() {
+            if let Some(mut fm) = first_foreign_mod {
+                fm.items = ffi_to_extract;
+                lib_ast.items.push(syn::Item::ForeignMod(fm));
+            }
+        }
+
+        let formatted_lib = prettyplease::unparse(&lib_ast);
+        fs::write(&lib_rs_path, formatted_lib.as_bytes())
+            .log_err(&format!("write {}", lib_rs_path.display()))?;
+
+        // 从 mod.rs 删除已提取的 items
+        for mod_rs_path in &mod_rs_files {
+            let content = fs::read_to_string(mod_rs_path)
+                .log_err(&format!("read {}", mod_rs_path.display()))?;
+            let mut ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+            // 先处理 ForeignMod 内部 items
+            for item in &mut ast.items {
+                let syn::Item::ForeignMod(fm) = item else {
+                    continue;
+                };
+                fm.items.retain(|ffi| {
+                    let link_name = match ffi {
+                        syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
+                            .unwrap_or_else(|| f.sig.ident.to_string()),
+                        syn::ForeignItem::Static(s) => {
+                            Self::extract_link_name(&s.attrs).unwrap_or_else(|| s.ident.to_string())
+                        }
+                        _ => return true,
+                    };
+                    !ffi_remove_set.contains(&link_name)
+                });
+            }
+
+            // 删除其他需要移除的 items 以及空的 ForeignMod
+            ast.items.retain(|item| match item {
+                syn::Item::Struct(s) => !named_remove_set.contains(&s.ident.to_string()),
+                syn::Item::Union(u) => !named_remove_set.contains(&u.ident.to_string()),
+                syn::Item::Const(c) => !named_remove_set.contains(&c.ident.to_string()),
+                syn::Item::Type(t) => !named_remove_set.contains(&t.ident.to_string()),
+                syn::Item::ForeignMod(fm) => !fm.items.is_empty(),
+                _ => true,
+            });
+
+            let formatted = prettyplease::unparse(&ast);
+            fs::write(mod_rs_path, formatted.as_bytes())
+                .log_err(&format!("write {}", mod_rs_path.display()))?;
+        }
+
+        let total = named_remove_set.len() + ffi_remove_set.len();
+        println!("Deduplicated {} items to lib.rs", total);
+        Ok(())
+    }
+
+    fn extract_link_name(attrs: &[syn::Attribute]) -> Option<String> {
+        for attr in attrs {
+            let attr_str = attr.to_token_stream().to_string();
+            if attr_str.contains("link_name") {
+                if let Some(start) = attr_str.find("link_name") {
+                    let rest = &attr_str[start..];
+                    if let Some(quote_start) = rest.find('"') {
+                        let rest = &rest[quote_start + 1..];
+                        if let Some(quote_end) = rest.find('"') {
+                            return Some(rest[..quote_end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
