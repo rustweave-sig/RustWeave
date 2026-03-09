@@ -254,7 +254,6 @@ impl Feature {
         } else {
             println!("Feature '{}' already up to date", self.name);
         }
-        self.deduplicate_mod_rs()?;
         Ok(())
     }
 
@@ -413,7 +412,8 @@ impl Feature {
         let mod_rs = mod_dir.join("mod.rs");
         let content = fs::read_to_string(&mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let mut ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
-        let use_super = syn::parse_str(&format!("#[allow(unused_imports)]\nuse super::*;")).unwrap();
+        let use_super =
+            syn::parse_str(&format!("#[allow(unused_imports)]\nuse super::*;")).unwrap();
         ast.items.insert(0, use_super);
 
         struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>, bool);
@@ -1000,9 +1000,7 @@ impl Feature {
             syn::parse_file(&base_content).log_err(&format!("parse {}", lib_rs_path.display()))?;
 
         // 添加 named items
-        for item in named_to_extract {
-            lib_ast.items.push(item);
-        }
+        lib_ast.items.extend(named_to_extract);
 
         // 添加 ffi items (使用 first_foreign_mod 作为基础)
         if !ffi_to_extract.is_empty() {
@@ -1023,31 +1021,25 @@ impl Feature {
             let mut ast =
                 syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
 
-            // 先处理 ForeignMod 内部 items
-            for item in &mut ast.items {
-                let syn::Item::ForeignMod(fm) = item else {
-                    continue;
-                };
-                fm.items.retain(|ffi| {
-                    let link_name = match ffi {
-                        syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
-                            .unwrap_or_else(|| f.sig.ident.to_string()),
-                        syn::ForeignItem::Static(s) => {
-                            Self::extract_link_name(&s.attrs).unwrap_or_else(|| s.ident.to_string())
-                        }
-                        _ => return true,
-                    };
-                    !ffi_remove_set.contains(&link_name)
-                });
-            }
-
             // 删除其他需要移除的 items 以及空的 ForeignMod
-            ast.items.retain(|item| match item {
+            ast.items.retain_mut(|item| match item {
                 syn::Item::Struct(s) => !named_remove_set.contains(&s.ident.to_string()),
                 syn::Item::Union(u) => !named_remove_set.contains(&u.ident.to_string()),
                 syn::Item::Const(c) => !named_remove_set.contains(&c.ident.to_string()),
                 syn::Item::Type(t) => !named_remove_set.contains(&t.ident.to_string()),
-                syn::Item::ForeignMod(fm) => !fm.items.is_empty(),
+                syn::Item::ForeignMod(fm) => {
+                    fm.items.retain(|ffi| {
+                        let link_name = match ffi {
+                            syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
+                                .unwrap_or_else(|| f.sig.ident.to_string()),
+                            syn::ForeignItem::Static(s) => Self::extract_link_name(&s.attrs)
+                                .unwrap_or_else(|| s.ident.to_string()),
+                            _ => return true,
+                        };
+                        !ffi_remove_set.contains(&link_name)
+                    });
+                    !fm.items.is_empty()
+                }
                 _ => true,
             });
 
