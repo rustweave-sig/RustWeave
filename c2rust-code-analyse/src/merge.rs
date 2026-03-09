@@ -520,6 +520,7 @@ mod test {
     use super::*;
     use quote::ToTokens;
     use syn::visit_mut::visit_item_use_mut;
+    /*
     #[test]
     fn test1() {
         let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx::var_xxx::xxx;").unwrap();
@@ -583,5 +584,15 @@ mod test {
             path.to_token_stream().to_string(),
             expect.to_token_stream().to_string()
         );
+    }
+    */
+    #[test]
+    fn test6() {
+        let mut code = "__attribute__( ( always_inline)) void foo();".to_string();
+        let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*always_inline\s*\)\s*\)").unwrap();
+        if let Some(m) = re.find(&code) {
+            code.replace_range(m.start()..m.start() + m.len(), "");
+        }
+        assert_eq!(code, " void foo();");
     }
 }

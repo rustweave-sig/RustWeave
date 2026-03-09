@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::env::var_os;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use syn::{
     parse::Parser,
     spanned::Spanned,
@@ -18,6 +18,7 @@ use syn::{
         visit_item_foreign_mod_mut, VisitMut,
     },
 };
+use toml_edit::{Array, Document, Item, Table};
 use walkdir::WalkDir;
 
 pub struct Feature {
@@ -153,6 +154,13 @@ impl Feature {
         guard.discard();
         let _ = fs::remove_dir_all(rust_old);
         println!("Cleaned up backup directory");
+        let lib_rs = self.root.join("rust/src/lib.rs");
+        let lib_normalized = lib_rs.with_extension("normalized");
+        fs::copy(&lib_rs, &lib_normalized).log_err(&format!(
+            "copy {} -> {}",
+            lib_rs.display(),
+            lib_normalized.display()
+        ))?;
         println!("Feature '{}' reinitialized successfully", self.name);
         Ok(())
     }
@@ -185,35 +193,38 @@ impl Feature {
                     continue;
                 }
 
-                // 获取节点名
                 let Some(name) = node.kind.name() else {
                     continue;
                 };
+                let name = name.to_string();
 
-                // 根据节点类型添加前缀
                 let prefixed_name = Self::prefixed_filename(node)?;
 
-                // 构建对应的Rust文件路径
                 let rust_file = mod_dir.join(&prefixed_name).with_extension("rs");
-                // 对于const常量，简单类型bindgen的时候会生成为rust的常量，不存在需要翻译的文件.
                 if !rust_file.exists() {
                     continue;
                 }
 
-                // 检查文件内容是否为空（去除空白字符后）
-                let not_empty = Self::validate_file(&rust_file, name, &prefixed_name)?;
+                let need_validate = Self::needs_validation(&rust_file)?;
+
+                let not_empty = if need_validate {
+                    let result = Self::validate_file(&rust_file, &name, &prefixed_name)?;
+                    Self::update_c_file_mtime(&rust_file)?;
+                    node.kind.set_last_not_empty(result);
+                    result
+                } else {
+                    node.kind.get_last_not_empty()
+                };
+
                 if not_empty {
-                    translated.insert(Self::normalize_name(name).to_string(), prefixed_name);
+                    translated.insert(Self::normalize_name(&name).to_string(), prefixed_name);
                 }
                 let has_committed = node.kind.has_committed();
 
-                // 检查状态是否一致
                 if has_committed && !not_empty {
-                    // 已标记为翻译但文件为空，需要重置状态为未翻译
                     node.kind.set_git_commit(false);
                     is_updated = true;
                 } else if !has_committed && not_empty {
-                    // 未标记为翻译但文件非空，需要标记为已翻译
                     node.kind.set_git_commit(true);
                     is_updated = true;
                 }
@@ -243,18 +254,28 @@ impl Feature {
         } else {
             println!("Feature '{}' already up to date", self.name);
         }
+        self.deduplicate_mod_rs()?;
         Ok(())
     }
 
     fn set_staticlib(&self) -> Result<()> {
-        // TODO: 后续通过toml文件操作API实现读写
-        // 当前简单追加写实现
-        let mut file = fs::File::options()
-            .append(true)
-            .open(self.root.join("rust/Cargo.toml"))
-            .log_err("open rust/Cargo.toml")?;
-        file.write(b"\n[lib]\ncrate-type = [\"staticlib\"]\n")
-            .log_err("write staticlib to Cargo.toml")?;
+        let toml_path = self.root.join("rust/Cargo.toml");
+        let content =
+            fs::read_to_string(&toml_path).log_err(&format!("read {}", toml_path.display()))?;
+
+        let mut doc =
+            Document::from_str(&content).log_err(&format!("parse {}", toml_path.display()))?;
+
+        let lib = doc["lib"].or_insert(Item::Table(Table::new()));
+        let lib = lib.as_table_mut().ok_or(Error::inval())?;
+
+        let mut crate_type = Array::new();
+        crate_type.push("staticlib");
+        lib.insert("crate-type", Item::Value(crate_type.into()));
+
+        let toml_string = doc.to_string();
+        fs::write(&toml_path, toml_string.as_bytes())
+            .log_err(&format!("write {}", toml_path.display()))?;
         Ok(())
     }
 
@@ -291,6 +312,9 @@ impl Feature {
         }
         let lib_rs = self.root.join("rust/src/lib.rs");
         fs::write(&lib_rs, code.as_bytes()).log_err(&format!("write {}", lib_rs.display()))?;
+        let lib_normalized = self.root.join("rust/src/lib.normalized");
+        fs::write(&lib_normalized, code.as_bytes())
+            .log_err(&format!("write {}", lib_normalized.display()))?;
         Ok(())
     }
 
@@ -487,6 +511,7 @@ impl Feature {
             .log_err(&format!("read {}", normalized_rs.display()))?;
         let mut ast =
             syn::parse_file(&content).log_err(&format!("parse {}", normalized_rs.display()))?;
+        // translated中只包含FFI内容
         for item in &mut ast.items {
             let syn::Item::ForeignMod(item) = item else {
                 continue;
@@ -500,12 +525,6 @@ impl Feature {
                 true
             });
         }
-        ast.items.retain(|item| {
-            let syn::Item::ForeignMod(item) = item else {
-                return true;
-            };
-            !item.items.is_empty()
-        });
         let mut modules = Vec::new();
         for module in translated.values() {
             modules.push(syn::parse_str(&format!("mod {module};")).unwrap());
@@ -610,6 +629,50 @@ impl Feature {
         Ok(())
     }
 
+    fn needs_validation(rust_file: &Path) -> Result<bool> {
+        let c_file = rust_file.with_extension("c");
+
+        let rust_mtime = fs::metadata(rust_file)
+            .log_err(&format!("metadata {}", rust_file.display()))?
+            .modified()
+            .log_err("get modified time")?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .log_err("duration since")?
+            .as_secs();
+
+        if !c_file.exists() {
+            return Ok(true);
+        }
+
+        let c_mtime = fs::metadata(&c_file)
+            .log_err(&format!("metadata {}", c_file.display()))?
+            .modified()
+            .log_err("get modified time")?
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .log_err("duration since")?
+            .as_secs();
+
+        if rust_mtime == c_mtime {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn update_c_file_mtime(rust_file: &Path) -> Result<()> {
+        let c_file = rust_file.with_extension("c");
+        let rust_metadata =
+            fs::metadata(rust_file).log_err(&format!("metadata {}", rust_file.display()))?;
+        filetime::set_file_mtime(
+            &c_file,
+            filetime::FileTime::from_system_time(
+                rust_metadata.modified().log_err("get modified time")?,
+            ),
+        )
+        .log_err(&format!("set mtime for {}", c_file.display()))?;
+        Ok(())
+    }
+
     // 大模型返回的文件可能不符合要求, 或者被意外破坏，需要修正.
     fn validate_file(file: &Path, link_name: &str, prefix: &str) -> Result<bool> {
         if !file.exists() {
@@ -692,7 +755,7 @@ impl Feature {
             is_changed = true;
             main_item.sig.abi = syn::parse_str(r#"extern "C""#).unwrap();
         }
-        if !Self::has_export_name_attr(&main_item.attrs) {
+        if !Self::has_export_name_attr(&mut main_item.attrs, link_name) {
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
@@ -720,7 +783,7 @@ impl Feature {
             return Err(Error::inval());
         };
         let mut is_changed = Self::remove_no_mangle_attr(&mut main_item.attrs);
-        if !Self::has_export_name_attr(&main_item.attrs) {
+        if !Self::has_export_name_attr(&mut main_item.attrs, link_name) {
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
@@ -741,14 +804,33 @@ impl Feature {
         Ok(is_changed)
     }
 
-    fn has_export_name_attr(attrs: &[syn::Attribute]) -> bool {
-        for attr in attrs {
+    fn has_export_name_attr(attrs: &mut Vec<syn::Attribute>, expected_name: &str) -> bool {
+        let mut found_wrong = false;
+        attrs.retain(|attr| {
             let s = attr.to_token_stream().to_string();
             if s.contains("export_name") {
-                return true;
+                if let Some(start) = s.find("export_name") {
+                    let rest = &s[start..];
+                    if let Some(quote_start) = rest.find('"') {
+                        let rest = &rest[quote_start + 1..];
+                        if let Some(quote_end) = rest.find('"') {
+                            let value = &rest[..quote_end];
+                            if value != expected_name {
+                                found_wrong = true;
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
+            true
+        });
+        if found_wrong {
+            return false;
         }
-        false
+        !attrs
+            .iter()
+            .any(|attr| attr.to_token_stream().to_string().contains("export_name"))
     }
     fn remove_no_mangle_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
         let len = attrs.len();
@@ -786,5 +868,212 @@ impl Feature {
         visit_file_mut(&mut ffi_names, ast);
 
         Ok(())
+    }
+
+    pub fn deduplicate_mod_rs(&self) -> Result<()> {
+        let rust_src = self.root.join("rust/src");
+        if !rust_src.exists() {
+            return Ok(());
+        }
+
+        let mod_rs_files: Vec<PathBuf> = WalkDir::new(&rust_src)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file() && e.path().file_name().map_or(false, |n| n == "mod.rs"))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        if mod_rs_files.is_empty() {
+            return Ok(());
+        }
+
+        // 命名类型: name -> Vec<syn::Item>
+        let mut named_items: HashMap<String, Vec<syn::Item>> = HashMap::new();
+        // FFI: link_name -> Vec<syn::ForeignItem>
+        let mut ffi_items: HashMap<String, Vec<syn::ForeignItem>> = HashMap::new();
+        // 遇到的第一个 ForeignMod
+        let mut first_foreign_mod: Option<syn::ItemForeignMod> = None;
+
+        for mod_rs_path in &mod_rs_files {
+            let content = fs::read_to_string(mod_rs_path)
+                .log_err(&format!("read {}", mod_rs_path.display()))?;
+            let ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+            for item in ast.items.into_iter() {
+                match item {
+                    syn::Item::Struct(s) => {
+                        let name = s.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Struct(s));
+                    }
+                    syn::Item::Union(u) => {
+                        let name = u.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Union(u));
+                    }
+                    syn::Item::Const(c) => {
+                        let name = c.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Const(c));
+                    }
+                    syn::Item::Type(t) => {
+                        let name = t.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Type(t));
+                    }
+                    syn::Item::ForeignMod(fm) => {
+                        if first_foreign_mod.is_none() {
+                            let mut fm_clone = fm.clone();
+                            fm_clone.items.clear();
+                            first_foreign_mod = Some(fm_clone);
+                        }
+                        for foreign_item in fm.items.into_iter() {
+                            let link_name = match &foreign_item {
+                                syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
+                                    .unwrap_or_else(|| f.sig.ident.to_string()),
+                                syn::ForeignItem::Static(s) => Self::extract_link_name(&s.attrs)
+                                    .unwrap_or_else(|| s.ident.to_string()),
+                                _ => continue,
+                            };
+                            ffi_items.entry(link_name).or_default().push(foreign_item);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut named_to_extract: Vec<syn::Item> = Vec::new();
+        let mut ffi_to_extract: Vec<syn::ForeignItem> = Vec::new();
+        let mut named_remove_set: HashSet<String> = HashSet::new();
+        let mut ffi_remove_set: HashSet<String> = HashSet::new();
+
+        // named_items 处理: 多个mod.rs存在且内容完全相同才提取
+        for (name, items) in &named_items {
+            if items.len() > 1 {
+                let first_tokens = items[0].to_token_stream().to_string();
+                if items
+                    .iter()
+                    .all(|item| item.to_token_stream().to_string() == first_tokens)
+                {
+                    named_to_extract.push(items[0].clone());
+                    named_remove_set.insert(name.clone());
+                }
+            }
+        }
+
+        // ffi_items 处理: 多个mod.rs存在才提取
+        for (link_name, items) in &ffi_items {
+            if items.len() > 1 {
+                ffi_to_extract.push(items[0].clone());
+                ffi_remove_set.insert(link_name.clone());
+            }
+        }
+
+        if named_to_extract.is_empty() && ffi_to_extract.is_empty() {
+            return Ok(());
+        }
+
+        let lib_normalized_path = rust_src.join("lib.normalized");
+        let lib_rs_path = rust_src.join("lib.rs");
+
+        let base_content = if lib_normalized_path.exists() {
+            fs::read_to_string(&lib_normalized_path)
+                .log_err(&format!("read {}", lib_normalized_path.display()))?
+        } else {
+            fs::read_to_string(&lib_rs_path).log_err(&format!("read {}", lib_rs_path.display()))?
+        };
+
+        let mut lib_ast =
+            syn::parse_file(&base_content).log_err(&format!("parse {}", lib_rs_path.display()))?;
+
+        // 添加 named items
+        for item in named_to_extract {
+            lib_ast.items.push(item);
+        }
+
+        // 添加 ffi items (使用 first_foreign_mod 作为基础)
+        if !ffi_to_extract.is_empty() {
+            if let Some(mut fm) = first_foreign_mod {
+                fm.items = ffi_to_extract;
+                lib_ast.items.push(syn::Item::ForeignMod(fm));
+            }
+        }
+
+        let formatted_lib = prettyplease::unparse(&lib_ast);
+        fs::write(&lib_rs_path, formatted_lib.as_bytes())
+            .log_err(&format!("write {}", lib_rs_path.display()))?;
+
+        // 从 mod.rs 删除已提取的 items
+        for mod_rs_path in &mod_rs_files {
+            let content = fs::read_to_string(mod_rs_path)
+                .log_err(&format!("read {}", mod_rs_path.display()))?;
+            let mut ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+            // 先处理 ForeignMod 内部 items
+            for item in &mut ast.items {
+                let syn::Item::ForeignMod(fm) = item else {
+                    continue;
+                };
+                fm.items.retain(|ffi| {
+                    let link_name = match ffi {
+                        syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
+                            .unwrap_or_else(|| f.sig.ident.to_string()),
+                        syn::ForeignItem::Static(s) => {
+                            Self::extract_link_name(&s.attrs).unwrap_or_else(|| s.ident.to_string())
+                        }
+                        _ => return true,
+                    };
+                    !ffi_remove_set.contains(&link_name)
+                });
+            }
+
+            // 删除其他需要移除的 items 以及空的 ForeignMod
+            ast.items.retain(|item| match item {
+                syn::Item::Struct(s) => !named_remove_set.contains(&s.ident.to_string()),
+                syn::Item::Union(u) => !named_remove_set.contains(&u.ident.to_string()),
+                syn::Item::Const(c) => !named_remove_set.contains(&c.ident.to_string()),
+                syn::Item::Type(t) => !named_remove_set.contains(&t.ident.to_string()),
+                syn::Item::ForeignMod(fm) => !fm.items.is_empty(),
+                _ => true,
+            });
+
+            let formatted = prettyplease::unparse(&ast);
+            fs::write(mod_rs_path, formatted.as_bytes())
+                .log_err(&format!("write {}", mod_rs_path.display()))?;
+        }
+
+        let total = named_remove_set.len() + ffi_remove_set.len();
+        println!("Deduplicated {} items to lib.rs", total);
+        Ok(())
+    }
+
+    fn extract_link_name(attrs: &[syn::Attribute]) -> Option<String> {
+        for attr in attrs {
+            let attr_str = attr.to_token_stream().to_string();
+            if attr_str.contains("link_name") {
+                if let Some(start) = attr_str.find("link_name") {
+                    let rest = &attr_str[start..];
+                    if let Some(quote_start) = rest.find('"') {
+                        let rest = &rest[quote_start + 1..];
+                        if let Some(quote_end) = rest.find('"') {
+                            return Some(rest[..quote_end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }

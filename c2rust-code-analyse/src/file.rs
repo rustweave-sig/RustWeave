@@ -89,6 +89,21 @@ fn range_include(range: &SourceRange, included: &SourceRange) -> bool {
     beg1.file == beg2.file && beg1.offset <= beg2.offset && end1.offset >= end2.offset
 }
 
+fn remove_unused_attrs(code: &mut String) {
+    let mut off = 0;
+    let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*always_inline\s*\)\s*\)").unwrap();
+    while let Some(m) = re.find(&code[off..]) {
+        off += m.start();
+        code.replace_range(off..off + m.len(), "");
+    }
+    off = 0;
+    let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*__malloc__\s*(\(.+\))?\)\s*\)").unwrap();
+    while let Some(m) = re.find(&code[off..]) {
+        off += m.start();
+        code.replace_range(off..off + m.len(), "");
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum Kind {
     EnumDecl(EnumDecl),
@@ -297,6 +312,22 @@ impl Kind {
         };
     }
 
+    pub fn get_last_not_empty(&self) -> bool {
+        match self {
+            Kind::FunctionDecl(ref item) => item.last_not_empty.unwrap_or(false),
+            Kind::VarDecl(ref item) => item.last_not_empty.unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    pub fn set_last_not_empty(&mut self, not_empty: bool) {
+        match self {
+            Kind::FunctionDecl(ref mut item) => item.last_not_empty = Some(not_empty),
+            Kind::VarDecl(ref mut item) => item.last_not_empty = Some(not_empty),
+            _ => {}
+        };
+    }
+
     /// 变量中应该翻译带初始化值的那一个, 如果都没有初始化，且非`extern`需要任意翻译一个.
     pub fn is_inited(&self) -> bool {
         match self {
@@ -422,6 +453,8 @@ pub struct VarDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
+    #[serde(default)]
+    last_not_empty: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -444,6 +477,8 @@ pub struct FunctionDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
+    #[serde(default)]
+    last_not_empty: Option<bool>,
 }
 
 pub(crate) struct File {
@@ -504,7 +539,8 @@ impl File {
             // let _ = fs::remove_file(p);
         });
         let new_c2rust_file = path.with_extension("c2rust_global");
-        fs::write(&*new_c2rust_file, code.as_bytes()).log_err(&format!("write {}", new_c2rust_file.display()))?;
+        fs::write(&*new_c2rust_file, code.as_bytes())
+            .log_err(&format!("write {}", new_c2rust_file.display()))?;
         // 输入已经是预处理后的文件，这里无条件使用clang只实现宏展开，不会引入clang特有的内容.
         let output = Command::new(get_clang())
             .arg("-xc")
@@ -667,15 +703,6 @@ impl File {
 
     pub fn export_header(&self, root: &Path) -> Result<String> {
         let mut header = Self::generate_c_code(root, &self.node.inner, true)?;
-        // gcc和clang的兼容性问题, 用于bindgen生成的头文件必须满足clang的要求.
-        // clang不认识这些gcc扩展属性，通过选项也无法忽略，只能删除.
-        let mut off = 0;
-        let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*__malloc__\s*(\(.+\))?\)\s*\)")
-            .map_err(|_| Error::inval())?;
-        while let Some(m) = re.find(&header[off..]) {
-            off += m.start();
-            header.replace_range(off..off + m.len(), "");
-        }
         // bindgen基于clang，clang需要定义，但是gcc的预处理没有，无条件添加，重复无影响
         let mut new_header = "typedef float _Float32;\n".to_string();
         new_header.push_str("typedef double _Float64;\n");
@@ -686,11 +713,7 @@ impl File {
         Ok(new_header)
     }
 
-    fn generate_c_code(
-        root: &Path,
-        nodes: &[Node],
-        is_header: bool,
-    ) -> Result<String> {
+    fn generate_c_code(root: &Path, nodes: &[Node], is_header: bool) -> Result<String> {
         let mut content = String::new();
         let mut last: Option<&Node> = None;
         for node in nodes {
@@ -731,9 +754,12 @@ impl File {
                     code.insert_str(0, "extern ");
                 }
             }
-            //rename_macro都需要插入到最前面.
             if let Some(rename) = node.kind.rename_macro() {
-                content.insert_str(0, &format!("{rename}\n"));
+                let insert_pos = content
+                    .rfind(|c| c == ';' || c == '}')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                content.insert_str(insert_pos, &format!("\n{rename}"));
             }
             content.push_str(&code);
         }
@@ -741,6 +767,7 @@ impl File {
             let code = last.kind.tail_code(root, None)?;
             content.push_str(&code);
         }
+        remove_unused_attrs(&mut content);
         Ok(content)
     }
 }
