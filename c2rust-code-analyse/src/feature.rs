@@ -254,7 +254,6 @@ impl Feature {
         } else {
             println!("Feature '{}' already up to date", self.name);
         }
-        self.deduplicate_mod_rs()?;
         Ok(())
     }
 
