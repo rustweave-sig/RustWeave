@@ -702,7 +702,7 @@ impl File {
     }
 
     pub fn export_header(&self, root: &Path) -> Result<String> {
-        let mut header = Self::generate_c_code(root, &self.node.inner, true)?;
+        let header = Self::generate_c_code(root, &self.node.inner, true)?;
         // bindgen基于clang，clang需要定义，但是gcc的预处理没有，无条件添加，重复无影响
         let mut new_header = "typedef float _Float32;\n".to_string();
         new_header.push_str("typedef double _Float64;\n");

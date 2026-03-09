@@ -413,6 +413,9 @@ impl Feature {
         let mod_rs = mod_dir.join("mod.rs");
         let content = fs::read_to_string(&mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let mut ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
+        let use_super = syn::parse_str(&format!("#[allow(unused_imports)]\nuse super::*;")).unwrap();
+        ast.items.insert(0, use_super);
+
         struct Visitor<'a>(&'a HashMap<&'a str, &'a Node>, bool);
         // _c2rust_private_仅仅体现在导出符号名中，本模块的代码仍然看到的是C代码中的名字.
         // 本目录下生成的C源码也要删除掉_c2rust_private_前缀
@@ -530,7 +533,6 @@ impl Feature {
             modules.push(syn::parse_str(&format!("mod {module};")).unwrap());
             modules.push(syn::parse_str(&format!("pub use {module}::*;")).unwrap());
         }
-        modules.push(syn::parse_str(&format!("#[allow(unused_imports)]\nuse super::*;")).unwrap());
         ast.items.extend(modules);
 
         let formatted = prettyplease::unparse(&ast);
