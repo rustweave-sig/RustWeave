@@ -89,6 +89,21 @@ fn range_include(range: &SourceRange, included: &SourceRange) -> bool {
     beg1.file == beg2.file && beg1.offset <= beg2.offset && end1.offset >= end2.offset
 }
 
+fn remove_unused_attrs(code: &mut String) {
+    let mut off = 0;
+    let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*always_inline\s*\)\s*\)").unwrap();
+    while let Some(m) = re.find(&code[off..]) {
+        off += m.start();
+        code.replace_range(off..off + m.len(), "");
+    }
+    off = 0;
+    let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*__malloc__\s*(\(.+\))?\)\s*\)").unwrap();
+    while let Some(m) = re.find(&code[off..]) {
+        off += m.start();
+        code.replace_range(off..off + m.len(), "");
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum Kind {
     EnumDecl(EnumDecl),
@@ -688,15 +703,6 @@ impl File {
 
     pub fn export_header(&self, root: &Path) -> Result<String> {
         let mut header = Self::generate_c_code(root, &self.node.inner, true)?;
-        // gcc和clang的兼容性问题, 用于bindgen生成的头文件必须满足clang的要求.
-        // clang不认识这些gcc扩展属性，通过选项也无法忽略，只能删除.
-        let mut off = 0;
-        let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*__malloc__\s*(\(.+\))?\)\s*\)")
-            .map_err(|_| Error::inval())?;
-        while let Some(m) = re.find(&header[off..]) {
-            off += m.start();
-            header.replace_range(off..off + m.len(), "");
-        }
         // bindgen基于clang，clang需要定义，但是gcc的预处理没有，无条件添加，重复无影响
         let mut new_header = "typedef float _Float32;\n".to_string();
         new_header.push_str("typedef double _Float64;\n");
@@ -761,6 +767,7 @@ impl File {
             let code = last.kind.tail_code(root, None)?;
             content.push_str(&code);
         }
+        remove_unused_attrs(&mut content);
         Ok(content)
     }
 }
