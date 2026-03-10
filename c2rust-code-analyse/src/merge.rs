@@ -1,7 +1,6 @@
 use crate::{Error, Feature, File, Result, ToError};
 use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::{visit_foreign_item, visit_item, visit_path, Visit};
@@ -48,34 +47,15 @@ impl Visit<'_> for DepNames {
 }
 
 impl Feature {
-    /// Rust文件和C源码文件一一对应，即合并原来同一个文件下独立的多个变量和函数的Rust文件
-    /// 合并时主要检查三点:
-    /// 1. 依赖的外表FFI声明去重
-    /// 1. 根据名字恢复C代码中符号可见性
-    /// 1. 合并后需要编译，可能存在因为符号冲突导致的编译错误，需要手工修正.
-    /// 1. 合并各个模块的mod.rs文件，去重后写入src/lib.rs
+    /// 将每个 mod_xxx 目录下的 fun_*.rs、var_*.rs 和 mod.rs 合并为单个 mod_xxx.rs 文件
+    /// mod.rs 中仅保留该模块实际依赖的类型和 FFI 声明
     pub fn merge(&mut self) -> Result<()> {
         println!("Starting merge for feature '{}'", self.name);
 
-        // 简化处理不区分名字空间，可能会导致实际未使用的符号仍然保留下来，可以接受.
-        let mut dep = DepNames::new();
-        let mut use_items = String::new();
-
-        // 处理每个file的Rust文件合并
+        // 每个模块独立处理
         for file in &self.files {
-            self.merge_file(file, &mut dep, &mut use_items)?;
+            self.merge_file(file)?;
         }
-
-        // 首先收集所有模块的mod.rs文件路径
-        let mod_rs_files = self.collect_mod_rs_files()?;
-
-        println!("Found {} mod.rs files to merge", mod_rs_files.len());
-
-        if mod_rs_files.is_empty() {
-            return Err(Error::inval());
-        }
-
-        self.merge_mod_rs(&mod_rs_files, &mut dep, &use_items)?;
 
         self.link_src()?;
 
@@ -83,19 +63,16 @@ impl Feature {
         Ok(())
     }
 
-    // 合并单个File对应的Rust文件
-    fn merge_file(&self, file: &File, dep: &mut DepNames, use_items: &mut String) -> Result<bool> {
-        // 获取File对应的mod目录名
+    // 合并单个 File 对应的 Rust 文件
+    fn merge_file(&self, file: &File) -> Result<bool> {
         let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
         let mod_dir = self.root.join("rust/src").join(&mod_name);
 
-        // 如果mod目录不存在，说明还没有Rust文件，跳过
         if !mod_dir.exists() {
             return Ok(false);
         }
 
         println!("Processing mod for merge: {}", mod_name);
-        // 收集目录下的所有.rs文件（排除mod.rs）
         let rs_files = Self::collect_rust_files(&mod_dir)?;
 
         println!(
@@ -104,37 +81,42 @@ impl Feature {
             mod_name
         );
 
-        // 如果没有rs文件，跳过
         if rs_files.is_empty() {
             return Err(Error::inval());
         }
 
         let mut items = Vec::new();
+        let mut deps = DepNames::new();
+
         for rs_file in &rs_files {
-            Self::parse_rust_file(rs_file, &mut items, use_items)?;
+            Self::parse_rust_file(rs_file, &mut items, &mut deps)?;
         }
 
-        // 提取转换后代码依赖的类型和FFI接口.
-        for item in items.iter_mut() {
-            visit_item(dep, item);
-        }
+        // 从 mod.rs 提取该模块依赖的类型和 FFI
+        let mod_rs = mod_dir.join("mod.rs");
+        let (type_items, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
 
-        // 创建合并后的文件AST
+        // 构建合并后的文件
+        let mut merged_items = Vec::new();
+        merged_items.push(syn::parse2(quote! { use super::*; }).unwrap());
+        merged_items.extend(type_items);
+        if let Some(fm) = foreign_mod {
+            merged_items.push(syn::Item::ForeignMod(fm));
+        }
+        merged_items.extend(items);
+
         let merged_file = syn::File {
             shebang: None,
             attrs: Vec::new(),
-            items,
+            items: merged_items,
         };
 
-        // 使用prettyplease格式化输出
         let formatted = prettyplease::unparse(&merged_file);
-        let content = format!("use super::*;\n\n{}", formatted);
 
         let merged_mod_dir = self.root.join("rust/src.2");
-        // 可能已经存在
         let _ = fs::create_dir(&merged_mod_dir);
         let merged_rs = merged_mod_dir.join(&mod_name).with_extension("rs");
-        fs::write(&merged_rs, content.as_bytes())
+        fs::write(&merged_rs, formatted.as_bytes())
             .log_err(&format!("write {}", merged_rs.display()))?;
 
         println!("File merged successfully: {}", merged_rs.display());
@@ -162,16 +144,14 @@ impl Feature {
         Ok(rs_files)
     }
 
-    // 解析所有Rust文件，收集items和已定义的函数名
     fn parse_rust_file(
         rs_file: &Path,
         all_items: &mut Vec<syn::Item>,
-        use_items: &mut String,
+        deps: &mut DepNames,
     ) -> Result<()> {
         let content =
             fs::read_to_string(rs_file).log_err(&format!("read {}", rs_file.display()))?;
         let ast = syn::parse_file(&content).log_err(&format!("parse {}", rs_file.display()))?;
-        // 去掉前缀var_或fun_的名字
         let file_name = rs_file
             .with_extension("")
             .file_name()
@@ -206,9 +186,11 @@ impl Feature {
                 &mut fn_item,
                 &rs_file.with_file_name(decl_file),
             )?;
+            visit_item(deps, &syn::Item::Fn(fn_item.clone()));
             all_items.push(syn::Item::Fn(fn_item));
         } else if let Some(syn::Item::Static(mut var_item)) = main_item {
             Self::merge_item_static(other_items, &mut var_item);
+            visit_item(deps, &syn::Item::Static(var_item.clone()));
             all_items.push(syn::Item::Static(var_item));
         } else {
             eprintln!(
@@ -217,16 +199,6 @@ impl Feature {
                 main_item_name
             );
         }
-        // 大模型生成的代码可能引用了模块`file_name`, 合并后需要利用`use`语句保证不影响已有代码.
-        // 这里路径格式一定满足要求, 直接调用unwrap
-        let mod_name = rs_file
-            .parent()
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        use_items.push_str(&format!("use {mod_name} as {file_name};\n"));
         Ok(())
     }
 
@@ -298,30 +270,6 @@ impl Feature {
         static_item.expr = syn::parse2(new_expr).unwrap();
     }
 
-    /// 收集所有模块目录下的mod.rs文件
-    fn collect_mod_rs_files(&self) -> Result<Vec<PathBuf>> {
-        let mut types_files = Vec::new();
-        let rust_src = self.root.join("rust/src");
-
-        if !rust_src.exists() {
-            return Ok(types_files);
-        }
-
-        for entry in WalkDir::new(&rust_src)
-            .min_depth(1)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if entry.depth() == 2 && path.file_name() == Some(OsStr::new("mod.rs")) {
-                types_files.push(path.to_path_buf());
-            }
-        }
-
-        Ok(types_files)
-    }
-
     fn item_name(item: &syn::Item) -> Option<String> {
         match item {
             syn::Item::Struct(item) => Some(item.ident.to_string()),
@@ -340,144 +288,75 @@ impl Feature {
         }
     }
 
-    /// 合并所有mod.rs文件，去重后写入src/lib.rs
-    fn merge_mod_rs(
-        &self,
-        mod_rs_files: &[PathBuf],
-        dep: &mut DepNames,
-        use_items: &str,
-    ) -> Result<()> {
-        // 收集所有mod.rs的内容
-        let mut all_items = HashMap::new();
-        let mut foreign_items = HashMap::new();
-        let mut merged_foreign_mod = None;
+    fn extract_dependencies(
+        mod_rs: &Path,
+        deps: &mut DepNames,
+    ) -> Result<(Vec<syn::Item>, Option<syn::ItemForeignMod>)> {
+        let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
+        let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
 
-        for mod_rs in mod_rs_files {
-            println!("Parsing mod.rs: {}", mod_rs.display());
-            let content =
-                fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
-            let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
+        let mut all_types: HashMap<String, syn::Item> = HashMap::new();
+        let mut all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
+        let mut foreign_mod_template: Option<syn::ItemForeignMod> = None;
 
-            for mut item in ast.items {
-                // 收集extern块
-                if let syn::Item::ForeignMod(ref mut foreign_mod) = item {
-                    for item in foreign_mod.items.clone() {
-                        if let Some(name) = Self::foreign_item_name(&item) {
-                            foreign_items.insert(name, item);
+        for item in ast.items {
+            match item {
+                syn::Item::ForeignMod(ref fm) => {
+                    if foreign_mod_template.is_none() {
+                        let mut template = fm.clone();
+                        template.items.clear();
+                        foreign_mod_template = Some(template);
+                    }
+                    for ffi_item in fm.items.clone() {
+                        if let Some(name) = Self::foreign_item_name(&ffi_item) {
+                            all_ffi.insert(name, ffi_item);
                         }
                     }
-                    foreign_mod.items = Vec::new();
-                    merged_foreign_mod = Some(foreign_mod.clone());
-                } else {
+                }
+                _ => {
                     if let Some(name) = Self::item_name(&item) {
-                        all_items.insert(name, item);
+                        all_types.insert(name, item);
                     }
                 }
             }
         }
 
-        all_items.insert(
-            "c_size_t".to_string(),
-            syn::parse2(quote!(
-                type c_size_t = usize;
-            ))
-            .unwrap(),
-        );
-        all_items.insert(
-            "c_ssize_t".to_string(),
-            syn::parse2(quote!(
-                type c_ssize_t = isize;
-            ))
-            .unwrap(),
-        );
-        all_items.insert(
-            "c_ptrdiff_t".to_string(),
-            syn::parse2(quote!(
-                type c_ptrdiff_t = isize;
-            ))
-            .unwrap(),
-        );
+        let mut dep_types = Vec::new();
+        let mut dep_ffi = Vec::new();
+        Self::filter_dependencies(all_types, all_ffi, deps, &mut dep_types, &mut dep_ffi);
 
-        let mut dep_items = Vec::new();
-        let mut dep_foreign_items = Vec::new();
-        Self::filter_merged_items(
-            all_items,
-            foreign_items,
-            dep,
-            &mut dep_items,
-            &mut dep_foreign_items,
-        );
-
-        if let Some(mut foreign_mod) = merged_foreign_mod {
-            foreign_mod.items = dep_foreign_items;
-            dep_items.push(syn::Item::ForeignMod(foreign_mod));
-        }
-
-        // 创建合并后的文件AST
-        let merged_file = syn::File {
-            shebang: None,
-            attrs: Vec::new(),
-            items: dep_items,
+        let foreign_mod = if !dep_ffi.is_empty() {
+            let mut fm = foreign_mod_template.unwrap();
+            fm.items = dep_ffi;
+            Some(fm)
+        } else {
+            None
         };
 
-        // 使用prettyplease格式化输出
-        let formatted = prettyplease::unparse(&merged_file);
-
-        let mut content = String::new();
-        content.push_str("#![allow(non_camel_case_types)]\n");
-        content.push_str("#![allow(non_snake_case)]\n");
-        content.push_str("#![allow(non_upper_case_globals)]\n");
-        content.push_str("#![allow(unsafe_op_in_unsafe_fn)]\n");
-        content.push_str("#![allow(improper_ctypes)]\n");
-        content.push_str("#![allow(dead_code)]\n");
-        content.push_str("#![allow(unused_imports)]\n");
-        content.push_str("use core::ffi::*;\n");
-        content.push('\n');
-        content.push_str(&formatted);
-        content.push('\n');
-        for file in &self.files {
-            let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
-            content.push_str("mod ");
-            content.push_str(&mod_name);
-            content.push_str(";\npub use ");
-            content.push_str(&mod_name);
-            content.push_str("::*;\n");
-        }
-        content.push_str(use_items);
-
-        // 写入src/lib.rs
-        let merge_dir = self.root.join("rust/src.2");
-        let lib_rs_path = merge_dir.join("lib.rs");
-        fs::write(&lib_rs_path, content.as_bytes()).log_err("write src.2/lib.rs")?;
-
-        println!("Merged mod.rs written to: {}", lib_rs_path.display());
-
-        Ok(())
+        Ok((dep_types, foreign_mod))
     }
 
-    fn filter_merged_items(
-        mut all_items: HashMap<String, syn::Item>,
-        foreign_items: HashMap<String, syn::ForeignItem>,
-        dep: &mut DepNames,
-        dep_items: &mut Vec<syn::Item>,
-        dep_foreign_items: &mut Vec<syn::ForeignItem>,
+    fn filter_dependencies(
+        mut all_types: HashMap<String, syn::Item>,
+        all_ffi: HashMap<String, syn::ForeignItem>,
+        deps: &mut DepNames,
+        dep_types: &mut Vec<syn::Item>,
+        dep_ffi: &mut Vec<syn::ForeignItem>,
     ) {
-        // 首先收集依赖的全部类型.
-        for (name, item) in foreign_items {
-            if dep.contains(&name) {
-                visit_foreign_item(dep, &item);
-                dep_foreign_items.push(item);
+        for (name, item) in all_ffi {
+            if deps.contains(&name) {
+                visit_foreign_item(deps, &item);
+                dep_ffi.push(item);
             }
         }
 
-        // 收集全部的类型依赖，知道没有新增任何间接依赖.
         let mut new_dep = true;
         while new_dep {
             new_dep = false;
-            all_items.retain(|name, item| {
-                if dep.contains(name) {
-                    visit_item(dep, item);
-                    dep_items.push(item.clone());
+            all_types.retain(|name, item| {
+                if deps.contains(name) {
+                    visit_item(deps, item);
+                    dep_types.push(item.clone());
                     new_dep = true;
                     return false;
                 }
@@ -485,10 +364,8 @@ impl Feature {
             });
         }
 
-        dep_items.sort_by(|item1, item2| Self::item_name(item2).cmp(&Self::item_name(item1)));
-        dep_foreign_items.sort_by(|item1, item2| {
-            Self::foreign_item_name(item2).cmp(&Self::foreign_item_name(item1))
-        });
+        dep_types.sort_by(|a, b| Self::item_name(b).cmp(&Self::item_name(a)));
+        dep_ffi.sort_by(|a, b| Self::foreign_item_name(b).cmp(&Self::foreign_item_name(a)));
     }
 
     fn link_src(&self) -> Result<()> {
@@ -513,86 +390,409 @@ impl Feature {
         });
         len != attrs.len()
     }
+
+    fn deduplicate_mod_rs(&self) -> Result<()> {
+        let rust_src = self.root.join("rust/src");
+        if !rust_src.exists() {
+            return Ok(());
+        }
+
+        let mod_rs_files: Vec<PathBuf> = WalkDir::new(&rust_src)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file() && e.path().file_name().map_or(false, |n| n == "mod.rs"))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        if mod_rs_files.is_empty() {
+            return Ok(());
+        }
+
+        // 命名类型: name -> Vec<syn::Item>
+        let mut named_items: HashMap<String, Vec<syn::Item>> = HashMap::new();
+        // FFI: link_name -> Vec<syn::ForeignItem>
+        let mut ffi_items: HashMap<String, Vec<syn::ForeignItem>> = HashMap::new();
+        // 遇到的第一个 ForeignMod
+        let mut first_foreign_mod: Option<syn::ItemForeignMod> = None;
+
+        for mod_rs_path in &mod_rs_files {
+            let content = fs::read_to_string(mod_rs_path)
+                .log_err(&format!("read {}", mod_rs_path.display()))?;
+            let ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+            for item in ast.items.into_iter() {
+                match item {
+                    syn::Item::Struct(s) => {
+                        let name = s.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Struct(s));
+                    }
+                    syn::Item::Union(u) => {
+                        let name = u.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Union(u));
+                    }
+                    syn::Item::Const(c) => {
+                        let name = c.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Const(c));
+                    }
+                    syn::Item::Type(t) => {
+                        let name = t.ident.to_string();
+                        named_items
+                            .entry(name)
+                            .or_default()
+                            .push(syn::Item::Type(t));
+                    }
+                    syn::Item::ForeignMod(fm) => {
+                        if first_foreign_mod.is_none() {
+                            let mut fm_clone = fm.clone();
+                            fm_clone.items.clear();
+                            first_foreign_mod = Some(fm_clone);
+                        }
+                        for foreign_item in fm.items.into_iter() {
+                            let link_name = match &foreign_item {
+                                syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
+                                    .unwrap_or_else(|| f.sig.ident.to_string()),
+                                syn::ForeignItem::Static(s) => Self::extract_link_name(&s.attrs)
+                                    .unwrap_or_else(|| s.ident.to_string()),
+                                _ => continue,
+                            };
+                            ffi_items.entry(link_name).or_default().push(foreign_item);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut named_to_extract: Vec<syn::Item> = Vec::new();
+        let mut ffi_to_extract: Vec<syn::ForeignItem> = Vec::new();
+        let mut named_remove_set: HashSet<String> = HashSet::new();
+        let mut ffi_remove_set: HashSet<String> = HashSet::new();
+
+        // named_items 处理: 多个mod.rs存在且内容完全相同才提取
+        for (name, items) in &named_items {
+            if items.len() > 1 {
+                let first_tokens = items[0].to_token_stream().to_string();
+                if items
+                    .iter()
+                    .all(|item| item.to_token_stream().to_string() == first_tokens)
+                {
+                    named_to_extract.push(items[0].clone());
+                    named_remove_set.insert(name.clone());
+                }
+            }
+        }
+
+        // ffi_items 处理: 多个mod.rs存在才提取
+        for (link_name, items) in &ffi_items {
+            if items.len() > 1 {
+                ffi_to_extract.push(items[0].clone());
+                ffi_remove_set.insert(link_name.clone());
+            }
+        }
+
+        if named_to_extract.is_empty() && ffi_to_extract.is_empty() {
+            return Ok(());
+        }
+
+        let lib_normalized_path = rust_src.join("lib.normalized");
+        let lib_rs_path = rust_src.join("lib.rs");
+
+        let base_content = if lib_normalized_path.exists() {
+            fs::read_to_string(&lib_normalized_path)
+                .log_err(&format!("read {}", lib_normalized_path.display()))?
+        } else {
+            fs::read_to_string(&lib_rs_path).log_err(&format!("read {}", lib_rs_path.display()))?
+        };
+
+        let mut lib_ast =
+            syn::parse_file(&base_content).log_err(&format!("parse {}", lib_rs_path.display()))?;
+
+        // 添加 named items
+        lib_ast.items.extend(named_to_extract);
+
+        // 添加 ffi items (使用 first_foreign_mod 作为基础)
+        if !ffi_to_extract.is_empty() {
+            if let Some(mut fm) = first_foreign_mod {
+                fm.items = ffi_to_extract;
+                lib_ast.items.push(syn::Item::ForeignMod(fm));
+            }
+        }
+
+        let formatted_lib = prettyplease::unparse(&lib_ast);
+        fs::write(&lib_rs_path, formatted_lib.as_bytes())
+            .log_err(&format!("write {}", lib_rs_path.display()))?;
+
+        // 从 mod.rs 删除已提取的 items
+        for mod_rs_path in &mod_rs_files {
+            let content = fs::read_to_string(mod_rs_path)
+                .log_err(&format!("read {}", mod_rs_path.display()))?;
+            let mut ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+            // 删除其他需要移除的 items 以及空的 ForeignMod
+            ast.items.retain_mut(|item| match item {
+                syn::Item::Struct(s) => !named_remove_set.contains(&s.ident.to_string()),
+                syn::Item::Union(u) => !named_remove_set.contains(&u.ident.to_string()),
+                syn::Item::Const(c) => !named_remove_set.contains(&c.ident.to_string()),
+                syn::Item::Type(t) => !named_remove_set.contains(&t.ident.to_string()),
+                syn::Item::ForeignMod(fm) => {
+                    fm.items.retain(|ffi| {
+                        let link_name = match ffi {
+                            syn::ForeignItem::Fn(f) => Self::extract_link_name(&f.attrs)
+                                .unwrap_or_else(|| f.sig.ident.to_string()),
+                            syn::ForeignItem::Static(s) => Self::extract_link_name(&s.attrs)
+                                .unwrap_or_else(|| s.ident.to_string()),
+                            _ => return true,
+                        };
+                        !ffi_remove_set.contains(&link_name)
+                    });
+                    !fm.items.is_empty()
+                }
+                _ => true,
+            });
+
+            let formatted = prettyplease::unparse(&ast);
+            fs::write(mod_rs_path, formatted.as_bytes())
+                .log_err(&format!("write {}", mod_rs_path.display()))?;
+        }
+
+        let total = named_remove_set.len() + ffi_remove_set.len();
+        println!("Deduplicated {} items to lib.rs", total);
+        Ok(())
+    }
+
+    fn extract_link_name(attrs: &[syn::Attribute]) -> Option<String> {
+        for attr in attrs {
+            let attr_str = attr.to_token_stream().to_string();
+            if attr_str.contains("link_name") {
+                if let Some(start) = attr_str.find("link_name") {
+                    let rest = &attr_str[start..];
+                    if let Some(quote_start) = rest.find('"') {
+                        let rest = &rest[quote_start + 1..];
+                        if let Some(quote_end) = rest.find('"') {
+                            return Some(rest[..quote_end].to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
-    use quote::ToTokens;
-    use syn::visit_mut::visit_item_use_mut;
-    /*
+    use syn::visit::Visit;
+
     #[test]
-    fn test1() {
-        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx::var_xxx::xxx;").unwrap();
-        let expect: syn::ItemUse = syn::parse_str("use crate::mod_xxx::xxx;").unwrap();
-        visit_item_use_mut(&mut NormalizeFile::new(), &mut path);
-        assert_eq!(
-            path.to_token_stream().to_string(),
-            expect.to_token_stream().to_string()
-        );
+    fn test_item_name() {
+        let item: syn::Item = syn::parse_str("struct MyStruct { x: i32 }").unwrap();
+        assert_eq!(Feature::item_name(&item), Some("MyStruct".to_string()));
+
+        let item: syn::Item = syn::parse_str("union MyUnion { x: i32 }").unwrap();
+        assert_eq!(Feature::item_name(&item), Some("MyUnion".to_string()));
+
+        let item: syn::Item = syn::parse_str("const MAX: usize = 100;").unwrap();
+        assert_eq!(Feature::item_name(&item), Some("MAX".to_string()));
+
+        let item: syn::Item = syn::parse_str("type MyType = i32;").unwrap();
+        assert_eq!(Feature::item_name(&item), Some("MyType".to_string()));
+
+        let item: syn::Item = syn::parse_str("fn my_func() {}").unwrap();
+        assert_eq!(Feature::item_name(&item), None);
     }
+
     #[test]
-    fn test2() {
-        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx::var_xxx;").unwrap();
-        let expect: syn::ItemUse =
-            syn::parse_str("use crate::mod_xxx::{self as var_xxx};").unwrap();
-        visit_item_use_mut(&mut NormalizeFile::new(), &mut path);
+    fn test_foreign_item_name() {
+        let item: syn::ForeignItem = syn::parse_str("fn external_func(x: i32) -> i32;").unwrap();
         assert_eq!(
-            path.to_token_stream().to_string(),
-            expect.to_token_stream().to_string()
+            Feature::foreign_item_name(&item),
+            Some("external_func".to_string())
         );
-    }
-    #[test]
-    fn test3() {
-        let mut path: syn::ItemUse =
-            syn::parse_str("use crate::mod_xxx::{var_xxx, fun_xxx as xxx, fun_yyy::yyy};").unwrap();
-        let expect: syn::ItemUse =
-            syn::parse_str("use crate::mod_xxx::{self as var_xxx, self as xxx, yyy};").unwrap();
-        visit_item_use_mut(&mut NormalizeFile::new(), &mut path);
+
+        let item: syn::ForeignItem = syn::parse_str("static EXTERNAL_VAR: i32;").unwrap();
         assert_eq!(
-            path.to_token_stream().to_string(),
-            expect.to_token_stream().to_string()
+            Feature::foreign_item_name(&item),
+            Some("EXTERNAL_VAR".to_string())
+        );
+
+        let item: syn::ForeignItem = syn::parse_str("type c_int = i32;").unwrap();
+        assert_eq!(Feature::foreign_item_name(&item), None);
+    }
+
+    #[test]
+    fn test_is_use_super() {
+        let item_use: syn::ItemUse = syn::parse_str("use super::*;").unwrap();
+        assert!(Feature::is_use_super(&item_use));
+
+        let item_use: syn::ItemUse = syn::parse_str("use super::SomeType;").unwrap();
+        assert!(!Feature::is_use_super(&item_use));
+
+        let item_use: syn::ItemUse = syn::parse_str("use crate::some_mod::*;").unwrap();
+        assert!(!Feature::is_use_super(&item_use));
+
+        let item_use: syn::ItemUse = syn::parse_str("use ::super::*;").unwrap();
+        assert!(!Feature::is_use_super(&item_use));
+    }
+
+    #[test]
+    fn test_remove_private_attr() {
+        let mut fn_item: syn::ItemFn =
+            syn::parse_str("#[_c2rust_private_abc] fn test() {}").unwrap();
+        assert!(Feature::remove_private_attr(&mut fn_item.attrs));
+        assert!(fn_item.attrs.is_empty());
+
+        let mut fn_item: syn::ItemFn = syn::parse_str("#[inline] fn test() {}").unwrap();
+        assert!(!Feature::remove_private_attr(&mut fn_item.attrs));
+        assert_eq!(fn_item.attrs.len(), 1);
+
+        let mut fn_item: syn::ItemFn =
+            syn::parse_str("#[_c2rust_private_abc] #[inline] fn test() {}").unwrap();
+        assert!(Feature::remove_private_attr(&mut fn_item.attrs));
+        assert_eq!(fn_item.attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_fn_signature() {
+        let mut fn_item: syn::ItemFn =
+            syn::parse_str("fn test(a: i32, b: i64) -> i32 { 0 }").unwrap();
+        let mut sig: syn::Signature =
+            syn::parse_str("fn test(x: *const i32, y: *mut i64) -> *const i32").unwrap();
+
+        Feature::merge_fn_signature(&mut fn_item, &mut sig);
+
+        assert_eq!(fn_item.sig.inputs.len(), 2);
+        assert!(matches!(fn_item.sig.output, syn::ReturnType::Type(_, _)));
+    }
+
+    #[test]
+    fn test_merge_item_static() {
+        let items = vec![syn::parse_str("const HELPER: i32 = 1;").unwrap()];
+        let mut static_item: syn::ItemStatic = syn::parse_str("static mut VAR: i32 = 42;").unwrap();
+
+        Feature::merge_item_static(items, &mut static_item);
+
+        let code = quote::quote!(#static_item).to_string();
+        assert!(code.contains("HELPER"));
+        assert!(code.contains("42"));
+    }
+
+    #[test]
+    fn test_dep_names_visit_path() {
+        let mut deps = DepNames::new();
+
+        let path: syn::Path = syn::parse_str("SomeType").unwrap();
+        deps.visit_path(&path);
+        assert!(deps.contains("SomeType"));
+        assert!(!deps.contains("OtherType"));
+
+        let path: syn::Path = syn::parse_str("_c2rust_private_hidden").unwrap();
+        deps.visit_path(&path);
+        assert!(!deps.contains("_c2rust_private_hidden"));
+    }
+
+    #[test]
+    fn test_dep_names_visit_macro() {
+        let mut deps = DepNames::new();
+
+        let mac: syn::Macro = syn::parse_str("some_macro!(x SomeType y OtherType z)").unwrap();
+        deps.visit_macro(&mac);
+        assert!(deps.mac_tokens.contains("SomeType"));
+        assert!(deps.mac_tokens.contains("OtherType"));
+
+        // contains 使用正则 [^a-zA-Z_]{name}[^a-zA-Z_] 匹配
+        // 所以需要前后有非字母字符才能匹配
+        assert!(deps.contains("SomeType"));
+        assert!(deps.contains("OtherType"));
+    }
+
+    #[test]
+    fn test_filter_dependencies_basic() {
+        let mut deps = DepNames::new();
+        deps.used_names.insert("UsedType".to_string());
+        deps.used_names.insert("used_func".to_string());
+
+        let mut all_types: HashMap<String, syn::Item> = HashMap::new();
+        all_types.insert(
+            "UsedType".to_string(),
+            syn::parse_str("struct UsedType { x: i32 }").unwrap(),
+        );
+        all_types.insert(
+            "UnusedType".to_string(),
+            syn::parse_str("struct UnusedType { x: i32 }").unwrap(),
+        );
+
+        let mut all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
+        all_ffi.insert(
+            "used_func".to_string(),
+            syn::parse_str("fn used_func() -> i32;").unwrap(),
+        );
+        all_ffi.insert(
+            "unused_func".to_string(),
+            syn::parse_str("fn unused_func() -> i32;").unwrap(),
+        );
+
+        let mut dep_types = Vec::new();
+        let mut dep_ffi = Vec::new();
+
+        Feature::filter_dependencies(all_types, all_ffi, &mut deps, &mut dep_types, &mut dep_ffi);
+
+        assert_eq!(dep_types.len(), 1);
+        assert_eq!(dep_ffi.len(), 1);
+        assert_eq!(
+            Feature::item_name(&dep_types[0]),
+            Some("UsedType".to_string())
+        );
+        assert_eq!(
+            Feature::foreign_item_name(&dep_ffi[0]),
+            Some("used_func".to_string())
         );
     }
 
     #[test]
-    fn test4() {
-        let mut normalize = NormalizeFile::new();
-        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx;").unwrap();
-        visit_item_use_mut(&mut normalize, &mut path);
-        let mut path: syn::ItemUse =
-            syn::parse_str("use mod_xxx::{var_xxx, fun_xxx as xxx, fun_yyy::yyy};").unwrap();
-        let expect: syn::ItemUse =
-            syn::parse_str("use mod_xxx::{self as var_xxx, self as xxx, yyy};").unwrap();
-        visit_item_use_mut(&mut normalize, &mut path);
-        assert_eq!(
-            path.to_token_stream().to_string(),
-            expect.to_token_stream().to_string()
+    fn test_filter_dependencies_transitive() {
+        let mut deps = DepNames::new();
+        deps.used_names.insert("TypeA".to_string());
+
+        let mut all_types: HashMap<String, syn::Item> = HashMap::new();
+        all_types.insert(
+            "TypeA".to_string(),
+            syn::parse_str("struct TypeA { b: TypeB }").unwrap(),
         );
-    }
-    #[test]
-    fn test5() {
-        let mut normalize = NormalizeFile::new();
-        let mut path: syn::ItemUse = syn::parse_str("use crate::mod_xxx as zzz;").unwrap();
-        visit_item_use_mut(&mut normalize, &mut path);
-        let mut path: syn::ItemUse =
-            syn::parse_str("use zzz::{var_xxx, fun_xxx as xxx, fun_yyy::yyy};").unwrap();
-        let expect: syn::ItemUse =
-            syn::parse_str("use zzz::{self as var_xxx, self as xxx, yyy};").unwrap();
-        visit_item_use_mut(&mut normalize, &mut path);
-        assert_eq!(
-            path.to_token_stream().to_string(),
-            expect.to_token_stream().to_string()
+        all_types.insert(
+            "TypeB".to_string(),
+            syn::parse_str("struct TypeB { x: i32 }").unwrap(),
         );
-    }
-    */
-    #[test]
-    fn test6() {
-        let mut code = "__attribute__( ( always_inline)) void foo();".to_string();
-        let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*always_inline\s*\)\s*\)").unwrap();
-        if let Some(m) = re.find(&code) {
-            code.replace_range(m.start()..m.start() + m.len(), "");
-        }
-        assert_eq!(code, " void foo();");
+        all_types.insert(
+            "TypeC".to_string(),
+            syn::parse_str("struct TypeC { x: i32 }").unwrap(),
+        );
+
+        let all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
+        let mut dep_types = Vec::new();
+        let mut dep_ffi = Vec::new();
+
+        Feature::filter_dependencies(all_types, all_ffi, &mut deps, &mut dep_types, &mut dep_ffi);
+
+        assert_eq!(dep_types.len(), 2);
+        let names: std::collections::HashSet<_> = dep_types
+            .iter()
+            .filter_map(|t| Feature::item_name(t))
+            .collect();
+        assert!(names.contains("TypeA"));
+        assert!(names.contains("TypeB"));
+        assert!(!names.contains("TypeC"));
     }
 }
