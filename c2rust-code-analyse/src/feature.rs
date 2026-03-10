@@ -664,15 +664,21 @@ impl Feature {
 
     fn update_c_file_mtime(rust_file: &Path) -> Result<()> {
         let c_file = rust_file.with_extension("c");
-        let rust_metadata =
-            fs::metadata(rust_file).log_err(&format!("metadata {}", rust_file.display()))?;
-        filetime::set_file_mtime(
-            &c_file,
-            filetime::FileTime::from_system_time(
-                rust_metadata.modified().log_err("get modified time")?,
-            ),
-        )
-        .log_err(&format!("set mtime for {}", c_file.display()))?;
+
+        // 使用过去固定时间（当前时间 - 1 分钟）
+        // 避免时间精度问题，同时保证两个文件时间相同
+        let mtime = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap_or(std::time::SystemTime::now());
+
+        let file_time = filetime::FileTime::from_system_time(mtime);
+
+        filetime::set_file_mtime(&c_file, file_time)
+            .log_err(&format!("set mtime for {}", c_file.display()))?;
+
+        filetime::set_file_mtime(rust_file, file_time)
+            .log_err(&format!("set mtime for {}", rust_file.display()))?;
+
         Ok(())
     }
 
