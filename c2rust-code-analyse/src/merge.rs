@@ -827,4 +827,47 @@ mod tests {
         assert!(names.contains("TypeB"));
         assert!(!names.contains("TypeC"));
     }
+
+    #[test]
+    fn test_ffi_name_fn() {
+        let ffi: syn::ForeignItem = syn::parse_str("fn external_func(x: i32) -> i32;").unwrap();
+        assert_eq!(Feature::ffi_name(&ffi), "external_func");
+
+        let ffi: syn::ForeignItem =
+            syn::parse_str(r#"#[link_name = "actual_name"] fn renamed_func() -> void;"#).unwrap();
+        assert_eq!(Feature::ffi_name(&ffi), "actual_name");
+    }
+
+    #[test]
+    fn test_ffi_name_static() {
+        let ffi: syn::ForeignItem = syn::parse_str("static EXTERNAL_VAR: i32;").unwrap();
+        assert_eq!(Feature::ffi_name(&ffi), "EXTERNAL_VAR");
+
+        let ffi: syn::ForeignItem =
+            syn::parse_str(r#"#[link_name = "actual_var"] static RENAMED_VAR: i32;"#).unwrap();
+        assert_eq!(Feature::ffi_name(&ffi), "actual_var");
+    }
+
+    #[test]
+    fn test_ffi_name_type() {
+        let ffi: syn::ForeignItem = syn::parse_str("type c_int = i32;").unwrap();
+        assert_eq!(Feature::ffi_name(&ffi), "");
+    }
+
+    #[test]
+    fn test_extract_link_name() {
+        let fn_item: syn::ItemFn =
+            syn::parse_str(r#"#[link_name = "actual_name"] fn test() {}"#).unwrap();
+        let link_name = Feature::extract_link_name(&fn_item.attrs);
+        assert_eq!(link_name, Some("actual_name".to_string()));
+
+        let fn_item: syn::ItemFn = syn::parse_str(r#"#[inline] fn test() {}"#).unwrap();
+        let link_name = Feature::extract_link_name(&fn_item.attrs);
+        assert_eq!(link_name, None);
+
+        let fn_item: syn::ItemFn =
+            syn::parse_str(r#"#[cfg(test)] #[link_name = "another_name"] fn test() {}"#).unwrap();
+        let link_name = Feature::extract_link_name(&fn_item.attrs);
+        assert_eq!(link_name, Some("another_name".to_string()));
+    }
 }
