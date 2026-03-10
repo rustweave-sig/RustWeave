@@ -339,6 +339,19 @@ impl Feature {
             }
         }
 
+        all_types.insert(
+            "c_size_t".to_string(),
+            syn::parse_str("type c_size_t = usize;").unwrap(),
+        );
+        all_types.insert(
+            "c_ssize_t".to_string(),
+            syn::parse_str("type c_ssize_t = isize;").unwrap(),
+        );
+        all_types.insert(
+            "c_ptrdiff_t".to_string(),
+            syn::parse_str("type c_ptrdiff_t = isize;").unwrap(),
+        );
+
         let mut dep_types = Vec::new();
         let mut dep_ffi = Vec::new();
         Self::filter_dependencies(all_types, all_ffi, deps, &mut dep_types, &mut dep_ffi);
@@ -594,12 +607,7 @@ impl Feature {
         let mut lib_file = syn::File {
             shebang: None,
             attrs,
-            items: vec![
-                syn::parse_str("use core::ffi::*;").unwrap(),
-                syn::parse_str("type c_size_t = usize;").unwrap(),
-                syn::parse_str("type c_ssize_t = isize;").unwrap(),
-                syn::parse_str("type c_ptrdiff_t = isize;").unwrap(),
-            ],
+            items: vec![syn::parse_str("use core::ffi::*;").unwrap()],
         };
 
         lib_file.items.extend(lib_items);
