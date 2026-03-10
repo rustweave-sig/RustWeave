@@ -528,7 +528,7 @@ impl File {
             return Ok(node);
         }
 
-        let new_c_file = path.with_extension("c");
+        let new_c_file = path.with_extension("c2rust_without_static");
         Self::preprocess_c_code(root, &node.inner, path, &new_c_file)?;
 
         let mut new_node = Self::load_by_c_file(root, &new_c_file)?;
