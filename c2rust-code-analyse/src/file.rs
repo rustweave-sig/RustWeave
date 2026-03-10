@@ -755,11 +755,10 @@ impl File {
                 }
             }
             if let Some(rename) = node.kind.rename_macro() {
-                let insert_pos = content
-                    .rfind(|c| c == ';' || c == '}')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                content.insert_str(insert_pos, &format!("\n{rename}"));
+                // 在哪里插入这个宏是一个问题，函数本身可能递归，函数前和后也可能存在一些特定的扩展属性以及注释信息.
+                // 只有插入到文件头相对好一些，但存在潜在的问题，就是之前的某个函数中存在名字冲突这种场景，相对罕见.
+                let insert_pos = 0;
+                content.insert_str(insert_pos, &format!("\n{rename}\n"));
             }
             content.push_str(&code);
         }
