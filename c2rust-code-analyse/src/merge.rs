@@ -49,6 +49,19 @@ impl Visit<'_> for DepNames {
     }
 }
 
+struct CollectedItems {
+    named_items: HashMap<String, Vec<syn::Item>>,
+    ffi_items: HashMap<String, Vec<syn::ForeignItem>>,
+    foreign_mod_template: Option<syn::ItemForeignMod>,
+}
+
+struct Duplicates {
+    named_to_extract: Vec<syn::Item>,
+    named_remove_set: HashSet<String>,
+    ffi_to_extract: Vec<syn::ForeignItem>,
+    ffi_remove_set: HashSet<String>,
+}
+
 impl Feature {
     /// 将每个 mod_xxx 目录下的 fun_*.rs、var_*.rs 和 mod.rs 合并为单个 mod_xxx.rs 文件
     /// mod.rs 中仅保留该模块实际依赖的类型和 FFI 声明
@@ -402,7 +415,35 @@ impl Feature {
             return Ok(());
         }
 
-        let mod_files: Vec<PathBuf> = WalkDir::new(&src_2)
+        let mod_files = Self::collect_mod_files(&src_2)?;
+        if mod_files.is_empty() {
+            return Ok(());
+        }
+
+        let collected = Self::collect_items_from_files(&mod_files)?;
+        let duplicates = Self::find_duplicates(&collected.named_items, &collected.ffi_items);
+
+        Self::generate_lib_rs(
+            &src_2,
+            &mod_files,
+            &duplicates,
+            &collected.foreign_mod_template,
+        )?;
+
+        if !duplicates.named_remove_set.is_empty() || !duplicates.ffi_remove_set.is_empty() {
+            Self::remove_duplicates_from_files(&mod_files, &duplicates)?;
+        }
+
+        println!(
+            "Deduplicated {} types and {} FFI declarations to lib.rs",
+            duplicates.named_remove_set.len(),
+            duplicates.ffi_remove_set.len()
+        );
+        Ok(())
+    }
+
+    fn collect_mod_files(src_2: &Path) -> Result<Vec<PathBuf>> {
+        let mod_files: Vec<PathBuf> = WalkDir::new(src_2)
             .min_depth(1)
             .max_depth(1)
             .into_iter()
@@ -417,16 +458,15 @@ impl Feature {
             })
             .map(|e| e.path().to_path_buf())
             .collect();
+        Ok(mod_files)
+    }
 
-        if mod_files.is_empty() {
-            return Ok(());
-        }
-
+    fn collect_items_from_files(mod_files: &[PathBuf]) -> Result<CollectedItems> {
         let mut named_items: HashMap<String, Vec<syn::Item>> = HashMap::new();
         let mut ffi_items: HashMap<String, Vec<syn::ForeignItem>> = HashMap::new();
         let mut foreign_mod_template: Option<syn::ItemForeignMod> = None;
 
-        for mod_file in &mod_files {
+        for mod_file in mod_files {
             let content =
                 fs::read_to_string(mod_file).log_err(&format!("read {}", mod_file.display()))?;
             let ast =
@@ -478,12 +518,23 @@ impl Feature {
             }
         }
 
+        Ok(CollectedItems {
+            named_items,
+            ffi_items,
+            foreign_mod_template,
+        })
+    }
+
+    fn find_duplicates(
+        named_items: &HashMap<String, Vec<syn::Item>>,
+        ffi_items: &HashMap<String, Vec<syn::ForeignItem>>,
+    ) -> Duplicates {
         let mut named_to_extract: Vec<syn::Item> = Vec::new();
         let mut named_remove_set: HashSet<String> = HashSet::new();
         let mut ffi_to_extract: Vec<syn::ForeignItem> = Vec::new();
         let mut ffi_remove_set: HashSet<String> = HashSet::new();
 
-        for (name, items) in &named_items {
+        for (name, items) in named_items {
             if items.len() > 1 {
                 let first_tokens = items[0].to_token_stream().to_string();
                 if items
@@ -496,20 +547,33 @@ impl Feature {
             }
         }
 
-        for (name, items) in &ffi_items {
+        for (name, items) in ffi_items {
             if items.len() > 1 {
                 ffi_to_extract.push(items[0].clone());
                 ffi_remove_set.insert(name.clone());
             }
         }
 
+        Duplicates {
+            named_to_extract,
+            named_remove_set,
+            ffi_to_extract,
+            ffi_remove_set,
+        }
+    }
+
+    fn generate_lib_rs(
+        src_2: &Path,
+        mod_files: &[PathBuf],
+        duplicates: &Duplicates,
+        foreign_mod_template: &Option<syn::ItemForeignMod>,
+    ) -> Result<()> {
         let mut lib_items: Vec<syn::Item> = Vec::new();
+        lib_items.extend(duplicates.named_to_extract.clone());
 
-        lib_items.extend(named_to_extract);
-
-        if !ffi_to_extract.is_empty() {
-            if let Some(mut fm) = foreign_mod_template {
-                fm.items = ffi_to_extract;
+        if !duplicates.ffi_to_extract.is_empty() {
+            if let Some(mut fm) = foreign_mod_template.clone() {
+                fm.items = duplicates.ffi_to_extract.clone();
                 lib_items.push(syn::Item::ForeignMod(fm));
             }
         }
@@ -540,7 +604,7 @@ impl Feature {
 
         lib_file.items.extend(lib_items);
 
-        for mod_file in &mod_files {
+        for mod_file in mod_files {
             let mod_name = mod_file.file_stem().unwrap().to_string_lossy().to_string();
             lib_file
                 .items
@@ -555,25 +619,24 @@ impl Feature {
         fs::write(&lib_rs_path, lib_content.as_bytes())
             .log_err(&format!("write {}", lib_rs_path.display()))?;
 
-        if named_remove_set.is_empty() && ffi_remove_set.is_empty() {
-            println!("Generated lib.rs with {} modules", mod_files.len());
-            return Ok(());
-        }
+        Ok(())
+    }
 
-        for mod_file in &mod_files {
+    fn remove_duplicates_from_files(mod_files: &[PathBuf], duplicates: &Duplicates) -> Result<()> {
+        for mod_file in mod_files {
             let content =
                 fs::read_to_string(mod_file).log_err(&format!("read {}", mod_file.display()))?;
             let mut ast =
                 syn::parse_file(&content).log_err(&format!("parse {}", mod_file.display()))?;
 
             ast.items.retain_mut(|item| match item {
-                syn::Item::Struct(s) => !named_remove_set.contains(&s.ident.to_string()),
-                syn::Item::Union(u) => !named_remove_set.contains(&u.ident.to_string()),
-                syn::Item::Const(c) => !named_remove_set.contains(&c.ident.to_string()),
-                syn::Item::Type(t) => !named_remove_set.contains(&t.ident.to_string()),
+                syn::Item::Struct(s) => !duplicates.named_remove_set.contains(&s.ident.to_string()),
+                syn::Item::Union(u) => !duplicates.named_remove_set.contains(&u.ident.to_string()),
+                syn::Item::Const(c) => !duplicates.named_remove_set.contains(&c.ident.to_string()),
+                syn::Item::Type(t) => !duplicates.named_remove_set.contains(&t.ident.to_string()),
                 syn::Item::ForeignMod(fm) => {
                     fm.items
-                        .retain(|ffi| !ffi_remove_set.contains(&Self::ffi_name(ffi)));
+                        .retain(|ffi| !duplicates.ffi_remove_set.contains(&Self::ffi_name(ffi)));
                     !fm.items.is_empty()
                 }
                 _ => true,
@@ -583,12 +646,6 @@ impl Feature {
             fs::write(mod_file, formatted.as_bytes())
                 .log_err(&format!("write {}", mod_file.display()))?;
         }
-
-        println!(
-            "Deduplicated {} types and {} FFI declarations to lib.rs",
-            named_remove_set.len(),
-            ffi_remove_set.len()
-        );
         Ok(())
     }
 
