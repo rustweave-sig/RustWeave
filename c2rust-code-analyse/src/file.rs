@@ -312,22 +312,6 @@ impl Kind {
         };
     }
 
-    pub fn get_last_not_empty(&self) -> bool {
-        match self {
-            Kind::FunctionDecl(ref item) => item.last_not_empty.unwrap_or(false),
-            Kind::VarDecl(ref item) => item.last_not_empty.unwrap_or(false),
-            _ => false,
-        }
-    }
-
-    pub fn set_last_not_empty(&mut self, not_empty: bool) {
-        match self {
-            Kind::FunctionDecl(ref mut item) => item.last_not_empty = Some(not_empty),
-            Kind::VarDecl(ref mut item) => item.last_not_empty = Some(not_empty),
-            _ => {}
-        };
-    }
-
     /// 变量中应该翻译带初始化值的那一个, 如果都没有初始化，且非`extern`需要任意翻译一个.
     pub fn is_inited(&self) -> bool {
         match self {
@@ -453,8 +437,6 @@ pub struct VarDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
-    #[serde(default)]
-    last_not_empty: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -477,18 +459,32 @@ pub struct FunctionDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
-    #[serde(default)]
-    last_not_empty: Option<bool>,
 }
 
 pub(crate) struct File {
     node: Node,
     path: PathBuf,
+    loaded_from_json: bool,
 }
 
 impl File {
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     pub fn new(root: &Path, path: &Path) -> Result<Self> {
+        let json_file = path.with_extension("json");
+
+        if json_file.exists() {
+            // 尝试从 JSON 文件加载
+            if let Ok(node) = Self::load_from_json(&json_file) {
+                return Ok(Self {
+                    node,
+                    path: path.to_path_buf(),
+                    loaded_from_json: true,
+                });
+            }
+            // 加载失败，继续从 C 文件解析
+        }
+
+        // 从 C 文件解析
         Self::with_c_file(root, path)
     }
 
@@ -502,6 +498,14 @@ impl File {
         fs::write(&json_file, json).map_err(|_| Error::last())
     }
 
+    fn load_from_json(json_file: &Path) -> Result<Node> {
+        let content =
+            fs::read_to_string(json_file).log_err(&format!("read {}", json_file.display()))?;
+        let node: Node =
+            serde_json::from_str(&content).log_err(&format!("parse {}", json_file.display()))?;
+        Ok(node)
+    }
+
     fn with_c_file(root: &Path, path: &Path) -> Result<Self> {
         let mut node = Self::load_by_c_file(root, path)?;
         let Kind::TranslationUnitDecl(ref mut unit) = node.kind else {
@@ -512,58 +516,76 @@ impl File {
         Ok(Self {
             node,
             path: path.to_path_buf(),
+            loaded_from_json: false,
         })
     }
 
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     fn remove_static(root: &Path, path: &Path, mut node: Node) -> Result<Node> {
         let md5 = Self::md5_file(&path.with_extension("c2rust"))?;
-        let mut has_static = false;
-        for node in &mut node.inner {
-            if !node.kind.is_static() {
-                continue;
-            }
-            let Some(name) = node.kind.name() else {
-                continue;
-            };
-            node.kind
-                .set_global_name(format!("_c2rust_private_{md5}_{name}"));
-            has_static = true;
-        }
-        if !has_static {
+
+        if !Self::rename_static_symbols(&mut node, &md5) {
             return Ok(node);
         }
-        let code = Self::generate_c_code(root, &node.inner, false)?;
-        let new_c_file = higuard::Guard::new(path.with_extension("c"), |_| {
-            // 不删除方便定位，后续执行会无条件覆盖.
-            // let _ = fs::remove_file(p);
-        });
-        let new_c2rust_file = path.with_extension("c2rust_global");
-        fs::write(&*new_c2rust_file, code.as_bytes())
-            .log_err(&format!("write {}", new_c2rust_file.display()))?;
-        // 输入已经是预处理后的文件，这里无条件使用clang只实现宏展开，不会引入clang特有的内容.
-        let output = Command::new(get_clang())
-            .arg("-xc")
-            .arg("-E")
-            .arg("-C") //保留注释
-            .arg("-P") //去除行号, 混合构建需要调试应该直接定位到这里生成的文件而不是原文件.
-            .arg("-fno-builtin")
-            .arg(&*new_c2rust_file)
-            .arg("-o")
-            .arg(&*new_c_file)
-            .output()
-            .log_err("clang -xc -E -P -fno-builtin")?;
-        if !output.status.success() {
-            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-            return Err(Error::last());
-        }
+
+        let new_c_file = path.with_extension("c2rust_without_static");
+        Self::preprocess_c_code(root, &node.inner, path, &new_c_file)?;
+
         let mut new_node = Self::load_by_c_file(root, &new_c_file)?;
         let Kind::TranslationUnitDecl(ref mut unit) = new_node.kind else {
             return Err(Error::inval());
         };
         unit.md5 = Some(Self::md5_file(path)?);
-        new_c_file.discard();
         Ok(new_node)
+    }
+
+    fn rename_static_symbols(node: &mut Node, md5: &str) -> bool {
+        let mut has_static = false;
+        for child in &mut node.inner {
+            if !child.kind.is_static() {
+                continue;
+            }
+            let Some(name) = child.kind.name() else {
+                continue;
+            };
+            child
+                .kind
+                .set_global_name(format!("_c2rust_private_{md5}_{name}"));
+            has_static = true;
+        }
+        has_static
+    }
+
+    fn preprocess_c_code(root: &Path, nodes: &[Node], path: &Path, output: &Path) -> Result<()> {
+        let new_c2rust_file = path.with_extension("c2rust_global");
+        let mut fix = false;
+        loop {
+            let code = Self::generate_c_code(root, nodes, false, fix)?;
+            fs::write(&new_c2rust_file, code.as_bytes())
+                .log_err(&format!("write {}", new_c2rust_file.display()))?;
+
+            let output_result = Command::new(get_clang())
+                .arg("-xc")
+                .arg("-E")
+                .arg("-C")
+                .arg("-P")
+                .arg("-fno-builtin")
+                .arg(&new_c2rust_file)
+                .arg("-o")
+                .arg(output)
+                .output()
+                .log_err("clang -xc -E -P -fno-builtin")?;
+
+            if output_result.status.success() {
+                return Ok(());
+            }
+            if !fix {
+                fix = true;
+                continue;
+            }
+            eprintln!("{}", String::from_utf8_lossy(&output_result.stderr));
+            return Err(Error::last());
+        }
     }
 
     fn load_by_c_file(root: &Path, path: &Path) -> Result<Node> {
@@ -696,13 +718,17 @@ impl File {
         &self.path
     }
 
+    pub fn loaded_from_json(&self) -> bool {
+        self.loaded_from_json
+    }
+
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     pub fn export_c_code(&self, root: &Path) -> Result<String> {
-        Self::generate_c_code(root, &self.node.inner, false)
+        Self::generate_c_code(root, &self.node.inner, false, false)
     }
 
     pub fn export_header(&self, root: &Path) -> Result<String> {
-        let header = Self::generate_c_code(root, &self.node.inner, true)?;
+        let header = Self::generate_c_code(root, &self.node.inner, true, false)?;
         // bindgen基于clang，clang需要定义，但是gcc的预处理没有，无条件添加，重复无影响
         let mut new_header = "typedef float _Float32;\n".to_string();
         new_header.push_str("typedef double _Float64;\n");
@@ -713,7 +739,8 @@ impl File {
         Ok(new_header)
     }
 
-    fn generate_c_code(root: &Path, nodes: &[Node], is_header: bool) -> Result<String> {
+    // fix: 表示之前生成的代码出现了错误，需要调整生成策略.
+    fn generate_c_code(root: &Path, nodes: &[Node], is_header: bool, fix: bool) -> Result<String> {
         let mut content = String::new();
         let mut last: Option<&Node> = None;
         for node in nodes {
@@ -757,8 +784,12 @@ impl File {
             if let Some(rename) = node.kind.rename_macro() {
                 // 在哪里插入这个宏是一个问题，函数本身可能递归，函数前和后也可能存在一些特定的扩展属性以及注释信息.
                 // 只有插入到文件头相对好一些，但存在潜在的问题，就是之前的某个函数中存在名字冲突这种场景，相对罕见.
-                let insert_pos = 0;
-                content.insert_str(insert_pos, &format!("\n{rename}\n"));
+                // 先尝试插入到函数头，如果出现了编译错误，则插入到文件头.
+                if !fix {
+                    content.push_str(&format!("\n{rename}\n"));
+                } else {
+                    content.insert_str(0, &format!("\n{rename}\n"));
+                }
             }
             content.push_str(&code);
         }
@@ -768,5 +799,152 @@ impl File {
         }
         remove_unused_attrs(&mut content);
         Ok(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_static_function_node(name: &str) -> Node {
+        Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::FunctionDecl(FunctionDecl {
+                name: name.to_string(),
+                loc: SourceLocation::default(),
+                range: SourceRange::default(),
+                is_definition: true,
+                is_implicit: false,
+                inline: false,
+                ty: MyClangType {
+                    qual_type: "void ()".to_string(),
+                    desugared_qual_type: None,
+                },
+                storage_class: Some("static".to_string()),
+                git_commit: false,
+                global_name: None,
+                skip: false,
+            }),
+            inner: vec![],
+        }
+    }
+
+    fn make_non_static_function_node(name: &str) -> Node {
+        Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::FunctionDecl(FunctionDecl {
+                name: name.to_string(),
+                loc: SourceLocation::default(),
+                range: SourceRange::default(),
+                is_definition: true,
+                is_implicit: false,
+                inline: false,
+                ty: MyClangType {
+                    qual_type: "void ()".to_string(),
+                    desugared_qual_type: None,
+                },
+                storage_class: None,
+                git_commit: false,
+                global_name: None,
+                skip: false,
+            }),
+            inner: vec![],
+        }
+    }
+
+    fn make_static_var_node(name: &str) -> Node {
+        Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::VarDecl(VarDecl {
+                name: name.to_string(),
+                loc: SourceLocation::default(),
+                range: SourceRange::default(),
+                ty: MyClangType {
+                    qual_type: "int".to_string(),
+                    desugared_qual_type: None,
+                },
+                storage_class: Some("static".to_string()),
+                init: None,
+                is_implicit: false,
+                git_commit: false,
+                global_name: None,
+                skip: false,
+            }),
+            inner: vec![],
+        }
+    }
+
+    #[test]
+    fn test_rename_static_symbols_no_static() {
+        let mut node = Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::TranslationUnitDecl(TranslationUnitDecl {
+                md5: None,
+                git_commit: false,
+            }),
+            inner: vec![
+                make_non_static_function_node("foo"),
+                make_non_static_function_node("bar"),
+            ],
+        };
+
+        let result = File::rename_static_symbols(&mut node, "abc123");
+        assert!(!result);
+
+        assert!(node.inner[0].kind.global_name().is_none());
+        assert!(node.inner[1].kind.global_name().is_none());
+    }
+
+    #[test]
+    fn test_rename_static_symbols_with_static() {
+        let mut node = Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::TranslationUnitDecl(TranslationUnitDecl {
+                md5: None,
+                git_commit: false,
+            }),
+            inner: vec![
+                make_static_function_node("private_func"),
+                make_non_static_function_node("public_func"),
+            ],
+        };
+
+        let result = File::rename_static_symbols(&mut node, "abc123");
+        assert!(result);
+
+        assert_eq!(
+            node.inner[0].kind.global_name(),
+            Some("_c2rust_private_abc123_private_func")
+        );
+        assert!(node.inner[1].kind.global_name().is_none());
+    }
+
+    #[test]
+    fn test_rename_static_symbols_mixed() {
+        let mut node = Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::TranslationUnitDecl(TranslationUnitDecl {
+                md5: None,
+                git_commit: false,
+            }),
+            inner: vec![
+                make_static_function_node("static_fn"),
+                make_static_var_node("static_var"),
+                make_non_static_function_node("public_fn"),
+            ],
+        };
+
+        let result = File::rename_static_symbols(&mut node, "xyz789");
+        assert!(result);
+
+        assert_eq!(
+            node.inner[0].kind.global_name(),
+            Some("_c2rust_private_xyz789_static_fn")
+        );
+        assert_eq!(
+            node.inner[1].kind.global_name(),
+            Some("_c2rust_private_xyz789_static_var")
+        );
+        assert!(node.inner[2].kind.global_name().is_none());
     }
 }

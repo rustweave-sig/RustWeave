@@ -187,6 +187,7 @@ impl Feature {
             // 收集需要更新的节点及其新状态
             let mut is_updated = false;
             let mut translated = HashMap::new();
+            let loaded_from_json = file.loaded_from_json();
             for node in file.iter_mut() {
                 // 只处理函数和变量定义
                 if !Self::is_node_definition(node) || node.kind.is_variadic() {
@@ -205,31 +206,26 @@ impl Feature {
                     continue;
                 }
 
-                let need_validate = Self::needs_validation(&rust_file)?;
+                let need_validate = Self::needs_validation(&rust_file, loaded_from_json)?;
 
                 let not_empty = if need_validate {
                     let result = Self::validate_file(&rust_file, &name, &prefixed_name)?;
                     Self::update_c_file_mtime(&rust_file)?;
-                    node.kind.set_last_not_empty(result);
                     result
                 } else {
-                    node.kind.get_last_not_empty()
+                    node.kind.has_committed()
                 };
 
                 if not_empty {
                     translated.insert(Self::normalize_name(&name).to_string(), prefixed_name);
                 }
+
                 let has_committed = node.kind.has_committed();
 
-                if has_committed && !not_empty {
-                    node.kind.set_git_commit(false);
-                    is_updated = true;
-                } else if !has_committed && not_empty {
-                    node.kind.set_git_commit(true);
+                if has_committed != not_empty {
+                    node.kind.set_git_commit(not_empty);
                     is_updated = true;
                 }
-
-                // 其他情况（状态一致）不需要处理
             }
 
             // 应用更新到file的节点
@@ -631,10 +627,20 @@ impl Feature {
         Ok(())
     }
 
-    fn needs_validation(rust_file: &Path) -> Result<bool> {
-        if matches!(var("C2RUST_CODE_UPDATE_FORCE").as_deref(), Ok("1") | Ok("true")) {
+    fn needs_validation(rust_file: &Path, loaded_from_json: bool) -> Result<bool> {
+        // 如果不是从 JSON 文件加载，强制校验
+        if !loaded_from_json {
             return Ok(true);
         }
+
+        // 环境变量强制校验
+        if matches!(
+            var("C2RUST_CODE_UPDATE_FORCE").as_deref(),
+            Ok("1") | Ok("true")
+        ) {
+            return Ok(true);
+        }
+
         let c_file = rust_file.with_extension("c");
 
         let rust_mtime = fs::metadata(rust_file)
@@ -666,15 +672,21 @@ impl Feature {
 
     fn update_c_file_mtime(rust_file: &Path) -> Result<()> {
         let c_file = rust_file.with_extension("c");
-        let rust_metadata =
-            fs::metadata(rust_file).log_err(&format!("metadata {}", rust_file.display()))?;
-        filetime::set_file_mtime(
-            &c_file,
-            filetime::FileTime::from_system_time(
-                rust_metadata.modified().log_err("get modified time")?,
-            ),
-        )
-        .log_err(&format!("set mtime for {}", c_file.display()))?;
+
+        // 使用过去固定时间（当前时间 - 1 分钟）
+        // 避免时间精度问题，同时保证两个文件时间相同
+        let mtime = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap_or(std::time::SystemTime::now());
+
+        let file_time = filetime::FileTime::from_system_time(mtime);
+
+        filetime::set_file_mtime(&c_file, file_time)
+            .log_err(&format!("set mtime for {}", c_file.display()))?;
+
+        filetime::set_file_mtime(rust_file, file_time)
+            .log_err(&format!("set mtime for {}", rust_file.display()))?;
+
         Ok(())
     }
 
@@ -810,7 +822,7 @@ impl Feature {
     }
 
     fn has_export_name_attr(attrs: &mut Vec<syn::Attribute>, expected_name: &str) -> bool {
-        let mut found_wrong = false;
+        let mut found = false;
         attrs.retain(|attr| {
             let s = attr.to_token_stream().to_string();
             if s.contains("export_name") {
@@ -820,22 +832,18 @@ impl Feature {
                         let rest = &rest[quote_start + 1..];
                         if let Some(quote_end) = rest.find('"') {
                             let value = &rest[..quote_end];
-                            if value != expected_name {
-                                found_wrong = true;
-                                return false;
+                            if value == expected_name {
+                                found = true;
+                                return true;
                             }
                         }
                     }
                 }
+                return false;
             }
             true
         });
-        if found_wrong {
-            return false;
-        }
-        !attrs
-            .iter()
-            .any(|attr| attr.to_token_stream().to_string().contains("export_name"))
+        found
     }
     fn remove_no_mangle_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
         let len = attrs.len();
@@ -874,5 +882,4 @@ impl Feature {
 
         Ok(())
     }
-
 }
