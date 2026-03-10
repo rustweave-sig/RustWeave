@@ -210,26 +210,21 @@ impl Feature {
                 let not_empty = if need_validate {
                     let result = Self::validate_file(&rust_file, &name, &prefixed_name)?;
                     Self::update_c_file_mtime(&rust_file)?;
-                    node.kind.set_last_not_empty(result);
                     result
                 } else {
-                    node.kind.get_last_not_empty()
+                    node.kind.has_committed()
                 };
 
                 if not_empty {
                     translated.insert(Self::normalize_name(&name).to_string(), prefixed_name);
                 }
+
                 let has_committed = node.kind.has_committed();
 
-                if has_committed && !not_empty {
-                    node.kind.set_git_commit(false);
-                    is_updated = true;
-                } else if !has_committed && not_empty {
-                    node.kind.set_git_commit(true);
+                if has_committed != not_empty {
+                    node.kind.set_git_commit(not_empty);
                     is_updated = true;
                 }
-
-                // 其他情况（状态一致）不需要处理
             }
 
             // 应用更新到file的节点
@@ -632,7 +627,10 @@ impl Feature {
     }
 
     fn needs_validation(rust_file: &Path) -> Result<bool> {
-        if matches!(var("C2RUST_CODE_UPDATE_FORCE").as_deref(), Ok("1") | Ok("true")) {
+        if matches!(
+            var("C2RUST_CODE_UPDATE_FORCE").as_deref(),
+            Ok("1") | Ok("true")
+        ) {
             return Ok(true);
         }
         let c_file = rust_file.with_extension("c");
@@ -874,5 +872,4 @@ impl Feature {
 
         Ok(())
     }
-
 }

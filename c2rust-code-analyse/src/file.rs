@@ -312,22 +312,6 @@ impl Kind {
         };
     }
 
-    pub fn get_last_not_empty(&self) -> bool {
-        match self {
-            Kind::FunctionDecl(ref item) => item.last_not_empty.unwrap_or(false),
-            Kind::VarDecl(ref item) => item.last_not_empty.unwrap_or(false),
-            _ => false,
-        }
-    }
-
-    pub fn set_last_not_empty(&mut self, not_empty: bool) {
-        match self {
-            Kind::FunctionDecl(ref mut item) => item.last_not_empty = Some(not_empty),
-            Kind::VarDecl(ref mut item) => item.last_not_empty = Some(not_empty),
-            _ => {}
-        };
-    }
-
     /// 变量中应该翻译带初始化值的那一个, 如果都没有初始化，且非`extern`需要任意翻译一个.
     pub fn is_inited(&self) -> bool {
         match self {
@@ -453,8 +437,6 @@ pub struct VarDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
-    #[serde(default)]
-    last_not_empty: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -477,8 +459,6 @@ pub struct FunctionDecl {
     global_name: Option<String>,
     #[serde(default)]
     skip: bool,
-    #[serde(default)]
-    last_not_empty: Option<bool>,
 }
 
 pub(crate) struct File {
@@ -815,7 +795,6 @@ mod tests {
                 git_commit: false,
                 global_name: None,
                 skip: false,
-                last_not_empty: None,
             }),
             inner: vec![],
         }
@@ -839,7 +818,6 @@ mod tests {
                 git_commit: false,
                 global_name: None,
                 skip: false,
-                last_not_empty: None,
             }),
             inner: vec![],
         }
@@ -862,7 +840,6 @@ mod tests {
                 git_commit: false,
                 global_name: None,
                 skip: false,
-                last_not_empty: None,
             }),
             inner: vec![],
         }
