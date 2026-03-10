@@ -464,11 +464,27 @@ pub struct FunctionDecl {
 pub(crate) struct File {
     node: Node,
     path: PathBuf,
+    loaded_from_json: bool,
 }
 
 impl File {
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     pub fn new(root: &Path, path: &Path) -> Result<Self> {
+        let json_file = path.with_extension("json");
+
+        if json_file.exists() {
+            // 尝试从 JSON 文件加载
+            if let Ok(node) = Self::load_from_json(&json_file) {
+                return Ok(Self {
+                    node,
+                    path: path.to_path_buf(),
+                    loaded_from_json: true,
+                });
+            }
+            // 加载失败，继续从 C 文件解析
+        }
+
+        // 从 C 文件解析
         Self::with_c_file(root, path)
     }
 
@@ -482,6 +498,14 @@ impl File {
         fs::write(&json_file, json).map_err(|_| Error::last())
     }
 
+    fn load_from_json(json_file: &Path) -> Result<Node> {
+        let content =
+            fs::read_to_string(json_file).log_err(&format!("read {}", json_file.display()))?;
+        let node: Node =
+            serde_json::from_str(&content).log_err(&format!("parse {}", json_file.display()))?;
+        Ok(node)
+    }
+
     fn with_c_file(root: &Path, path: &Path) -> Result<Self> {
         let mut node = Self::load_by_c_file(root, path)?;
         let Kind::TranslationUnitDecl(ref mut unit) = node.kind else {
@@ -492,6 +516,7 @@ impl File {
         Ok(Self {
             node,
             path: path.to_path_buf(),
+            loaded_from_json: false,
         })
     }
 
@@ -691,6 +716,10 @@ impl File {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn loaded_from_json(&self) -> bool {
+        self.loaded_from_json
     }
 
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c

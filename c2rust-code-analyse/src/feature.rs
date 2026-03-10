@@ -187,6 +187,7 @@ impl Feature {
             // 收集需要更新的节点及其新状态
             let mut is_updated = false;
             let mut translated = HashMap::new();
+            let loaded_from_json = file.loaded_from_json();
             for node in file.iter_mut() {
                 // 只处理函数和变量定义
                 if !Self::is_node_definition(node) || node.kind.is_variadic() {
@@ -205,7 +206,7 @@ impl Feature {
                     continue;
                 }
 
-                let need_validate = Self::needs_validation(&rust_file)?;
+                let need_validate = Self::needs_validation(&rust_file, loaded_from_json)?;
 
                 let not_empty = if need_validate {
                     let result = Self::validate_file(&rust_file, &name, &prefixed_name)?;
@@ -626,13 +627,20 @@ impl Feature {
         Ok(())
     }
 
-    fn needs_validation(rust_file: &Path) -> Result<bool> {
+    fn needs_validation(rust_file: &Path, loaded_from_json: bool) -> Result<bool> {
+        // 如果不是从 JSON 文件加载，强制校验
+        if !loaded_from_json {
+            return Ok(true);
+        }
+
+        // 环境变量强制校验
         if matches!(
             var("C2RUST_CODE_UPDATE_FORCE").as_deref(),
             Ok("1") | Ok("true")
         ) {
             return Ok(true);
         }
+
         let c_file = rust_file.with_extension("c");
 
         let rust_mtime = fs::metadata(rust_file)
