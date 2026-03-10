@@ -822,7 +822,7 @@ impl Feature {
     }
 
     fn has_export_name_attr(attrs: &mut Vec<syn::Attribute>, expected_name: &str) -> bool {
-        let mut found_wrong = false;
+        let mut found = false;
         attrs.retain(|attr| {
             let s = attr.to_token_stream().to_string();
             if s.contains("export_name") {
@@ -832,22 +832,18 @@ impl Feature {
                         let rest = &rest[quote_start + 1..];
                         if let Some(quote_end) = rest.find('"') {
                             let value = &rest[..quote_end];
-                            if value != expected_name {
-                                found_wrong = true;
-                                return false;
+                            if value == expected_name {
+                                found = true;
+                                return true;
                             }
                         }
                     }
                 }
+                return false;
             }
             true
         });
-        if found_wrong {
-            return false;
-        }
-        !attrs
-            .iter()
-            .any(|attr| attr.to_token_stream().to_string().contains("export_name"))
+        found
     }
     fn remove_no_mangle_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
         let len = attrs.len();
