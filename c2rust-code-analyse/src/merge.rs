@@ -69,15 +69,11 @@ impl Feature {
     pub fn merge(&mut self) -> Result<()> {
         println!("Starting merge for feature '{}'", self.name);
 
-        let mut all_aliases: HashMap<String, Vec<String>> = HashMap::new();
-
         for file in &self.files {
-            let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
-            let (_, aliases) = self.merge_file(file)?;
-            all_aliases.insert(mod_name, aliases);
+            self.merge_file(file)?;
         }
 
-        self.deduplicate_mod_rs(&all_aliases)?;
+        self.deduplicate_mod_rs()?;
 
         self.link_src()?;
 
@@ -86,12 +82,12 @@ impl Feature {
     }
 
     // 合并单个 File 对应的 Rust 文件
-    fn merge_file(&self, file: &File) -> Result<(bool, Vec<String>)> {
+    fn merge_file(&self, file: &File) -> Result<bool> {
         let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
         let mod_dir = self.root.join("rust/src").join(&mod_name);
 
         if !mod_dir.exists() {
-            return Ok((false, vec![]));
+            return Ok(false);
         }
 
         println!("Processing mod for merge: {}", mod_name);
@@ -116,13 +112,17 @@ impl Feature {
             Self::parse_rust_file(&rs_file, &mut items, &mut deps)?;
         }
 
-        // 从 mod.rs 提取该模块依赖的类型和 FFI
         let mod_rs = mod_dir.join("mod.rs");
         let (type_items, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
 
-        // 构建合并后的文件
         let mut merged_items = Vec::new();
         merged_items.push(syn::parse2(quote! { use super::*; }).unwrap());
+
+        for alias in &module_names {
+            merged_items
+                .push(syn::parse_str(&format!("use super::{mod_name} as {alias};")).unwrap());
+        }
+
         merged_items.extend(type_items);
         if let Some(fm) = foreign_mod {
             merged_items.push(syn::Item::ForeignMod(fm));
@@ -145,7 +145,7 @@ impl Feature {
 
         println!("File merged successfully: {}", merged_rs.display());
 
-        Ok((true, module_names))
+        Ok(true)
     }
 
     fn collect_modules_from_mod_rs(mod_dir: &Path) -> Result<Vec<String>> {
@@ -438,7 +438,7 @@ impl Feature {
         len != attrs.len()
     }
 
-    fn deduplicate_mod_rs(&self, aliases: &HashMap<String, Vec<String>>) -> Result<()> {
+    fn deduplicate_mod_rs(&self) -> Result<()> {
         let src_2 = self.root.join("rust/src.2");
         if !src_2.exists() {
             return Ok(());
@@ -457,7 +457,6 @@ impl Feature {
             &mod_files,
             &duplicates,
             &collected.foreign_mod_template,
-            aliases,
         )?;
 
         if !duplicates.named_remove_set.is_empty() || !duplicates.ffi_remove_set.is_empty() {
@@ -597,7 +596,6 @@ impl Feature {
         mod_files: &[PathBuf],
         duplicates: &Duplicates,
         foreign_mod_template: &Option<syn::ItemForeignMod>,
-        aliases: &HashMap<String, Vec<String>>,
     ) -> Result<()> {
         let mut lib_items: Vec<syn::Item> = Vec::new();
         lib_items.extend(duplicates.named_to_extract.clone());
@@ -630,15 +628,6 @@ impl Feature {
 
         for mod_file in mod_files {
             let mod_name = mod_file.file_stem().unwrap().to_string_lossy().to_string();
-
-            if let Some(mod_aliases) = aliases.get(&mod_name) {
-                for alias in mod_aliases {
-                    lib_file
-                        .items
-                        .push(syn::parse_str(&format!("use {mod_name} as {alias};")).unwrap());
-                }
-            }
-
             lib_file
                 .items
                 .push(syn::parse_str(&format!("mod {mod_name};")).unwrap());
@@ -1088,21 +1077,13 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_lib_rs_with_aliases() {
-        use std::collections::HashMap;
-
+    fn test_generate_lib_rs_basic() {
         let duplicates = Duplicates {
             named_to_extract: vec![],
             named_remove_set: std::collections::HashSet::new(),
             ffi_to_extract: vec![],
             ffi_remove_set: std::collections::HashSet::new(),
         };
-
-        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
-        aliases.insert(
-            "mod_test".to_string(),
-            vec!["fun_foo".to_string(), "var_bar".to_string()],
-        );
 
         let temp_dir = tempfile::tempdir().unwrap();
         let src_2 = temp_dir.path().join("src.2");
@@ -1113,7 +1094,7 @@ mod tests {
 
         let mod_files = vec![mod_file];
 
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None, &aliases);
+        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
         assert!(result.is_ok());
 
         let lib_rs_path = src_2.join("lib.rs");
@@ -1127,50 +1108,13 @@ mod tests {
         assert!(lib_content.contains("#![allow(dead_code)]"));
         assert!(lib_content.contains("#![allow(unused_imports)]"));
         assert!(lib_content.contains("use core::ffi::*;"));
-        assert!(lib_content.contains("use mod_test as fun_foo;"));
-        assert!(lib_content.contains("use mod_test as var_bar;"));
         assert!(lib_content.contains("mod mod_test;"));
+        assert!(!lib_content.contains("use mod_test as fun_foo;"));
         assert!(!lib_content.contains("pub use mod_test::*;"));
     }
 
     #[test]
-    fn test_lib_rs_attributes_parsing() {
-        use syn::Attribute;
-
-        let attr_str = r#"#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(non_upper_case_globals)]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(improper_ctypes)]
-#![allow(dead_code)]
-#![allow(unused_imports)]"#;
-
-        let attrs: Vec<Attribute> = syn::Attribute::parse_inner
-            .parse_str(attr_str)
-            .unwrap_or_default();
-
-        println!("Parsed {} attributes using parse_inner", attrs.len());
-
-        let lib_file = syn::File {
-            shebang: None,
-            attrs,
-            items: vec![],
-        };
-
-        let content = prettyplease::unparse(&lib_file);
-        println!("Generated content:\n{}", content);
-
-        assert!(content.contains("#![allow(non_camel_case_types)]"));
-        assert!(content.contains("#![allow(non_snake_case)]"));
-        assert!(content.contains("#![allow(non_upper_case_globals)]"));
-        assert!(content.contains("#![allow(unsafe_op_in_unsafe_fn)]"));
-        assert!(content.contains("#![allow(improper_ctypes)]"));
-        assert!(content.contains("#![allow(dead_code)]"));
-        assert!(content.contains("#![allow(unused_imports)]"));
-    }
-
-    #[test]
-    fn test_generate_lib_rs_without_aliases() {
+    fn test_generate_lib_rs_multiple_modules() {
         use std::collections::HashMap;
 
         let duplicates = Duplicates {
@@ -1191,7 +1135,7 @@ mod tests {
 
         let mod_files = vec![mod_file];
 
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None, &aliases);
+        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
         assert!(result.is_ok());
 
         let lib_rs_path = src_2.join("lib.rs");
@@ -1229,17 +1173,36 @@ mod tests {
 
         let mod_files = vec![mod_test, mod_other];
 
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None, &aliases);
+        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
         assert!(result.is_ok());
 
         let lib_rs_path = src_2.join("lib.rs");
         let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
 
-        assert!(lib_content.contains("use mod_test as fun_foo;"));
-        assert!(!lib_content.contains("use mod_test as var_bar;"));
         assert!(lib_content.contains("mod mod_test;"));
-        assert!(!lib_content.contains("pub use mod_test::*;"));
         assert!(lib_content.contains("mod mod_other;"));
+        assert!(!lib_content.contains("pub use mod_test::*;"));
         assert!(!lib_content.contains("pub use mod_other::*;"));
+    }
+
+    #[test]
+    fn test_merge_file_with_aliases() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod var_bar;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+        fs::write(mod_dir.join("var_bar.rs"), "pub static BAR: i32 = 42;").unwrap();
+        fs::write(mod_dir.join("types.h"), "typedef int c_int;").unwrap();
+
+        let result = Feature::collect_modules_from_mod_rs(&mod_dir);
+        assert!(result.is_ok());
+        let modules = result.unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(modules.contains(&"var_bar".to_string()));
     }
 }
