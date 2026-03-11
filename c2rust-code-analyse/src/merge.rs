@@ -602,17 +602,15 @@ impl Feature {
             }
         }
 
-        let attr_str = r#"
-            #![allow(non_camel_case_types)]
-            #![allow(non_snake_case)]
-            #![allow(non_upper_case_globals)]
-            #![allow(unsafe_op_in_unsafe_fn)]
-            #![allow(improper_ctypes)]
-            #![allow(dead_code)]
-            #![allow(unused_imports)]
-        "#;
+        let attr_str = r#"#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(improper_ctypes)]
+#![allow(dead_code)]
+#![allow(unused_imports)]"#;
         let attrs: Vec<syn::Attribute> = syn::Attribute::parse_inner
-            .parse2(quote::quote! { #attr_str })
+            .parse_str(attr_str)
             .unwrap_or_default();
 
         let mut lib_file = syn::File {
@@ -985,10 +983,54 @@ mod tests {
         let lib_rs_path = src_2.join("lib.rs");
         let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
 
+        assert!(lib_content.contains("#![allow(non_camel_case_types)]"));
+        assert!(lib_content.contains("#![allow(non_snake_case)]"));
+        assert!(lib_content.contains("#![allow(non_upper_case_globals)]"));
+        assert!(lib_content.contains("#![allow(unsafe_op_in_unsafe_fn)]"));
+        assert!(lib_content.contains("#![allow(improper_ctypes)]"));
+        assert!(lib_content.contains("#![allow(dead_code)]"));
+        assert!(lib_content.contains("#![allow(unused_imports)]"));
+        assert!(lib_content.contains("use core::ffi::*;"));
         assert!(lib_content.contains("use mod_test as fun_foo;"));
         assert!(lib_content.contains("use mod_test as var_bar;"));
         assert!(lib_content.contains("mod mod_test;"));
         assert!(!lib_content.contains("pub use mod_test::*;"));
+    }
+
+    #[test]
+    fn test_lib_rs_attributes_parsing() {
+        use syn::Attribute;
+
+        let attr_str = r#"#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(improper_ctypes)]
+#![allow(dead_code)]
+#![allow(unused_imports)]"#;
+
+        let attrs: Vec<Attribute> = syn::Attribute::parse_inner
+            .parse_str(attr_str)
+            .unwrap_or_default();
+
+        println!("Parsed {} attributes using parse_inner", attrs.len());
+
+        let lib_file = syn::File {
+            shebang: None,
+            attrs,
+            items: vec![],
+        };
+
+        let content = prettyplease::unparse(&lib_file);
+        println!("Generated content:\n{}", content);
+
+        assert!(content.contains("#![allow(non_camel_case_types)]"));
+        assert!(content.contains("#![allow(non_snake_case)]"));
+        assert!(content.contains("#![allow(non_upper_case_globals)]"));
+        assert!(content.contains("#![allow(unsafe_op_in_unsafe_fn)]"));
+        assert!(content.contains("#![allow(improper_ctypes)]"));
+        assert!(content.contains("#![allow(dead_code)]"));
+        assert!(content.contains("#![allow(unused_imports)]"));
     }
 
     #[test]
