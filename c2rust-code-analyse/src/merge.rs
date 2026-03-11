@@ -101,7 +101,8 @@ impl Feature {
         );
 
         if module_names.is_empty() {
-            return Err(Error::inval());
+            println!("No modules to merge for: {}", mod_name);
+            return Ok(false);
         }
 
         let mut items = Vec::new();
