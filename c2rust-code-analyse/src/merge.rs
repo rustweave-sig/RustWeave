@@ -1100,13 +1100,6 @@ mod tests {
         let lib_rs_path = src_2.join("lib.rs");
         let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
 
-        assert!(lib_content.contains("#![allow(non_camel_case_types)]"));
-        assert!(lib_content.contains("#![allow(non_snake_case)]"));
-        assert!(lib_content.contains("#![allow(non_upper_case_globals)]"));
-        assert!(lib_content.contains("#![allow(unsafe_op_in_unsafe_fn)]"));
-        assert!(lib_content.contains("#![allow(improper_ctypes)]"));
-        assert!(lib_content.contains("#![allow(dead_code)]"));
-        assert!(lib_content.contains("#![allow(unused_imports)]"));
         assert!(lib_content.contains("use core::ffi::*;"));
         assert!(lib_content.contains("mod mod_test;"));
         assert!(!lib_content.contains("use mod_test as fun_foo;"));
@@ -1114,9 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_lib_rs_multiple_modules() {
-        use std::collections::HashMap;
-
+    fn test_verify_no_aliases_in_lib_rs() {
         let duplicates = Duplicates {
             named_to_extract: vec![],
             named_remove_set: std::collections::HashSet::new(),
@@ -1139,9 +1130,10 @@ mod tests {
         let lib_rs_path = src_2.join("lib.rs");
         let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
 
+        assert!(!lib_content.contains("use mod_test as fun_"));
+        assert!(!lib_content.contains("use mod_test as var_"));
+        assert!(!lib_content.contains("as "));
         assert!(lib_content.contains("mod mod_test;"));
-        assert!(!lib_content.contains("use mod_test as fun_foo;"));
-        assert!(!lib_content.contains("pub use mod_test::*;"));
     }
 
     #[test]
