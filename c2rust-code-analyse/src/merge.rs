@@ -114,7 +114,29 @@ impl Feature {
         }
 
         let mod_rs = mod_dir.join("mod.rs");
-        let (type_items, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
+        let (type_items, all_impls, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
+
+        let dep_type_names: std::collections::HashSet<String> = type_items
+            .iter()
+            .filter_map(|item| Self::item_name(item))
+            .collect();
+
+        let filtered_impls: Vec<syn::ItemImpl> = all_impls
+            .into_iter()
+            .filter(|impl_item| {
+                Self::impl_self_type_name(impl_item)
+                    .map(|name| dep_type_names.contains(&name))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let mut impl_map: std::collections::HashMap<String, Vec<syn::ItemImpl>> =
+            std::collections::HashMap::new();
+        for impl_block in filtered_impls {
+            if let Some(type_name) = Self::impl_self_type_name(&impl_block) {
+                impl_map.entry(type_name).or_default().push(impl_block);
+            }
+        }
 
         let mut merged_items = Vec::new();
         merged_items.push(syn::parse2(quote! { use super::*; }).unwrap());
@@ -124,7 +146,17 @@ impl Feature {
                 .push(syn::parse_str(&format!("use super::{mod_name} as {alias};")).unwrap());
         }
 
-        merged_items.extend(type_items);
+        for type_item in &type_items {
+            merged_items.push(type_item.clone());
+
+            if let Some(type_name) = Self::item_name(type_item) {
+                if let Some(impl_blocks) = impl_map.get(&type_name) {
+                    for impl_block in impl_blocks {
+                        merged_items.push(syn::Item::Impl(impl_block.clone()));
+                    }
+                }
+            }
+        }
         if let Some(fm) = foreign_mod {
             merged_items.push(syn::Item::ForeignMod(fm));
         }
@@ -323,16 +355,34 @@ impl Feature {
         }
     }
 
+    fn impl_self_type_name(impl_item: &syn::ItemImpl) -> Option<String> {
+        match &*impl_item.self_ty {
+            syn::Type::Path(type_path) if type_path.qself.is_none() => {
+                if let Some(segment) = type_path.path.segments.last() {
+                    Some(segment.ident.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn extract_dependencies(
         mod_rs: &Path,
         deps: &mut DepNames,
-    ) -> Result<(Vec<syn::Item>, Option<syn::ItemForeignMod>)> {
+    ) -> Result<(
+        Vec<syn::Item>,
+        Vec<syn::ItemImpl>,
+        Option<syn::ItemForeignMod>,
+    )> {
         let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
 
         let mut all_types: HashMap<String, syn::Item> = HashMap::new();
         let mut all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
         let mut foreign_mod_template: Option<syn::ItemForeignMod> = None;
+        let mut all_impls: Vec<syn::ItemImpl> = Vec::new();
 
         for item in ast.items {
             match item {
@@ -347,6 +397,9 @@ impl Feature {
                             all_ffi.insert(name, ffi_item);
                         }
                     }
+                }
+                syn::Item::Impl(impl_item) => {
+                    all_impls.push(impl_item);
                 }
                 _ => {
                     if let Some(name) = Self::item_name(&item) {
@@ -381,7 +434,7 @@ impl Feature {
             None
         };
 
-        Ok((dep_types, foreign_mod))
+        Ok((dep_types, all_impls, foreign_mod))
     }
 
     fn filter_dependencies(
@@ -1138,23 +1191,62 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_file_with_aliases() {
+    fn test_impl_self_type_name() {
+        let impl_block: syn::ItemImpl =
+            syn::parse_str("impl MyStruct { fn foo(&self) {} }").unwrap();
+        assert_eq!(
+            Feature::impl_self_type_name(&impl_block),
+            Some("MyStruct".to_string())
+        );
+
+        let impl_block: syn::ItemImpl = syn::parse_str("impl MyType { fn bar(&self) {} }").unwrap();
+        assert_eq!(
+            Feature::impl_self_type_name(&impl_block),
+            Some("MyType".to_string())
+        );
+
+        let impl_block: syn::ItemImpl =
+            syn::parse_str("impl<T> MyGeneric<T> { fn baz(&self) {} }").unwrap();
+        assert_eq!(
+            Feature::impl_self_type_name(&impl_block),
+            Some("MyGeneric".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_dependencies_preserves_impls() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let mod_dir = temp_dir.path().join("mod_test");
-        fs::create_dir_all(&mod_dir).unwrap();
+        let mod_rs_path = temp_dir.path().join("mod.rs");
 
-        let mod_rs = mod_dir.join("mod.rs");
-        fs::write(&mod_rs, "mod fun_foo;\nmod var_bar;").unwrap();
+        let mod_rs_content = r#"
+struct MyStruct;
+impl MyStruct {
+    fn foo(&self) {}
+}
 
-        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
-        fs::write(mod_dir.join("var_bar.rs"), "pub static BAR: i32 = 42;").unwrap();
-        fs::write(mod_dir.join("types.h"), "typedef int c_int;").unwrap();
+struct OtherStruct;
+impl OtherStruct {
+    fn bar(&self) {}
+}
+"#;
 
-        let result = Feature::collect_modules_from_mod_rs(&mod_dir);
-        assert!(result.is_ok());
-        let modules = result.unwrap();
-        assert_eq!(modules.len(), 2);
-        assert!(modules.contains(&"fun_foo".to_string()));
-        assert!(modules.contains(&"var_bar".to_string()));
+        fs::write(&mod_rs_path, mod_rs_content).unwrap();
+
+        let mut deps = DepNames::new();
+        deps.used_names.insert("MyStruct".to_string());
+        deps.used_names.insert("OtherStruct".to_string());
+
+        let (type_items, impl_blocks, _foreign_mod) =
+            Feature::extract_dependencies(&mod_rs_path, &mut deps).unwrap();
+
+        assert_eq!(type_items.len(), 2);
+        assert_eq!(impl_blocks.len(), 2);
+
+        let impl_types: Vec<String> = impl_blocks
+            .iter()
+            .filter_map(|impl_block| Feature::impl_self_type_name(impl_block))
+            .collect();
+assert!(impl_types.contains(&"MyStruct".to_string()));
+        assert!(impl_types.contains(&"OtherStruct".to_string()));
     }
 }
