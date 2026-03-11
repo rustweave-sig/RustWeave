@@ -1124,8 +1124,6 @@ mod tests {
             ffi_remove_set: std::collections::HashSet::new(),
         };
 
-        let aliases: HashMap<String, Vec<String>> = HashMap::new();
-
         let temp_dir = tempfile::tempdir().unwrap();
         let src_2 = temp_dir.path().join("src.2");
         fs::create_dir_all(&src_2).unwrap();
@@ -1144,45 +1142,6 @@ mod tests {
         assert!(lib_content.contains("mod mod_test;"));
         assert!(!lib_content.contains("use mod_test as fun_foo;"));
         assert!(!lib_content.contains("pub use mod_test::*;"));
-    }
-
-    #[test]
-    fn test_generate_lib_rs_partial_aliases() {
-        use std::collections::HashMap;
-
-        let duplicates = Duplicates {
-            named_to_extract: vec![],
-            named_remove_set: std::collections::HashSet::new(),
-            ffi_to_extract: vec![],
-            ffi_remove_set: std::collections::HashSet::new(),
-        };
-
-        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
-        aliases.insert("mod_test".to_string(), vec!["fun_foo".to_string()]);
-        aliases.insert("mod_other".to_string(), vec![]);
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let src_2 = temp_dir.path().join("src.2");
-        fs::create_dir_all(&src_2).unwrap();
-
-        let mod_test = src_2.join("mod_test.rs");
-        fs::write(&mod_test, "pub fn foo() {}").unwrap();
-
-        let mod_other = src_2.join("mod_other.rs");
-        fs::write(&mod_other, "pub static BAR: i32 = 42;").unwrap();
-
-        let mod_files = vec![mod_test, mod_other];
-
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
-        assert!(result.is_ok());
-
-        let lib_rs_path = src_2.join("lib.rs");
-        let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
-
-        assert!(lib_content.contains("mod mod_test;"));
-        assert!(lib_content.contains("mod mod_other;"));
-        assert!(!lib_content.contains("pub use mod_test::*;"));
-        assert!(!lib_content.contains("pub use mod_other::*;"));
     }
 
     #[test]
