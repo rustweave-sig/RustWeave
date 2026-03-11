@@ -95,28 +95,25 @@ impl Feature {
         }
 
         println!("Processing mod for merge: {}", mod_name);
-        let rs_files = Self::collect_rust_files(&mod_dir)?;
+
+        let module_names = Self::collect_modules_from_mod_rs(&mod_dir)?;
 
         println!(
-            "Merging {} .rs files for mod: {} ...",
-            rs_files.len(),
+            "Merging {} modules for mod: {} ...",
+            module_names.len(),
             mod_name
         );
 
-        if rs_files.is_empty() {
+        if module_names.is_empty() {
             return Err(Error::inval());
         }
-
-        let aliases: Vec<String> = rs_files
-            .iter()
-            .filter_map(|path| path.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .collect();
 
         let mut items = Vec::new();
         let mut deps = DepNames::new();
 
-        for rs_file in &rs_files {
-            Self::parse_rust_file(rs_file, &mut items, &mut deps)?;
+        for module_name in &module_names {
+            let rs_file = mod_dir.join(module_name).with_extension("rs");
+            Self::parse_rust_file(&rs_file, &mut items, &mut deps)?;
         }
 
         // 从 mod.rs 提取该模块依赖的类型和 FFI
@@ -148,27 +145,37 @@ impl Feature {
 
         println!("File merged successfully: {}", merged_rs.display());
 
-        Ok((true, aliases))
+        Ok((true, module_names))
     }
 
-    // 收集目录下的所有.rs文件（前缀为fun_或var_)
-    fn collect_rust_files(mod_dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut rs_files = Vec::new();
-        for entry in WalkDir::new(mod_dir)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() && path.extension().map(|e| e == "rs").unwrap_or(false) {
-                let file_name = path.file_name().unwrap().to_string_lossy();
-                if file_name.starts_with("fun_") || file_name.starts_with("var_") {
-                    rs_files.push(path.to_path_buf());
+    fn collect_modules_from_mod_rs(mod_dir: &Path) -> Result<Vec<String>> {
+        let mod_rs_path = mod_dir.join("mod.rs");
+
+        if !mod_rs_path.exists() {
+            return Ok(vec![]);
+        }
+
+        let content =
+            fs::read_to_string(&mod_rs_path).log_err(&format!("read {}", mod_rs_path.display()))?;
+
+        let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+        let mut modules = Vec::new();
+
+        for item in ast.items {
+            if let syn::Item::Mod(mod_item) = item {
+                let mod_name = mod_item.ident.to_string();
+
+                if mod_name.starts_with("fun_") || mod_name.starts_with("var_") {
+                    let rs_file = mod_dir.join(&mod_name).with_extension("rs");
+                    if rs_file.exists() {
+                        modules.push(mod_name);
+                    }
                 }
             }
         }
-        Ok(rs_files)
+
+        Ok(modules)
     }
 
     fn parse_rust_file(
@@ -949,6 +956,135 @@ mod tests {
             syn::parse_str(r#"#[cfg(test)] #[link_name = "another_name"] fn test() {}"#).unwrap();
         let link_name = Feature::extract_link_name(&fn_item.attrs);
         assert_eq!(link_name, Some("another_name".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_basic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod var_bar;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+        fs::write(mod_dir.join("var_bar.rs"), "pub static BAR: i32 = 42;").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(modules.contains(&"var_bar".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_only_fun() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod fun_baz;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+        fs::write(mod_dir.join("fun_baz.rs"), "pub fn baz() {}").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(modules.contains(&"fun_baz".to_string()));
+        assert!(!modules.contains(&"var_bar".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_only_var() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod var_foo;\nmod var_bar;").unwrap();
+
+        fs::write(mod_dir.join("var_foo.rs"), "pub static FOO: i32 = 1;").unwrap();
+        fs::write(mod_dir.join("var_bar.rs"), "pub static BAR: i32 = 2;").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"var_foo".to_string()));
+        assert!(modules.contains(&"var_bar".to_string()));
+        assert!(!modules.contains(&"fun_foo".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_empty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "// no modules").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 0);
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_other_mods() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod types;\nmod helpers;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+        fs::write(mod_dir.join("types.rs"), "pub struct Foo;").unwrap();
+        fs::write(mod_dir.join("helpers.rs"), "pub fn helper() {}").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(!modules.contains(&"types".to_string()));
+        assert!(!modules.contains(&"helpers".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod var_bar;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(!modules.contains(&"var_bar".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_no_mod_rs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 0);
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_invalid_syntax() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo\nmod var_bar;").unwrap();
+
+        let result = Feature::collect_modules_from_mod_rs(&mod_dir);
+        assert!(result.is_err());
     }
 
     #[test]
