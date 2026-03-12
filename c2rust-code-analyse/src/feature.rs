@@ -596,7 +596,11 @@ impl Feature {
     // 获取File对应的mod目录名
     pub fn get_mod_name_for_file(prefix: &Path, file: &File) -> Result<String> {
         let rel_path = Self::get_mod_rel_path(prefix, file)?;
-        Ok("mod_".to_string() + &rel_path.display().to_string().replace("/", "_"))
+        Ok("mod_".to_string()
+            + &rel_path
+                .display()
+                .to_string()
+                .replace(|c| !matches!(c, 'a'..'z' | 'A'..'Z' | '0'..'9' | '_'), "_"))
     }
 
     fn get_mod_rel_path(prefix: &Path, file: &File) -> Result<PathBuf> {

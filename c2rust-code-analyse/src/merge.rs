@@ -91,33 +91,72 @@ impl Feature {
         }
 
         println!("Processing mod for merge: {}", mod_name);
-        let rs_files = Self::collect_rust_files(&mod_dir)?;
+
+        let module_names = Self::collect_modules_from_mod_rs(&mod_dir)?;
 
         println!(
-            "Merging {} .rs files for mod: {} ...",
-            rs_files.len(),
+            "Merging {} modules for mod: {} ...",
+            module_names.len(),
             mod_name
         );
 
-        if rs_files.is_empty() {
-            return Err(Error::inval());
+        if module_names.is_empty() {
+            println!("No modules to merge for: {}", mod_name);
+            return Ok(false);
         }
 
         let mut items = Vec::new();
         let mut deps = DepNames::new();
 
-        for rs_file in &rs_files {
-            Self::parse_rust_file(rs_file, &mut items, &mut deps)?;
+        for module_name in &module_names {
+            let rs_file = mod_dir.join(module_name).with_extension("rs");
+            Self::parse_rust_file(&rs_file, &mut items, &mut deps)?;
         }
 
-        // 从 mod.rs 提取该模块依赖的类型和 FFI
         let mod_rs = mod_dir.join("mod.rs");
-        let (type_items, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
+        let (type_items, all_impls, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
 
-        // 构建合并后的文件
+        let dep_type_names: std::collections::HashSet<String> = type_items
+            .iter()
+            .filter_map(|item| Self::item_name(item))
+            .collect();
+
+        let filtered_impls: Vec<syn::ItemImpl> = all_impls
+            .into_iter()
+            .filter(|impl_item| {
+                Self::impl_self_type_name(impl_item)
+                    .map(|name| dep_type_names.contains(&name))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let mut impl_map: std::collections::HashMap<String, Vec<syn::ItemImpl>> =
+            std::collections::HashMap::new();
+        for impl_block in filtered_impls {
+            if let Some(type_name) = Self::impl_self_type_name(&impl_block) {
+                impl_map.entry(type_name).or_default().push(impl_block);
+            }
+        }
+
         let mut merged_items = Vec::new();
         merged_items.push(syn::parse2(quote! { use super::*; }).unwrap());
-        merged_items.extend(type_items);
+
+        for alias in &module_names {
+            merged_items
+                .push(syn::parse_str(&format!("use super::{mod_name} as {alias};")).unwrap());
+        }
+
+        for type_item in &type_items {
+            merged_items.push(type_item.clone());
+
+            if let Some(type_name) = Self::item_name(type_item) {
+                if let Some(impl_blocks) = impl_map.get(&type_name) {
+                    for impl_block in impl_blocks {
+                        merged_items.push(syn::Item::Impl(impl_block.clone()));
+                    }
+                }
+            }
+        }
         if let Some(fm) = foreign_mod {
             merged_items.push(syn::Item::ForeignMod(fm));
         }
@@ -142,24 +181,34 @@ impl Feature {
         Ok(true)
     }
 
-    // 收集目录下的所有.rs文件（前缀为fun_或var_)
-    fn collect_rust_files(mod_dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut rs_files = Vec::new();
-        for entry in WalkDir::new(mod_dir)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() && path.extension().map(|e| e == "rs").unwrap_or(false) {
-                let file_name = path.file_name().unwrap().to_string_lossy();
-                if file_name.starts_with("fun_") || file_name.starts_with("var_") {
-                    rs_files.push(path.to_path_buf());
+    fn collect_modules_from_mod_rs(mod_dir: &Path) -> Result<Vec<String>> {
+        let mod_rs_path = mod_dir.join("mod.rs");
+
+        if !mod_rs_path.exists() {
+            return Ok(vec![]);
+        }
+
+        let content =
+            fs::read_to_string(&mod_rs_path).log_err(&format!("read {}", mod_rs_path.display()))?;
+
+        let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs_path.display()))?;
+
+        let mut modules = Vec::new();
+
+        for item in ast.items {
+            if let syn::Item::Mod(mod_item) = item {
+                let mod_name = mod_item.ident.to_string();
+
+                if mod_name.starts_with("fun_") || mod_name.starts_with("var_") {
+                    let rs_file = mod_dir.join(&mod_name).with_extension("rs");
+                    if rs_file.exists() {
+                        modules.push(mod_name);
+                    }
                 }
             }
         }
-        Ok(rs_files)
+
+        Ok(modules)
     }
 
     fn parse_rust_file(
@@ -306,16 +355,34 @@ impl Feature {
         }
     }
 
+    fn impl_self_type_name(impl_item: &syn::ItemImpl) -> Option<String> {
+        match &*impl_item.self_ty {
+            syn::Type::Path(type_path) if type_path.qself.is_none() => {
+                if let Some(segment) = type_path.path.segments.last() {
+                    Some(segment.ident.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn extract_dependencies(
         mod_rs: &Path,
         deps: &mut DepNames,
-    ) -> Result<(Vec<syn::Item>, Option<syn::ItemForeignMod>)> {
+    ) -> Result<(
+        Vec<syn::Item>,
+        Vec<syn::ItemImpl>,
+        Option<syn::ItemForeignMod>,
+    )> {
         let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
 
         let mut all_types: HashMap<String, syn::Item> = HashMap::new();
         let mut all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
         let mut foreign_mod_template: Option<syn::ItemForeignMod> = None;
+        let mut all_impls: Vec<syn::ItemImpl> = Vec::new();
 
         for item in ast.items {
             match item {
@@ -330,6 +397,9 @@ impl Feature {
                             all_ffi.insert(name, ffi_item);
                         }
                     }
+                }
+                syn::Item::Impl(impl_item) => {
+                    all_impls.push(impl_item);
                 }
                 _ => {
                     if let Some(name) = Self::item_name(&item) {
@@ -364,7 +434,7 @@ impl Feature {
             None
         };
 
-        Ok((dep_types, foreign_mod))
+        Ok((dep_types, all_impls, foreign_mod))
     }
 
     fn filter_dependencies(
@@ -591,17 +661,15 @@ impl Feature {
             }
         }
 
-        let attr_str = r#"
-            #![allow(non_camel_case_types)]
-            #![allow(non_snake_case)]
-            #![allow(non_upper_case_globals)]
-            #![allow(unsafe_op_in_unsafe_fn)]
-            #![allow(improper_ctypes)]
-            #![allow(dead_code)]
-            #![allow(unused_imports)]
-        "#;
+        let attr_str = r#"#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(improper_ctypes)]
+#![allow(dead_code)]
+#![allow(unused_imports)]"#;
         let attrs: Vec<syn::Attribute> = syn::Attribute::parse_inner
-            .parse2(quote::quote! { #attr_str })
+            .parse_str(attr_str)
             .unwrap_or_default();
 
         let mut lib_file = syn::File {
@@ -617,9 +685,6 @@ impl Feature {
             lib_file
                 .items
                 .push(syn::parse_str(&format!("mod {mod_name};")).unwrap());
-            lib_file
-                .items
-                .push(syn::parse_str(&format!("pub use {mod_name}::*;")).unwrap());
         }
 
         let lib_content = prettyplease::unparse(&lib_file);
@@ -934,5 +999,254 @@ mod tests {
             syn::parse_str(r#"#[cfg(test)] #[link_name = "another_name"] fn test() {}"#).unwrap();
         let link_name = Feature::extract_link_name(&fn_item.attrs);
         assert_eq!(link_name, Some("another_name".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_basic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod var_bar;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+        fs::write(mod_dir.join("var_bar.rs"), "pub static BAR: i32 = 42;").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(modules.contains(&"var_bar".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_only_fun() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod fun_baz;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+        fs::write(mod_dir.join("fun_baz.rs"), "pub fn baz() {}").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(modules.contains(&"fun_baz".to_string()));
+        assert!(!modules.contains(&"var_bar".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_only_var() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod var_foo;\nmod var_bar;").unwrap();
+
+        fs::write(mod_dir.join("var_foo.rs"), "pub static FOO: i32 = 1;").unwrap();
+        fs::write(mod_dir.join("var_bar.rs"), "pub static BAR: i32 = 2;").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"var_foo".to_string()));
+        assert!(modules.contains(&"var_bar".to_string()));
+        assert!(!modules.contains(&"fun_foo".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_empty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "// no modules").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 0);
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_other_mods() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod types;\nmod helpers;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+        fs::write(mod_dir.join("types.rs"), "pub struct Foo;").unwrap();
+        fs::write(mod_dir.join("helpers.rs"), "pub fn helper() {}").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(!modules.contains(&"types".to_string()));
+        assert!(!modules.contains(&"helpers".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo;\nmod var_bar;").unwrap();
+
+        fs::write(mod_dir.join("fun_foo.rs"), "pub fn foo() {}").unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert!(modules.contains(&"fun_foo".to_string()));
+        assert!(!modules.contains(&"var_bar".to_string()));
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_no_mod_rs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let modules = Feature::collect_modules_from_mod_rs(&mod_dir).unwrap();
+        assert_eq!(modules.len(), 0);
+    }
+
+    #[test]
+    fn test_collect_modules_from_mod_rs_invalid_syntax() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_dir = temp_dir.path().join("mod_test");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        fs::write(&mod_rs, "mod fun_foo\nmod var_bar;").unwrap();
+
+        let result = Feature::collect_modules_from_mod_rs(&mod_dir);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_lib_rs_basic() {
+        let duplicates = Duplicates {
+            named_to_extract: vec![],
+            named_remove_set: std::collections::HashSet::new(),
+            ffi_to_extract: vec![],
+            ffi_remove_set: std::collections::HashSet::new(),
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_file = src_2.join("mod_test.rs");
+        fs::write(&mod_file, "pub fn foo() {} pub static BAR: i32 = 42;").unwrap();
+
+        let mod_files = vec![mod_file];
+
+        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
+        assert!(result.is_ok());
+
+        let lib_rs_path = src_2.join("lib.rs");
+        let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
+
+        assert!(lib_content.contains("use core::ffi::*;"));
+        assert!(lib_content.contains("mod mod_test;"));
+        assert!(!lib_content.contains("use mod_test as fun_foo;"));
+        assert!(!lib_content.contains("pub use mod_test::*;"));
+    }
+
+    #[test]
+    fn test_verify_no_aliases_in_lib_rs() {
+        let duplicates = Duplicates {
+            named_to_extract: vec![],
+            named_remove_set: std::collections::HashSet::new(),
+            ffi_to_extract: vec![],
+            ffi_remove_set: std::collections::HashSet::new(),
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_file = src_2.join("mod_test.rs");
+        fs::write(&mod_file, "pub fn foo() {}").unwrap();
+
+        let mod_files = vec![mod_file];
+
+        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
+        assert!(result.is_ok());
+
+        let lib_rs_path = src_2.join("lib.rs");
+        let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
+
+        assert!(!lib_content.contains("use mod_test as fun_"));
+        assert!(!lib_content.contains("use mod_test as var_"));
+        assert!(!lib_content.contains("as "));
+        assert!(lib_content.contains("mod mod_test;"));
+    }
+
+    #[test]
+    fn test_impl_self_type_name() {
+        let impl_block: syn::ItemImpl =
+            syn::parse_str("impl MyStruct { fn foo(&self) {} }").unwrap();
+        assert_eq!(
+            Feature::impl_self_type_name(&impl_block),
+            Some("MyStruct".to_string())
+        );
+
+        let impl_block: syn::ItemImpl = syn::parse_str("impl MyType { fn bar(&self) {} }").unwrap();
+        assert_eq!(
+            Feature::impl_self_type_name(&impl_block),
+            Some("MyType".to_string())
+        );
+
+        let impl_block: syn::ItemImpl =
+            syn::parse_str("impl<T> MyGeneric<T> { fn baz(&self) {} }").unwrap();
+        assert_eq!(
+            Feature::impl_self_type_name(&impl_block),
+            Some("MyGeneric".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_dependencies_preserves_impls() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mod_rs_path = temp_dir.path().join("mod.rs");
+
+        let mod_rs_content = r#"
+struct MyStruct;
+impl MyStruct {
+    fn foo(&self) {}
+}
+
+struct OtherStruct;
+impl OtherStruct {
+    fn bar(&self) {}
+}
+"#;
+
+        fs::write(&mod_rs_path, mod_rs_content).unwrap();
+
+        let mut deps = DepNames::new();
+        deps.used_names.insert("MyStruct".to_string());
+        deps.used_names.insert("OtherStruct".to_string());
+
+        let (type_items, impl_blocks, _foreign_mod) =
+            Feature::extract_dependencies(&mod_rs_path, &mut deps).unwrap();
+
+        assert_eq!(type_items.len(), 2);
+        assert_eq!(impl_blocks.len(), 2);
+
+        let impl_types: Vec<String> = impl_blocks
+            .iter()
+            .filter_map(|impl_block| Feature::impl_self_type_name(impl_block))
+            .collect();
+assert!(impl_types.contains(&"MyStruct".to_string()));
+        assert!(impl_types.contains(&"OtherStruct".to_string()));
     }
 }

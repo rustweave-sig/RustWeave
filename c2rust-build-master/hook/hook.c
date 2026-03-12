@@ -94,11 +94,11 @@ static int parse_args(int argc, char* argv[], char* extracted[], char* cfiles[])
                                 extracted[cnt++] = argv[i];
                         }
                 }
-        } else if (strcmp(&arg[1], "include") == 0) {
+        } else if (strcmp(&arg[1], "include") == 0 || strcmp(&arg[1], "isystem") == 0 || strcmp(&arg[1], "iquote") == 0) {
                 extracted[cnt++] = arg;
                 ++i;
                 if (i < argc) {
-                    extracted[cnt++] = arg;
+                    extracted[cnt++] = argv[i];
                 }
         } else if (strncmp(&arg[1], "std=", 4) == 0) {
                 extracted[cnt++] = arg;
