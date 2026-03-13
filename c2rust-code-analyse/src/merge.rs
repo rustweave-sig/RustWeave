@@ -1,4 +1,4 @@
-use crate::{Error, Feature, File, Result, ToError};
+use crate::{Feature, File, Result, ToError};
 use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::fs;

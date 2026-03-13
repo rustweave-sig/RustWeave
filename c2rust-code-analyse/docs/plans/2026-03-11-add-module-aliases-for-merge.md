@@ -7,6 +7,7 @@
 - `merge` 前：目录结构为 `mod_xxx/fun_foo.rs`、`mod_xxx/var_bar.rs`
 - `merge` 后：所有内容合并到 `mod_xxx.rs`，`fun_foo` 和 `var_bar` 模块不再存在
 - 需要在 `lib.rs` 中生成 `use mod_xxx as fun_foo;` 和 `use mod_xxx as var_bar;` 别名
+- **不生成** `pub use mod_xxx::*;`，避免将模块所有内容导出
 
 ## 涉及的文件和模块
 - **主要修改文件**：`src/merge.rs`
@@ -23,6 +24,7 @@
 - **不重新解析** `mod_xxx.rs` 文件
 - **在 `merge_file` 中直接收集**：从文件名（`fun_*.rs` 和 `var_*.rs`）提取别名信息
 - **传递给 `generate_lib_rs`**：通过返回值和参数链传递别名映射
+- **移除 `pub use mod_xxx::*;`**：只保留 `mod` 声明和别名声明
 
 ### 实现步骤
 
@@ -93,8 +95,8 @@ fn deduplicate_mod_rs(&self, aliases: &HashMap<String, Vec<String>>) -> Result<(
 #### 4. 修改 `generate_lib_rs` 函数
 - 新增参数：`aliases: &HashMap<String, Vec<String>>`
 - 在生成 `mod` 声明之前，生成对应的 `use` 别名声明
-- 格式：`use {mod_name} as {alias};`
-- 别名按模块顺序排列
+- **移除** `pub use mod_name::*;` 语句
+- 只保留 `mod mod_name;` 和别名声明
 
 ```rust
 fn generate_lib_rs(
@@ -119,7 +121,7 @@ fn generate_lib_rs(
         }
 
         lib_file.items.push(syn::parse_str(&format!("mod {mod_name};")).unwrap());
-        lib_file.items.push(syn::parse_str(&format!("pub use {mod_name}::*;")).unwrap());
+        // 移除：lib_file.items.push(syn::parse_str(&format!("pub use {mod_name}::*;")).unwrap());
     }
 
     // ...
@@ -140,8 +142,8 @@ fn generate_lib_rs(
   use mod_test as fun_foo;
   use mod_test as var_bar;
   mod mod_test;
-  pub use mod_test::*;
   ```
+- 验证**不包含** `pub use mod_test::*;`
 
 ### 2. 边界情况测试
 - 模块中只有函数（无变量）：只生成 `fun_*` 别名
