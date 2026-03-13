@@ -189,6 +189,11 @@ impl Kind {
         !inner.iter().any(|e| matches!(e.kind, Kind::CompoundStmt))
     }
 
+    pub fn is_const_var(&self) -> bool {
+        let Kind::VarDecl(var) = self else { return false; };
+        var.ty.qual_type.starts_with("const ")
+    }
+
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
     pub fn c_code(&self, root: &Path) -> Result<String> {
         if self.skip() {

@@ -53,23 +53,25 @@ fn print_help() {
     println!("选项:");
     println!("  --feature <名称>     必需：指定要处理的feature名称");
     println!("  --init               初始化feature，创建新的Rust库项目");
+    println!("  --reinit             重新初始化feature, 不影响已经转换的rs文件");
     println!("  --update             更新feature，同步C代码和Rust文件");
     println!("  --merge              合并feature，合并分散的Rust文件");
     println!("  -h, --help           显示此帮助信息并退出");
     println!();
     println!("说明:");
     println!("  这是一个C到Rust代码转换工具的一部分，用于管理特定feature的C/Rust代码转换。");
-    println!("  必须指定 --feature 选项和 exactly one of --init, --update, or --merge。");
+    println!("  必须指定 --feature 选项和 exactly one of --init, --update, --reinit, or --merge。");
     println!();
     println!("示例:");
     println!("  code-analyse --feature my_feature --init");
     println!("  code-analyse --feature my_feature --update");
+    println!("  code-analyse --feature my_feature --reinit");
     println!("  code-analyse --feature my_feature --merge");
 }
 
 fn main() -> Result<()> {
     // 定义支持的选项: feature: 需要参数, init/update/merge 不需要参数, help/h 显示帮助
-    let opts = hiopt::options!["feature:", "init", "update", "merge", "help", "h"];
+    let opts = hiopt::options!["feature:", "init", "update", "merge", "reinit", "help", "h"];
 
     // 获取命令行参数（跳过第一个程序名）
     let args: Vec<String> = std::env::args().collect();
@@ -78,6 +80,7 @@ fn main() -> Result<()> {
     let mut feature_name = None;
     let mut init_flag = false;
     let mut update_flag = false;
+    let mut reinit_flag = false;
     let mut merge_flag = false;
 
     // 遍历选项
@@ -94,6 +97,9 @@ fn main() -> Result<()> {
                     }
                     "update" => {
                         update_flag = true;
+                    }
+                    "reinit" => {
+                        reinit_flag = true;
                     }
                     "merge" => {
                         merge_flag = true;
@@ -122,21 +128,25 @@ fn main() -> Result<()> {
     let operations = [
         (init_flag, "init"),
         (update_flag, "update"),
+        (reinit_flag, "reinit"),
         (merge_flag, "merge"),
     ];
     let specified: Vec<_> = operations.iter().filter(|(flag, _)| *flag).collect();
     if specified.len() != 1 {
-        eprintln!("Error: exactly one of --init, --update, or --merge must be specified");
+        eprintln!("Error: exactly one of --init, --update, --reinit, or --merge must be specified");
         return Err(Error::inval());
     }
 
     let mut feature = Feature::new(&feature_name)?;
     match specified[0].1 {
         "init" => {
-            feature.reinit()?;
+            feature.init()?;
         }
         "update" => {
             feature.update()?;
+        }
+        "reinit" => {
+            feature.reinit()?;
         }
         "merge" => {
             feature.merge()?;
