@@ -13,10 +13,7 @@ use syn::{
     parse::Parser,
     spanned::Spanned,
     visit::{visit_file, visit_signature, Visit},
-    visit_mut::{
-        visit_file_mut, visit_foreign_item_fn_mut, visit_item_const_mut,
-        visit_item_foreign_mod_mut, VisitMut,
-    },
+    visit_mut::{visit_file_mut, visit_foreign_item_fn_mut, visit_item_foreign_mod_mut, VisitMut},
 };
 use toml_edit::{Array, Document, Item, Table};
 use walkdir::WalkDir;
@@ -421,6 +418,21 @@ impl Feature {
                     .parse_str(&format!("#[allow(warnings)]\n#[link_name = \"{}\"]", name))
                     .unwrap()
             }
+
+            fn normalize_item_const(&mut self, item: &mut syn::Item) {
+                let syn::Item::Const(c) = item else {
+                    return;
+                };
+                let name = c.ident.to_string();
+                if !self.0.contains_key(name.as_str()) {
+                    self.visit_item_const_mut(c);
+                    return;
+                }
+                let ty = &c.ty;
+                let ident = &c.ident;
+                *item = syn::parse2(quote!(unsafe extern "C" { static mut #ident: #ty; })).unwrap();
+                self.visit_item_mut(item);
+            }
         }
         // 如果有多个文件，这些文件当前机制下是相互独立的，同一个类型，同一个FFI函数会重复声明
         // 这里抑制这些重复FFI声明可能导致的告警
@@ -429,7 +441,7 @@ impl Feature {
             fn visit_item_mut(&mut self, item: &mut syn::Item) {
                 match item {
                     syn::Item::ForeignMod(m) => visit_item_foreign_mod_mut(self, m),
-                    syn::Item::Const(c) => visit_item_const_mut(self, c),
+                    syn::Item::Const(_) => self.normalize_item_const(item),
                     syn::Item::Fn(item) => item.vis = syn::Visibility::Inherited,
                     syn::Item::Struct(item) => item.vis = syn::Visibility::Inherited,
                     syn::Item::Union(item) => item.vis = syn::Visibility::Inherited,
