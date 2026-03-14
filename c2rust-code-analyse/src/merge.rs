@@ -179,9 +179,7 @@ impl Feature {
         for type_item in &type_items {
             let mut type_item = type_item.clone();
             if let Some(type_name) = Self::item_name(&type_item) {
-                if !deps.is_pub(&type_name) {
-                    Self::set_item_visibility(&mut type_item, syn::Visibility::Inherited);
-                }
+                Self::set_item_visibility(&mut type_item, deps.is_pub(&type_name));
                 if let Some(impl_blocks) = impl_map.get(&type_name) {
                     for impl_block in impl_blocks {
                         merged_items.push(syn::Item::Impl(impl_block.clone()));
@@ -407,12 +405,17 @@ impl Feature {
         }
     }
 
-    fn set_item_visibility(item: &mut syn::Item, vis: syn::Visibility) {
+    fn set_item_visibility(item: &mut syn::Item, is_pub: bool) {
+        let vis = if is_pub {
+            syn::parse_str("pub").unwrap()
+        } else {
+            syn::Visibility::Inherited
+        };
         match item {
-            syn::Item::Struct(s) => s.vis = vis.clone(),
-            syn::Item::Union(u) => u.vis = vis.clone(),
-            syn::Item::Const(c) => c.vis = vis.clone(),
-            syn::Item::Type(t) => t.vis = vis.clone(),
+            syn::Item::Struct(s) => s.vis = vis,
+            syn::Item::Union(u) => u.vis = vis,
+            syn::Item::Const(c) => c.vis = vis,
+            syn::Item::Type(t) => t.vis = vis,
             _ => {}
         }
     }
@@ -1318,10 +1321,9 @@ impl OtherStruct {
     #[test]
     fn test_set_item_visibility_struct() {
         let mut item: syn::Item = syn::parse_str("struct MyStruct { x: i32 }").unwrap();
-        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
-        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        Feature::set_item_visibility(&mut item, true);
         if let syn::Item::Struct(s) = item {
-            assert!(matches!(s.vis, syn::Visibility::Restricted(_)));
+            assert!(matches!(s.vis, syn::Visibility::Public(_)));
         } else {
             panic!("Expected struct");
         }
@@ -1330,10 +1332,9 @@ impl OtherStruct {
     #[test]
     fn test_set_item_visibility_union() {
         let mut item: syn::Item = syn::parse_str("union MyUnion { x: i32 }").unwrap();
-        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
-        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        Feature::set_item_visibility(&mut item, true);
         if let syn::Item::Union(u) = item {
-            assert!(matches!(u.vis, syn::Visibility::Restricted(_)));
+            assert!(matches!(u.vis, syn::Visibility::Public(_)));
         } else {
             panic!("Expected union");
         }
@@ -1342,10 +1343,9 @@ impl OtherStruct {
     #[test]
     fn test_set_item_visibility_const() {
         let mut item: syn::Item = syn::parse_str("const MAX: usize = 100;").unwrap();
-        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
-        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        Feature::set_item_visibility(&mut item, false);
         if let syn::Item::Const(c) = item {
-            assert!(matches!(c.vis, syn::Visibility::Restricted(_)));
+            assert!(matches!(c.vis, syn::Visibility::Inherited));
         } else {
             panic!("Expected const");
         }
@@ -1354,10 +1354,9 @@ impl OtherStruct {
     #[test]
     fn test_set_item_visibility_type() {
         let mut item: syn::Item = syn::parse_str("type MyType = i32;").unwrap();
-        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
-        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        Feature::set_item_visibility(&mut item, false);
         if let syn::Item::Type(t) = item {
-            assert!(matches!(t.vis, syn::Visibility::Restricted(_)));
+            assert!(matches!(t.vis, syn::Visibility::Inherited));
         } else {
             panic!("Expected type");
         }
