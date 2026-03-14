@@ -61,14 +61,14 @@ impl Visit<'_> for DepNames {
     }
 }
 
-struct PubDepVisitor<'a>(&'a mut HashMap<String, bool>);
+struct PubDepVisitor<'a>(&'a mut DepNames);
 
 impl Visit<'_> for PubDepVisitor<'_> {
     fn visit_path(&mut self, path: &syn::Path) {
         if let Some(ident) = path.segments.last() {
             let name = ident.ident.to_string();
             if !name.starts_with("_c2rust_private_") {
-                self.0.insert(name, true);
+                self.0.mark_pub(name);
             }
         }
         visit_path(self, path);
@@ -180,8 +180,7 @@ impl Feature {
             let mut type_item = type_item.clone();
             if let Some(type_name) = Self::item_name(&type_item) {
                 if !deps.is_pub(&type_name) {
-                    let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
-                    Self::set_item_visibility(&mut type_item, pub_crate_vis);
+                    Self::set_item_visibility(&mut type_item, syn::Visibility::Inherited);
                 }
                 if let Some(impl_blocks) = impl_map.get(&type_name) {
                     for impl_block in impl_blocks {
@@ -288,14 +287,14 @@ impl Feature {
                 &rs_file.with_file_name(decl_file),
             )?;
             if matches!(fn_item.vis, syn::Visibility::Public(_)) {
-                PubDepVisitor(&mut deps.used_names).visit_signature(&fn_item.sig);
+                PubDepVisitor(deps).visit_signature(&fn_item.sig);
             }
             visit_item(deps, &syn::Item::Fn(fn_item.clone()));
             all_items.push(syn::Item::Fn(fn_item));
         } else if let Some(syn::Item::Static(mut var_item)) = main_item {
             Self::merge_item_static(other_items, &mut var_item);
             if matches!(var_item.vis, syn::Visibility::Public(_)) {
-                PubDepVisitor(&mut deps.used_names).visit_type(&var_item.ty);
+                PubDepVisitor(deps).visit_type(&var_item.ty);
             }
             visit_item(deps, &syn::Item::Static(var_item.clone()));
             all_items.push(syn::Item::Static(var_item));
@@ -507,7 +506,7 @@ impl Feature {
             all_types.retain(|name, item| {
                 if deps.contains(name) {
                     if deps.is_pub(name) {
-                        PubDepVisitor(&mut deps.used_names).visit_item(item);
+                        PubDepVisitor(deps).visit_item(item);
                     }
                     visit_item(deps, item);
                     dep_types.push(item.clone());
@@ -1299,7 +1298,7 @@ impl OtherStruct {
     #[test]
     fn test_pub_dep_visitor_basic() {
         let mut deps = DepNames::new();
-        PubDepVisitor(&mut deps.used_names)
+        PubDepVisitor(&mut deps)
             .visit_signature(&syn::parse_str("fn test(a: MyType) -> i32").unwrap());
         assert!(deps.is_pub("MyType"));
         assert!(!deps.is_pub("OtherType"));
@@ -1310,7 +1309,7 @@ impl OtherStruct {
         let mut deps = DepNames::new();
         deps.used_names.insert("InnerType".to_string(), false);
         deps.used_names.insert("OuterType".to_string(), true);
-        PubDepVisitor(&mut deps.used_names)
+        PubDepVisitor(&mut deps)
             .visit_item(&syn::parse_str("struct OuterType { inner: InnerType }").unwrap());
         assert!(deps.is_pub("InnerType"));
         assert!(deps.is_pub("OuterType"));
