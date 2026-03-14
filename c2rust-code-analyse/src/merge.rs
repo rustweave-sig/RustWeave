@@ -10,24 +10,36 @@ use syn::{
 use walkdir::WalkDir;
 
 struct DepNames {
-    used_names: HashSet<String>,
+    used_names: HashMap<String, bool>, // bool 表示是否是 pub 签名依赖
     mac_tokens: String,
 }
 
 impl DepNames {
     fn new() -> Self {
         Self {
-            used_names: HashSet::new(),
+            used_names: HashMap::new(),
             mac_tokens: String::new(),
         }
     }
 
     fn contains(&self, name: &str) -> bool {
-        if self.used_names.contains(name) {
+        if self.used_names.contains_key(name) {
             return true;
         }
         let regex = regex::Regex::new(&format!("[^a-zA-Z_]{name}[^a-zA-Z_]")).unwrap();
         regex.find(&self.mac_tokens).is_some()
+    }
+
+    fn mark_used(&mut self, name: String) {
+        self.used_names.entry(name).or_insert(false);
+    }
+
+    fn mark_pub(&mut self, name: String) {
+        self.used_names.insert(name, true);
+    }
+
+    fn is_pub(&self, name: &str) -> bool {
+        self.used_names.get(name).copied().unwrap_or(false)
     }
 }
 
@@ -36,7 +48,7 @@ impl Visit<'_> for DepNames {
         if let Some(ident) = path.segments.last() {
             let name = ident.ident.to_string();
             if !name.starts_with("_c2rust_private_") {
-                self.used_names.insert(name);
+                self.mark_used(name);
             }
         }
         // Option<&T>形式，还需要处理T.
@@ -47,6 +59,24 @@ impl Visit<'_> for DepNames {
     fn visit_macro(&mut self, mac: &syn::Macro) {
         self.mac_tokens.push_str(&mac.tokens.to_string());
     }
+}
+
+struct PubDepVisitor<'a>(&'a mut HashMap<String, bool>);
+
+impl Visit<'_> for PubDepVisitor<'_> {
+    fn visit_path(&mut self, path: &syn::Path) {
+        if let Some(ident) = path.segments.last() {
+            let name = ident.ident.to_string();
+            if !name.starts_with("_c2rust_private_") {
+                self.0.insert(name, true);
+            }
+        }
+        visit_path(self, path);
+    }
+
+    fn visit_block(&mut self, _: &syn::Block) {}
+    fn visit_expr(&mut self, _: &syn::Expr) {}
+    fn visit_stmt(&mut self, _: &syn::Stmt) {}
 }
 
 struct CollectedItems {
@@ -147,15 +177,19 @@ impl Feature {
         }
 
         for type_item in &type_items {
-            merged_items.push(type_item.clone());
-
-            if let Some(type_name) = Self::item_name(type_item) {
+            let mut type_item = type_item.clone();
+            if let Some(type_name) = Self::item_name(&type_item) {
+                if !deps.is_pub(&type_name) {
+                    let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
+                    Self::set_item_visibility(&mut type_item, pub_crate_vis);
+                }
                 if let Some(impl_blocks) = impl_map.get(&type_name) {
                     for impl_block in impl_blocks {
                         merged_items.push(syn::Item::Impl(impl_block.clone()));
                     }
                 }
             }
+            merged_items.push(type_item);
         }
         if let Some(fm) = foreign_mod {
             merged_items.push(syn::Item::ForeignMod(fm));
@@ -253,10 +287,16 @@ impl Feature {
                 &mut fn_item,
                 &rs_file.with_file_name(decl_file),
             )?;
+            if matches!(fn_item.vis, syn::Visibility::Public(_)) {
+                PubDepVisitor(&mut deps.used_names).visit_signature(&fn_item.sig);
+            }
             visit_item(deps, &syn::Item::Fn(fn_item.clone()));
             all_items.push(syn::Item::Fn(fn_item));
         } else if let Some(syn::Item::Static(mut var_item)) = main_item {
             Self::merge_item_static(other_items, &mut var_item);
+            if matches!(var_item.vis, syn::Visibility::Public(_)) {
+                PubDepVisitor(&mut deps.used_names).visit_type(&var_item.ty);
+            }
             visit_item(deps, &syn::Item::Static(var_item.clone()));
             all_items.push(syn::Item::Static(var_item));
         } else {
@@ -368,6 +408,16 @@ impl Feature {
         }
     }
 
+    fn set_item_visibility(item: &mut syn::Item, vis: syn::Visibility) {
+        match item {
+            syn::Item::Struct(s) => s.vis = vis.clone(),
+            syn::Item::Union(u) => u.vis = vis.clone(),
+            syn::Item::Const(c) => c.vis = vis.clone(),
+            syn::Item::Type(t) => t.vis = vis.clone(),
+            _ => {}
+        }
+    }
+
     fn extract_dependencies(
         mod_rs: &Path,
         deps: &mut DepNames,
@@ -456,6 +506,9 @@ impl Feature {
             new_dep = false;
             all_types.retain(|name, item| {
                 if deps.contains(name) {
+                    if deps.is_pub(name) {
+                        PubDepVisitor(&mut deps.used_names).visit_item(item);
+                    }
                     visit_item(deps, item);
                     dep_types.push(item.clone());
                     new_dep = true;
@@ -876,8 +929,8 @@ mod tests {
     #[test]
     fn test_filter_dependencies_basic() {
         let mut deps = DepNames::new();
-        deps.used_names.insert("UsedType".to_string());
-        deps.used_names.insert("used_func".to_string());
+        deps.used_names.insert("UsedType".to_string(), false);
+        deps.used_names.insert("used_func".to_string(), false);
 
         let mut all_types: HashMap<String, syn::Item> = HashMap::new();
         all_types.insert(
@@ -919,7 +972,7 @@ mod tests {
     #[test]
     fn test_filter_dependencies_transitive() {
         let mut deps = DepNames::new();
-        deps.used_names.insert("TypeA".to_string());
+        deps.used_names.insert("TypeA".to_string(), false);
 
         let mut all_types: HashMap<String, syn::Item> = HashMap::new();
         all_types.insert(
@@ -1226,8 +1279,8 @@ impl OtherStruct {
         fs::write(&mod_rs_path, mod_rs_content).unwrap();
 
         let mut deps = DepNames::new();
-        deps.used_names.insert("MyStruct".to_string());
-        deps.used_names.insert("OtherStruct".to_string());
+        deps.used_names.insert("MyStruct".to_string(), false);
+        deps.used_names.insert("OtherStruct".to_string(), false);
 
         let (type_items, impl_blocks, _foreign_mod) =
             Feature::extract_dependencies(&mod_rs_path, &mut deps).unwrap();
@@ -1239,7 +1292,85 @@ impl OtherStruct {
             .iter()
             .filter_map(|impl_block| Feature::impl_self_type_name(impl_block))
             .collect();
-assert!(impl_types.contains(&"MyStruct".to_string()));
+        assert!(impl_types.contains(&"MyStruct".to_string()));
         assert!(impl_types.contains(&"OtherStruct".to_string()));
+    }
+
+    #[test]
+    fn test_pub_dep_visitor_basic() {
+        let mut deps = DepNames::new();
+        PubDepVisitor(&mut deps.used_names)
+            .visit_signature(&syn::parse_str("fn test(a: MyType) -> i32").unwrap());
+        assert!(deps.is_pub("MyType"));
+        assert!(!deps.is_pub("OtherType"));
+    }
+
+    #[test]
+    fn test_pub_dep_visitor_indirect() {
+        let mut deps = DepNames::new();
+        deps.used_names.insert("InnerType".to_string(), false);
+        deps.used_names.insert("OuterType".to_string(), true);
+        PubDepVisitor(&mut deps.used_names)
+            .visit_item(&syn::parse_str("struct OuterType { inner: InnerType }").unwrap());
+        assert!(deps.is_pub("InnerType"));
+        assert!(deps.is_pub("OuterType"));
+    }
+
+    #[test]
+    fn test_set_item_visibility_struct() {
+        let mut item: syn::Item = syn::parse_str("struct MyStruct { x: i32 }").unwrap();
+        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
+        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        if let syn::Item::Struct(s) = item {
+            assert!(matches!(s.vis, syn::Visibility::Restricted(_)));
+        } else {
+            panic!("Expected struct");
+        }
+    }
+
+    #[test]
+    fn test_set_item_visibility_union() {
+        let mut item: syn::Item = syn::parse_str("union MyUnion { x: i32 }").unwrap();
+        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
+        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        if let syn::Item::Union(u) = item {
+            assert!(matches!(u.vis, syn::Visibility::Restricted(_)));
+        } else {
+            panic!("Expected union");
+        }
+    }
+
+    #[test]
+    fn test_set_item_visibility_const() {
+        let mut item: syn::Item = syn::parse_str("const MAX: usize = 100;").unwrap();
+        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
+        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        if let syn::Item::Const(c) = item {
+            assert!(matches!(c.vis, syn::Visibility::Restricted(_)));
+        } else {
+            panic!("Expected const");
+        }
+    }
+
+    #[test]
+    fn test_set_item_visibility_type() {
+        let mut item: syn::Item = syn::parse_str("type MyType = i32;").unwrap();
+        let pub_crate_vis = syn::parse_str("pub(crate)").unwrap();
+        Feature::set_item_visibility(&mut item, pub_crate_vis);
+        if let syn::Item::Type(t) = item {
+            assert!(matches!(t.vis, syn::Visibility::Restricted(_)));
+        } else {
+            panic!("Expected type");
+        }
+    }
+
+    #[test]
+    fn test_is_pub() {
+        let mut deps = DepNames::new();
+        deps.used_names.insert("PubType".to_string(), true);
+        deps.used_names.insert("PrivateType".to_string(), false);
+        assert!(deps.is_pub("PubType"));
+        assert!(!deps.is_pub("PrivateType"));
+        assert!(!deps.is_pub("UnknownType"));
     }
 }

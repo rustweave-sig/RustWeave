@@ -190,7 +190,9 @@ impl Kind {
     }
 
     pub fn is_const_var(&self) -> bool {
-        let Kind::VarDecl(var) = self else { return false; };
+        let Kind::VarDecl(var) = self else {
+            return false;
+        };
         var.ty.qual_type.starts_with("const ")
     }
 
@@ -884,6 +886,7 @@ mod tests {
                 git_commit: false,
                 global_name: None,
                 skip: false,
+                fake_init: false,
             }),
             inner: vec![],
         }
