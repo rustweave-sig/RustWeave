@@ -193,7 +193,20 @@ impl Kind {
         let Kind::VarDecl(var) = self else {
             return false;
         };
-        var.ty.qual_type.starts_with("const ")
+
+        let qual_type = &var.ty.qual_type;
+
+        // 提前创建正则表达式，避免重复编译
+        let const_pattern = regex::Regex::new(r"\bconst\b").unwrap();
+
+        // 查找最后一个指针标记 * (从右向左查找，处理多级指针)
+        if let Some(last_star_pos) = qual_type.rfind('*') {
+            // 检查 * 之后是否有 const（顶层 const）
+            const_pattern.is_match(&qual_type[last_star_pos + 1..])
+        } else {
+            // 没有指针，检查整个类型是否有 const
+            const_pattern.is_match(qual_type)
+        }
     }
 
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
@@ -890,6 +903,69 @@ mod tests {
             }),
             inner: vec![],
         }
+    }
+
+    fn make_var(qual_type: &str) -> Node {
+        Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::VarDecl(VarDecl {
+                name: "test_var".to_string(),
+                loc: SourceLocation::default(),
+                range: SourceRange::default(),
+                ty: MyClangType {
+                    qual_type: qual_type.to_string(),
+                    desugared_qual_type: None,
+                },
+                storage_class: None,
+                init: None,
+                is_implicit: false,
+                git_commit: false,
+                global_name: None,
+                skip: false,
+                fake_init: false,
+            }),
+            inner: vec![],
+        }
+    }
+
+    #[test]
+    fn test_is_const_var_top_level() {
+        assert!(make_var("const int").kind.is_const_var());
+        assert!(make_var("int const").kind.is_const_var());
+        assert!(!make_var("int").kind.is_const_var());
+    }
+
+    #[test]
+    fn test_is_const_var_pointer() {
+        assert!(make_var("int * const").kind.is_const_var());
+        assert!(!make_var("const int *").kind.is_const_var());
+        assert!(!make_var("int const *").kind.is_const_var());
+        assert!(!make_var("int *").kind.is_const_var());
+    }
+
+    #[test]
+    fn test_is_const_var_no_match_keywords() {
+        assert!(!make_var("constexpr int").kind.is_const_var());
+        assert!(!make_var("auto const_cast<T>").kind.is_const_var());
+        assert!(!make_var("myconst int").kind.is_const_var());
+        assert!(!make_var("constify int").kind.is_const_var());
+    }
+
+    #[test]
+    fn test_is_const_var_complex_types() {
+        assert!(make_var("const struct Point").kind.is_const_var());
+        assert!(make_var("struct Point * const").kind.is_const_var());
+        assert!(!make_var("const struct Point *").kind.is_const_var());
+        assert!(make_var("const enum Color").kind.is_const_var());
+        assert!(make_var("enum Color * const").kind.is_const_var());
+    }
+
+    #[test]
+    fn test_is_const_var_multi_level_pointer() {
+        assert!(make_var("int ** const").kind.is_const_var());
+        assert!(!make_var("int * const *").kind.is_const_var());
+        assert!(!make_var("const int **").kind.is_const_var());
+        assert!(make_var("int *** const").kind.is_const_var());
     }
 
     #[test]
