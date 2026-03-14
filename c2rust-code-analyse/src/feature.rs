@@ -458,10 +458,6 @@ impl Feature {
                 match item {
                     syn::Item::ForeignMod(m) => visit_item_foreign_mod_mut(self, m),
                     syn::Item::Const(_) => self.normalize_item_const(item),
-                    syn::Item::Fn(item) => item.vis = syn::Visibility::Inherited,
-                    syn::Item::Struct(item) => item.vis = syn::Visibility::Inherited,
-                    syn::Item::Union(item) => item.vis = syn::Visibility::Inherited,
-                    syn::Item::Type(item) => item.vis = syn::Visibility::Inherited,
                     syn::Item::Use(item) => item.vis = syn::Visibility::Inherited,
                     _ => {}
                 }
@@ -469,7 +465,6 @@ impl Feature {
 
             fn visit_item_const_mut(&mut self, item: &mut syn::ItemConst) {
                 let name = item.ident.to_string();
-                item.vis = syn::Visibility::Inherited;
                 if name.starts_with("_c2rust_private_") {
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.ident = syn::Ident::new(new_name, item.ident.span());
@@ -479,7 +474,6 @@ impl Feature {
             fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
                 let name = item.ident.to_string();
                 item.attrs = Self::foreign_item_attrs(&name);
-                item.vis = syn::Visibility::Inherited;
                 if name.starts_with("_c2rust_private_") {
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.ident = syn::Ident::new(new_name, item.ident.span());
@@ -489,7 +483,6 @@ impl Feature {
             fn visit_foreign_item_fn_mut(&mut self, item: &mut syn::ForeignItemFn) {
                 let name = item.sig.ident.to_string();
                 item.attrs = Self::foreign_item_attrs(&name);
-                item.vis = syn::Visibility::Inherited;
                 if name.starts_with("_c2rust_private_") {
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.sig.ident = syn::Ident::new(new_name, item.sig.ident.span());
