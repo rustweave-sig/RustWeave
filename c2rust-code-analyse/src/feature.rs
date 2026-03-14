@@ -759,7 +759,106 @@ impl Feature {
             let formatted = prettyplease::unparse(&ast);
             fs::write(file, formatted.as_bytes()).log_err(&format!("write {}", file.display()))?;
         }
+
+        // 新增：检查是否需要拷贝到其他模块
+        // 只有当 link_name 以 _c2rust_private_ 开头时才触发拷贝
+        if link_name.starts_with("_c2rust_private_") {
+            let _ = Self::copy_content_to_other_modules(file);
+        }
+
         Ok(true)
+    }
+
+    fn copy_content_to_other_modules(file: &Path) -> Result<()> {
+        // 1. 读取当前 Rust 文件内容
+        let rust_content = fs::read_to_string(file).log_err(&format!("read {}", file.display()))?;
+
+        // 2. 获取当前 C 文件路径
+        let source_c_file = file.with_extension("c");
+        if !source_c_file.exists() {
+            return Ok(());
+        }
+
+        // 3. 读取当前 C 文件内容
+        let c_content = fs::read_to_string(&source_c_file)
+            .log_err(&format!("read {}", source_c_file.display()))?;
+
+        // 4. 获取当前模块目录（跳过）
+        let current_mod_dir = file.parent().ok_or(Error::inval())?;
+
+        // 5. 获取 src 目录
+        let src_dir = current_mod_dir.parent().ok_or(Error::inval())?;
+
+        // 6. 获取文件名
+        let file_name = file
+            .file_name()
+            .ok_or(Error::inval())?
+            .to_string_lossy()
+            .to_string();
+
+        // 7. 使用 WalkDir 遍历 src 目录下一层目录
+        for entry in WalkDir::new(&src_dir)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let mod_dir = entry.path();
+
+            // 跳过非目录或非 mod_ 开头的目录
+            if !mod_dir.is_dir() {
+                continue;
+            }
+            let mod_name = mod_dir
+                .file_name()
+                .ok_or(Error::inval())?
+                .to_string_lossy()
+                .to_string();
+            if !mod_name.starts_with("mod_") {
+                continue;
+            }
+
+            // 跳过当前模块
+            if mod_dir == current_mod_dir {
+                continue;
+            }
+
+            // 查找同名文件
+            let target_rust_file = mod_dir.join(&file_name);
+            if !target_rust_file.exists() {
+                continue;
+            }
+
+            // 检查目标文件内容是否为空
+            let target_rust_content = fs::read_to_string(&target_rust_file)
+                .log_err(&format!("read {}", target_rust_file.display()))?;
+            if !target_rust_content.trim().is_empty() {
+                continue;
+            }
+
+            // 检查 C 文件是否存在且内容相同
+            let target_c_file = target_rust_file.with_extension("c");
+            if !target_c_file.exists() {
+                continue;
+            }
+            let target_c_content = fs::read_to_string(&target_c_file)
+                .log_err(&format!("read {}", target_c_file.display()))?;
+            if c_content != target_c_content {
+                continue;
+            }
+
+            // 拷贝内容
+            fs::write(&target_rust_file, rust_content.as_bytes())
+                .log_err(&format!("write {}", target_rust_file.display()))?;
+
+            println!(
+                "Copied content from {} to {}",
+                file.display(),
+                target_rust_file.display()
+            );
+        }
+
+        Ok(())
     }
 
     fn has_ptr_arg(sig: &syn::Signature) -> bool {
@@ -912,5 +1011,132 @@ impl Feature {
         visit_file_mut(&mut ffi_names, ast);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_rust_structure(temp_dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let mod_a = temp_dir.join("rust/src/mod_a");
+        let mod_b = temp_dir.join("rust/src/mod_b");
+        fs::create_dir_all(&mod_a).unwrap();
+        fs::create_dir_all(&mod_b).unwrap();
+
+        let fun_foo_a_rs = mod_a.join("fun_foo.rs");
+        let fun_foo_b_rs = mod_b.join("fun_foo.rs");
+        let fun_foo_a_c = mod_a.join("fun_foo.c");
+        let fun_foo_b_c = mod_b.join("fun_foo.c");
+
+        (fun_foo_a_rs, fun_foo_b_rs, fun_foo_a_c, fun_foo_b_c)
+    }
+
+    #[test]
+    fn test_copy_content_to_other_modules_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let (fun_foo_a_rs, fun_foo_b_rs, fun_foo_a_c, fun_foo_b_c) =
+            create_test_rust_structure(root);
+
+        fs::write(&fun_foo_a_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&fun_foo_b_rs, "").unwrap();
+        fs::write(&fun_foo_a_c, "int foo() { return 42; }").unwrap();
+        fs::write(&fun_foo_b_c, "int foo() { return 42; }").unwrap();
+
+        Feature::copy_content_to_other_modules(&fun_foo_a_rs).unwrap();
+
+        let content_b = fs::read_to_string(&fun_foo_b_rs).unwrap();
+        assert_eq!(content_b.trim(), "pub fn foo() -> i32 { 42 }");
+    }
+
+    #[test]
+    fn test_copy_content_c_content_different() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let (fun_foo_a_rs, fun_foo_b_rs, fun_foo_a_c, fun_foo_b_c) =
+            create_test_rust_structure(root);
+
+        fs::write(&fun_foo_a_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&fun_foo_b_rs, "").unwrap();
+        fs::write(&fun_foo_a_c, "int foo() { return 42; }").unwrap();
+        fs::write(&fun_foo_b_c, "int foo() { return 100; }").unwrap();
+
+        Feature::copy_content_to_other_modules(&fun_foo_a_rs).unwrap();
+
+        let content_b = fs::read_to_string(&fun_foo_b_rs).unwrap();
+        assert!(content_b.trim().is_empty());
+    }
+
+    #[test]
+    fn test_copy_content_target_not_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let (fun_foo_a_rs, fun_foo_b_rs, fun_foo_a_c, fun_foo_b_c) =
+            create_test_rust_structure(root);
+
+        fs::write(&fun_foo_a_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&fun_foo_b_rs, "pub fn bar() -> i32 { 100 }").unwrap();
+        fs::write(&fun_foo_a_c, "int foo() { return 42; }").unwrap();
+        fs::write(&fun_foo_b_c, "int foo() { return 42; }").unwrap();
+
+        Feature::copy_content_to_other_modules(&fun_foo_a_rs).unwrap();
+
+        let content_b = fs::read_to_string(&fun_foo_b_rs).unwrap();
+        assert_eq!(content_b.trim(), "pub fn bar() -> i32 { 100 }");
+    }
+
+    #[test]
+    fn test_copy_content_source_c_not_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let (fun_foo_a_rs, fun_foo_b_rs, _, _) = create_test_rust_structure(root);
+
+        fs::write(&fun_foo_a_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&fun_foo_b_rs, "").unwrap();
+
+        Feature::copy_content_to_other_modules(&fun_foo_a_rs).unwrap();
+
+        let content_b = fs::read_to_string(&fun_foo_b_rs).unwrap();
+        assert!(content_b.trim().is_empty());
+    }
+
+    #[test]
+    fn test_copy_content_multiple_targets() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let mod_a = root.join("rust/src/mod_a");
+        let mod_b = root.join("rust/src/mod_b");
+        let mod_c = root.join("rust/src/mod_c");
+        fs::create_dir_all(&mod_a).unwrap();
+        fs::create_dir_all(&mod_b).unwrap();
+        fs::create_dir_all(&mod_c).unwrap();
+
+        let fun_foo_a_rs = mod_a.join("fun_foo.rs");
+        let fun_foo_b_rs = mod_b.join("fun_foo.rs");
+        let fun_foo_c_rs = mod_c.join("fun_foo.rs");
+        let fun_foo_a_c = mod_a.join("fun_foo.c");
+        let fun_foo_b_c = mod_b.join("fun_foo.c");
+        let fun_foo_c_c = mod_c.join("fun_foo.c");
+
+        fs::write(&fun_foo_a_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&fun_foo_b_rs, "").unwrap();
+        fs::write(&fun_foo_c_rs, "").unwrap();
+        fs::write(&fun_foo_a_c, "int foo() { return 42; }").unwrap();
+        fs::write(&fun_foo_b_c, "int foo() { return 42; }").unwrap();
+        fs::write(&fun_foo_c_c, "int foo() { return 42; }").unwrap();
+
+        Feature::copy_content_to_other_modules(&fun_foo_a_rs).unwrap();
+
+        let content_b = fs::read_to_string(&fun_foo_b_rs).unwrap();
+        let content_c = fs::read_to_string(&fun_foo_c_rs).unwrap();
+        assert_eq!(content_b.trim(), "pub fn foo() -> i32 { 42 }");
+        assert_eq!(content_c.trim(), "pub fn foo() -> i32 { 42 }");
     }
 }
