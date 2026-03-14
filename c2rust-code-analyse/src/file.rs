@@ -204,6 +204,7 @@ impl Kind {
         };
 
         let mut code = read_c_code(root, range)?;
+
         if code.is_empty() {
             return Ok(code);
         }
@@ -320,7 +321,14 @@ impl Kind {
     /// 变量中应该翻译带初始化值的那一个, 如果都没有初始化，且非`extern`需要任意翻译一个.
     pub fn is_inited(&self) -> bool {
         match self {
-            Kind::VarDecl(ref item) => item.init.is_some(),
+            Kind::VarDecl(ref item) => item.init.is_some() || item.fake_init,
+            _ => false,
+        }
+    }
+
+    pub fn is_fake_inited(&self) -> bool {
+        match self {
+            Kind::VarDecl(ref item) => item.fake_init,
             _ => false,
         }
     }
@@ -435,6 +443,8 @@ pub struct VarDecl {
     #[serde(rename = "storageClass")]
     storage_class: Option<String>,
     init: Option<String>,
+    #[serde(default)]
+    fake_init: bool,
     #[serde(default, rename = "isImplicit")]
     is_implicit: bool,
     #[serde(default)]
@@ -689,7 +699,7 @@ impl File {
     }
 
     fn init_vars(node: &mut Node) {
-        // 每个变量都必须有个init标志.
+        // 每个变量都必须有个init标志, 如果都没有，选择一个设置为fake_init标志.
         let mut inited_vars = HashMap::new();
         for node in &mut node.inner {
             let Kind::VarDecl(ref mut var) = node.kind else {
@@ -705,8 +715,8 @@ impl File {
             }
         }
         for (_, var) in inited_vars {
-            if var.storage_class.as_deref() != Some("extern") {
-                var.init = Some("c".to_string());
+            if var.storage_class.as_deref() != Some("extern") && var.init.is_none() {
+                var.fake_init = true;
             }
         }
     }
