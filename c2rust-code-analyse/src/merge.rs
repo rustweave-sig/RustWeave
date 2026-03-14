@@ -1202,7 +1202,7 @@ mod tests {
         let lib_rs_path = src_2.join("lib.rs");
         let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
 
-        assert!(lib_content.contains("use core::ffi::*;"));
+        assert!(lib_content.contains("use ::core::ffi::*;"));
         assert!(lib_content.contains("mod mod_test;"));
         assert!(!lib_content.contains("use mod_test as fun_foo;"));
         assert!(!lib_content.contains("pub use mod_test::*;"));
