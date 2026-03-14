@@ -115,7 +115,7 @@ impl Feature {
         self.create_file_directories(true)?;
         println!("Feature '{}' reinitialized successfully", self.name);
         set_var("C2RUST_CODE_UPDATE_FORCE", "1");
-        self.update()?;
+        self.update(false)?;
         remove_var("C2RUST_CODE_UPDATE_FORCE");
         Ok(())
     }
@@ -167,7 +167,7 @@ impl Feature {
     /// 检查每个变量和函数翻译状态和对应的rust文件内容是否一致
     /// 如果不一致(已翻译但文件为空或者未翻译但是文件非空), 则根据rust文件内容更新真实的翻译状态,
     /// 更新后需要重新生成C文件.
-    pub fn update(&mut self) -> Result<()> {
+    pub fn update(&mut self, build_success: bool) -> Result<()> {
         println!("Starting update for feature '{}'", self.name);
         let mut changed = false;
         let prefix = &self.prefix;
@@ -208,8 +208,11 @@ impl Feature {
                 let need_validate = Self::needs_validation(&rust_file, loaded_from_json)?;
 
                 let not_empty = if need_validate {
-                    let result = Self::validate_file(&rust_file, &name, &prefixed_name)?;
-                    Self::update_c_file_mtime(&rust_file)?;
+                    let result =
+                        Self::validate_file(&rust_file, &name, &prefixed_name, build_success)?;
+                    if build_success {
+                        Self::update_c_file_mtime(&rust_file)?;
+                    }
                     result
                 } else {
                     node.kind.has_committed()
@@ -722,7 +725,12 @@ impl Feature {
     }
 
     // 大模型返回的文件可能不符合要求, 或者被意外破坏，需要修正.
-    fn validate_file(file: &Path, link_name: &str, prefix: &str) -> Result<bool> {
+    fn validate_file(
+        file: &Path,
+        link_name: &str,
+        prefix: &str,
+        build_success: bool,
+    ) -> Result<bool> {
         if !file.exists() {
             return Ok(true);
         }
@@ -761,8 +769,8 @@ impl Feature {
         }
 
         // 新增：检查是否需要拷贝到其他模块
-        // 只有当 link_name 以 _c2rust_private_ 开头时才触发拷贝
-        if link_name.starts_with("_c2rust_private_") {
+        // 两个条件同时满足才触发：build_success=true 且 link_name 以 _c2rust_private_ 开头
+        if build_success && link_name.starts_with("_c2rust_private_") {
             let _ = Self::copy_content_to_other_modules(file);
         }
 
