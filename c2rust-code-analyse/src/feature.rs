@@ -362,7 +362,7 @@ impl Feature {
                 let rs_file = mod_dir.join(&prefixed_name).with_extension("rs");
                 fs::File::create(&rs_file).log_err(&format!("create {}", rs_file.display()))?;
             }
-            let c_code = Self::normalize_c_code(node.kind.c_code(&c_root)?);
+            let c_code = Self::normalize_c_code(&node, &c_root)?;
             let c_file = mod_dir.join(&prefixed_name).with_extension("c");
             fs::write(&c_file, c_code.as_bytes())
                 .log_err(&format!("write {}", c_file.display()))?;
@@ -557,14 +557,20 @@ impl Feature {
         Ok(())
     }
 
-    fn normalize_c_code(mut code: String) -> String {
+    fn normalize_c_code(node: &Node, c_root: &Path) -> Result<String> {
+        let mut code = node.kind.c_code(c_root)?;
         let regex = regex::Regex::new("_c2rust_private_[^_]+_").unwrap();
         let mut off = 0;
         while let Some(m) = regex.find(&code[off..]) {
             off += m.start();
             code.replace_range(off..off + m.len(), "");
         }
-        code
+        // 如果是全局变量，C可能没有初始值，这种情况下，GLM4.7在目前提示词情况下无法正确翻译.
+        // 这里生成的C代码无条件增加0初始值.
+        if node.kind.is_fake_inited() {
+            code.push_str(" = { 0 }");
+        }
+        Ok(code)
     }
 
     fn normalize_name(name: &str) -> &str {
