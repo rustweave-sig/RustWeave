@@ -723,7 +723,7 @@ impl Feature {
         let mut lib_file = syn::File {
             shebang: None,
             attrs,
-            items: vec![syn::parse_str("use core::ffi::*;").unwrap()],
+            items: vec![syn::parse_str("use ::core::ffi::*;").unwrap()],
         };
 
         lib_file.items.extend(lib_items);
