@@ -661,15 +661,8 @@ impl Feature {
             }
         }
 
-        let attr_str = r#"#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(non_upper_case_globals)]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(improper_ctypes)]
-#![allow(dead_code)]
-#![allow(unused_imports)]"#;
         let attrs: Vec<syn::Attribute> = syn::Attribute::parse_inner
-            .parse_str(attr_str)
+            .parse_str(Self::lib_attrs())
             .unwrap_or_default();
 
         let mut lib_file = syn::File {
