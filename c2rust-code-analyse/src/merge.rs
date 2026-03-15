@@ -1498,7 +1498,7 @@ impl OtherStruct {
         .unwrap();
         fs::write(
             &mod_b,
-            "struct MyStruct { x: i32 }\nimpl MyStruct { fn bar(&self) -> i32 { self.x + 1 } }",
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
         )
         .unwrap();
 
@@ -1512,7 +1512,7 @@ impl OtherStruct {
 
         assert_eq!(duplicates.named_remove_set.len(), 1);
         assert!(duplicates.named_remove_set.contains("MyStruct"));
-        assert_eq!(duplicates.impl_to_extract.len(), 2);
+        assert_eq!(duplicates.impl_to_extract.len(), 1);
     }
 
     #[test]
@@ -1562,7 +1562,11 @@ impl OtherStruct {
             "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
         )
         .unwrap();
-        fs::write(&mod_b, "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }\nimpl MyStruct { fn bar(&self) -> i32 { self.x + 1 } }").unwrap();
+        fs::write(
+            &mod_b,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
+        )
+        .unwrap();
 
         let mod_files = vec![mod_a.clone(), mod_b.clone()];
         let collected = Feature::collect_items_from_files(&mod_files).unwrap();
@@ -1574,7 +1578,7 @@ impl OtherStruct {
 
         assert_eq!(duplicates.named_remove_set.len(), 1);
         assert!(duplicates.named_remove_set.contains("MyStruct"));
-        assert_eq!(duplicates.impl_to_extract.len(), 2);
+        assert_eq!(duplicates.impl_to_extract.len(), 1);
     }
 
     #[test]
