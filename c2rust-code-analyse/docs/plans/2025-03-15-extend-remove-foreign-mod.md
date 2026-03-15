@@ -1,7 +1,7 @@
-# 扩展 remove_duplicate_items 功能以支持 ItemStruct/Union/Type/Const/Static 去重
+# 扩展 remove_duplicate_items 功能以支持 ItemStruct/Union/Type/Const 去重
 
 ## 目标概述
-扩展 `Feature::remove_duplicate_items` 功能，使其不仅删除重复的 FFI 定义（ForeignItem::Fn, ForeignItem::Static），还能删除重复定义的 ItemStruct, ItemUnion, ItemType, ItemConst, ItemStatic。
+扩展 `Feature::remove_duplicate_items` 功能，使其不仅删除重复的 FFI 定义（ForeignItem::Fn, ForeignItem::Static），还能删除重复定义的 ItemStruct, ItemUnion, ItemType, ItemConst。
 
 ## 涉及的文件和模块
 - **主要文件**：`/home/dududingding/h00339793/rust/C2RustXW-CLI/c2rust-code-analyse/src/feature.rs`
@@ -42,9 +42,6 @@ impl Visit<'_> for Visitor {
     fn visit_item_const(&mut self, i: &syn::ItemConst) {
         self.0.insert(i.ident.to_string());
     }
-    fn visit_item_static(&mut self, i: &syn::ItemStatic) {
-        self.0.insert(i.ident.to_string());
-    }
 }
 ```
 
@@ -72,7 +69,6 @@ impl VisitMut for Visitor {
             syn::Item::Union(u) => self.0.contains(&u.ident.to_string()),
             syn::Item::Type(t) => self.0.contains(&t.ident.to_string()),
             syn::Item::Const(c) => self.0.contains(&c.ident.to_string()),
-            syn::Item::Static(s) => self.0.contains(&s.ident.to_string()),
             _ => false,
         };
 

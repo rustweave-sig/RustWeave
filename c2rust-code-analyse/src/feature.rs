@@ -930,7 +930,7 @@ impl Feature {
         ast.items.iter_mut().any(|item| match item {
             syn::Item::Static(item) if item.ident.to_string() == name => {
                 main_item = Some(item);
-                false
+                true
             }
             _ => false,
         });
@@ -1015,9 +1015,6 @@ impl Feature {
             fn visit_item_const(&mut self, i: &syn::ItemConst) {
                 self.0.insert(i.ident.to_string());
             }
-            fn visit_item_static(&mut self, i: &syn::ItemStatic) {
-                self.0.insert(i.ident.to_string());
-            }
         }
         let mut ffi_names = Visitor(HashSet::new());
         visit_file(&mut ffi_names, &mod_ast);
@@ -1038,7 +1035,6 @@ impl Feature {
                     syn::Item::Union(u) => self.0.contains(&u.ident.to_string()),
                     syn::Item::Type(t) => self.0.contains(&t.ident.to_string()),
                     syn::Item::Const(c) => self.0.contains(&c.ident.to_string()),
-                    syn::Item::Static(s) => self.0.contains(&s.ident.to_string()),
                     _ => false,
                 };
                 if should_remove {
@@ -1274,8 +1270,6 @@ union MyUnion {
 type MyType = i32;
 
 const MY_CONST: i32 = 42;
-
-static MY_STATIC: i32 = 100;
 "#;
         let target_content = r#"
 struct MyStruct {
@@ -1309,7 +1303,7 @@ struct KeepStruct {
         assert!(!result.contains("union MyUnion"));
         assert!(!result.contains("type MyType"));
         assert!(!result.contains("const MY_CONST"));
-        assert!(!result.contains("static MY_STATIC"));
+        assert!(result.contains("static MY_STATIC"));
         assert!(result.contains("struct KeepStruct"));
     }
 }
