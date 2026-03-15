@@ -1,7 +1,7 @@
-# 扩展 remove_foreign_mod 功能以支持 ItemStruct/Union/Type/Const 去重
+# 扩展 remove_foreign_mod 功能以支持 ItemStruct/Union/Type/Const/Static 去重
 
 ## 目标概述
-扩展 `Feature::remove_foreign_mod` 功能，使其不仅删除重复的 FFI 定义（ForeignItem::Fn, ForeignItem::Static），还能删除重复定义的 ItemStruct, ItemUnion, ItemType, ItemConst。
+扩展 `Feature::remove_foreign_mod` 功能，使其不仅删除重复的 FFI 定义（ForeignItem::Fn, ForeignItem::Static），还能删除重复定义的 ItemStruct, ItemUnion, ItemType, ItemConst, ItemStatic。
 
 ## 涉及的文件和模块
 - **主要文件**：`/home/dududingding/h00339793/rust/C2RustXW-CLI/c2rust-code-analyse/src/feature.rs`
@@ -42,6 +42,9 @@ impl Visit<'_> for Visitor {
     fn visit_item_const(&mut self, i: &syn::ItemConst) {
         self.0.insert(i.ident.to_string());
     }
+    fn visit_item_static(&mut self, i: &syn::ItemStatic) {
+        self.0.insert(i.ident.to_string());
+    }
 }
 ```
 
@@ -69,6 +72,7 @@ impl VisitMut for Visitor {
             syn::Item::Union(u) => self.0.contains(&u.ident.to_string()),
             syn::Item::Type(t) => self.0.contains(&t.ident.to_string()),
             syn::Item::Const(c) => self.0.contains(&c.ident.to_string()),
+            syn::Item::Static(s) => self.0.contains(&s.ident.to_string()),
             _ => false,
         };
 
@@ -103,8 +107,8 @@ ast.items.retain(|item| {
 **预期**：目标文件中的 `type MyType` 定义被删除
 
 ### 测试用例 3：混合去重
-**场景**：mod.rs 中定义了结构体、联合体、类型别名、常量，目标文件中均有对应定义
-**预期**：所有4种类型的重复定义都被正确删除
+**场景**：mod.rs 中定义了结构体、联合体、类型别名、常量、静态变量，目标文件中均有对应定义
+**预期**：所有5种类型的重复定义都被正确删除
 
 ### 测试用例 4：不同定义不被删除
 **场景**：mod.rs 中定义了 `struct MyStruct { x: i32 }`，目标文件中定义了 `struct MyStruct { x: f64 }`（内容不同）
