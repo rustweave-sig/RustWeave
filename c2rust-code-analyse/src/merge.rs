@@ -339,7 +339,6 @@ impl Feature {
     ) -> Result<()> {
         if Self::remove_private_attr(&mut fn_item.attrs) {
             fn_item.vis = syn::Visibility::Inherited;
-            fn_item.sig.abi = None;
         }
         // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
         let content =
