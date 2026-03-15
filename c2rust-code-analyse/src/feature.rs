@@ -1038,8 +1038,8 @@ impl Feature {
     }
 
     fn remove_duplicate_items(ast: &mut syn::File, item_names: &HashSet<String>) -> Result<()> {
-        struct Visitor(HashSet<String>);
-        impl VisitMut for Visitor {
+        struct Visitor<'a>(&'a HashSet<String>);
+        impl VisitMut for Visitor<'_> {
             fn visit_item_foreign_mod_mut(&mut self, m: &mut syn::ItemForeignMod) {
                 m.items.retain(|item| match item {
                     syn::ForeignItem::Fn(f) => !self.0.contains(&f.sig.ident.to_string()),
@@ -1062,7 +1062,7 @@ impl Feature {
                 }
             }
         }
-        let mut visitor = Visitor(item_names.clone());
+        let mut visitor = Visitor(item_names);
         visit_file_mut(&mut visitor, ast);
 
         ast.items.retain(
