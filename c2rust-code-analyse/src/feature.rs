@@ -1040,6 +1040,10 @@ impl Feature {
     fn remove_duplicate_items(ast: &mut syn::File, item_names: &HashSet<String>) -> Result<bool> {
         struct Visitor<'a>(&'a HashSet<String>, bool);
         impl VisitMut for Visitor<'_> {
+            // 翻译的时候可能会定义一些新的类型，改变可见性，不要扩散到其他函数.
+            fn visit_visibility_mut(&mut self, v: &mut syn::Visibility) {
+                *v = syn::Visibility::Inherited;
+            }
             fn visit_item_foreign_mod_mut(&mut self, m: &mut syn::ItemForeignMod) {
                 let len = m.items.len();
                 m.items.retain(|item| match item {
