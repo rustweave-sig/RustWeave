@@ -760,7 +760,7 @@ impl Feature {
             // 大模型生成的代码语法错误，需要大模型修正，直接返回.
             return Ok(true);
         };
-        Self::remove_duplicate_items(&mut ast, item_names)?;
+        let removed = Self::remove_duplicate_items(&mut ast, item_names)?;
 
         let is_fun = prefix.starts_with("fun_");
         let name = Self::normalize_name(link_name);
@@ -777,7 +777,7 @@ impl Feature {
             return Ok(false);
         };
 
-        if is_changed {
+        if is_changed || removed {
             let formatted = prettyplease::unparse(&ast);
             fs::write(file, formatted.as_bytes()).log_err(&format!("write {}", file.display()))?;
         }
@@ -1037,15 +1037,19 @@ impl Feature {
         Ok(visitor.0)
     }
 
-    fn remove_duplicate_items(ast: &mut syn::File, item_names: &HashSet<String>) -> Result<()> {
-        struct Visitor<'a>(&'a HashSet<String>);
+    fn remove_duplicate_items(ast: &mut syn::File, item_names: &HashSet<String>) -> Result<bool> {
+        struct Visitor<'a>(&'a HashSet<String>, bool);
         impl VisitMut for Visitor<'_> {
             fn visit_item_foreign_mod_mut(&mut self, m: &mut syn::ItemForeignMod) {
+                let len = m.items.len();
                 m.items.retain(|item| match item {
                     syn::ForeignItem::Fn(f) => !self.0.contains(&f.sig.ident.to_string()),
                     syn::ForeignItem::Static(v) => !self.0.contains(&v.ident.to_string()),
                     _ => true,
                 });
+                if len != m.items.len() {
+                    self.1 = true;
+                }
             }
 
             fn visit_item_mut(&mut self, i: &mut syn::Item) {
@@ -1058,18 +1062,20 @@ impl Feature {
                     _ => false,
                 };
                 if should_remove {
+                    self.1 = true;
                     *i = syn::Item::Verbatim(quote::quote!());
                 }
             }
         }
-        let mut visitor = Visitor(item_names);
+        let mut visitor = Visitor(item_names, false);
         visit_file_mut(&mut visitor, ast);
 
-        ast.items.retain(
-            |item| !matches!(item, syn::Item::Verbatim(t) if t.to_string().trim().is_empty()),
-        );
+        ast.items.retain(|item| {
+            !matches!(item, syn::Item::Verbatim(t) if t.to_string().trim().is_empty())
+                && !matches!(item, syn::Item::ForeignMod(m) if m.items.is_empty())
+        });
 
-        Ok(())
+        Ok(visitor.1)
     }
 }
 
