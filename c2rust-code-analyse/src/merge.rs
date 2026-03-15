@@ -55,6 +55,14 @@ impl Visit<'_> for DepNames {
         visit_path(self, path);
     }
 
+    fn visit_use_name(&mut self, name: &syn::UseName) {
+        self.mark_used(name.ident.to_string());
+    }
+
+    fn visit_use_rename(&mut self, rename: &syn::UseRename) {
+        self.mark_used(rename.ident.to_string());
+    }
+
     // macro只能通过字符串匹配
     fn visit_macro(&mut self, mac: &syn::Macro) {
         self.mac_tokens.push_str(&mac.tokens.to_string());
