@@ -187,7 +187,7 @@ impl Feature {
         for type_item in &type_items {
             let mut type_item = type_item.clone();
             if let Some(type_name) = Self::item_name(&type_item) {
-                Self::set_item_visibility(&mut type_item, deps.is_pub(&type_name));
+                //Self::set_item_visibility(&mut type_item, deps.is_pub(&type_name));
                 if let Some(impl_blocks) = impl_map.get(&type_name) {
                     for impl_block in impl_blocks {
                         merged_items.push(syn::Item::Impl(impl_block.clone()));
