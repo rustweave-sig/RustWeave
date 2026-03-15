@@ -187,6 +187,14 @@ impl Feature {
             let mut is_updated = false;
             let mut translated = HashMap::new();
             let loaded_from_json = file.loaded_from_json();
+
+            let mod_rs = mod_dir.join("mod.rs");
+            let item_names = if mod_rs.exists() {
+                Self::collect_item_names_from_mod(&mod_rs)?
+            } else {
+                HashSet::new()
+            };
+
             for node in file.iter_mut() {
                 // 只处理函数和变量定义
                 if !Self::is_node_definition(node) || node.kind.is_variadic() {
@@ -208,8 +216,13 @@ impl Feature {
                 let need_validate = Self::needs_validation(&rust_file, loaded_from_json)?;
 
                 let not_empty = if need_validate {
-                    let result =
-                        Self::validate_file(&rust_file, &name, &prefixed_name, build_success)?;
+                    let result = Self::validate_file(
+                        &rust_file,
+                        &name,
+                        &prefixed_name,
+                        build_success,
+                        &item_names,
+                    )?;
                     if build_success {
                         Self::update_c_file_mtime(&rust_file)?;
                     }
@@ -730,6 +743,7 @@ impl Feature {
         link_name: &str,
         prefix: &str,
         build_success: bool,
+        item_names: &HashSet<String>,
     ) -> Result<bool> {
         if !file.exists() {
             return Ok(true);
@@ -746,7 +760,7 @@ impl Feature {
             // 大模型生成的代码语法错误，需要大模型修正，直接返回.
             return Ok(true);
         };
-        Self::remove_duplicate_items(&mut ast, &file.with_file_name("mod.rs"))?;
+        Self::remove_duplicate_items(&mut ast, item_names)?;
 
         let is_fun = prefix.starts_with("fun_");
         let name = Self::normalize_name(link_name);
@@ -992,9 +1006,10 @@ impl Feature {
         len != attrs.len()
     }
 
-    fn remove_duplicate_items(ast: &mut syn::File, mod_rs: &Path) -> Result<()> {
+    fn collect_item_names_from_mod(mod_rs: &Path) -> Result<HashSet<String>> {
         let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let mod_ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
+
         struct Visitor(HashSet<String>);
         impl Visit<'_> for Visitor {
             fn visit_foreign_item_fn(&mut self, f: &syn::ForeignItemFn) {
@@ -1016,9 +1031,14 @@ impl Feature {
                 self.0.insert(i.ident.to_string());
             }
         }
-        let mut ffi_names = Visitor(HashSet::new());
-        visit_file(&mut ffi_names, &mod_ast);
 
+        let mut visitor = Visitor(HashSet::new());
+        visit_file(&mut visitor, &mod_ast);
+        Ok(visitor.0)
+    }
+
+    fn remove_duplicate_items(ast: &mut syn::File, item_names: &HashSet<String>) -> Result<()> {
+        struct Visitor(HashSet<String>);
         impl VisitMut for Visitor {
             fn visit_item_foreign_mod_mut(&mut self, m: &mut syn::ItemForeignMod) {
                 m.items.retain(|item| match item {
@@ -1042,7 +1062,8 @@ impl Feature {
                 }
             }
         }
-        visit_file_mut(&mut ffi_names, ast);
+        let mut visitor = Visitor(item_names.clone());
+        visit_file_mut(&mut visitor, ast);
 
         ast.items.retain(
             |item| !matches!(item, syn::Item::Verbatim(t) if t.to_string().trim().is_empty()),
@@ -1208,7 +1229,8 @@ struct OtherStruct {
         fs::write(&target_rs, target_content).unwrap();
 
         let mut ast = syn::parse_file(&fs::read_to_string(&target_rs).unwrap()).unwrap();
-        Feature::remove_duplicate_items(&mut ast, &mod_rs).unwrap();
+        let item_names = Feature::collect_item_names_from_mod(&mod_rs).unwrap();
+        Feature::remove_duplicate_items(&mut ast, &item_names).unwrap();
 
         let result = prettyplease::unparse(&ast);
         assert!(!result.contains("struct MyStruct"));
@@ -1239,7 +1261,8 @@ type OtherType = f64;
         fs::write(&target_rs, target_content).unwrap();
 
         let mut ast = syn::parse_file(&fs::read_to_string(&target_rs).unwrap()).unwrap();
-        Feature::remove_duplicate_items(&mut ast, &mod_rs).unwrap();
+        let item_names = Feature::collect_item_names_from_mod(&mod_rs).unwrap();
+        Feature::remove_duplicate_items(&mut ast, &item_names).unwrap();
 
         let result = prettyplease::unparse(&ast);
         assert!(!result.contains("type MyType"));
@@ -1296,7 +1319,8 @@ struct KeepStruct {
         fs::write(&target_rs, target_content).unwrap();
 
         let mut ast = syn::parse_file(&fs::read_to_string(&target_rs).unwrap()).unwrap();
-        Feature::remove_duplicate_items(&mut ast, &mod_rs).unwrap();
+        let item_names = Feature::collect_item_names_from_mod(&mod_rs).unwrap();
+        Feature::remove_duplicate_items(&mut ast, &item_names).unwrap();
 
         let result = prettyplease::unparse(&ast);
         assert!(!result.contains("struct MyStruct"));
