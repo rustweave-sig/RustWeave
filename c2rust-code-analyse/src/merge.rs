@@ -90,12 +90,14 @@ impl Visit<'_> for PubDepVisitor<'_> {
 struct CollectedItems {
     named_items: HashMap<String, Vec<syn::Item>>,
     ffi_items: HashMap<String, Vec<syn::ForeignItem>>,
+    impl_items: HashMap<String, Vec<syn::ItemImpl>>,
     foreign_mod_template: Option<syn::ItemForeignMod>,
 }
 
 struct Duplicates {
     named_to_extract: Vec<syn::Item>,
     named_remove_set: HashSet<String>,
+    impl_to_extract: Vec<syn::ItemImpl>,
     ffi_to_extract: Vec<syn::ForeignItem>,
     ffi_remove_set: HashSet<String>,
 }
@@ -566,7 +568,11 @@ impl Feature {
         }
 
         let collected = Self::collect_items_from_files(&mod_files)?;
-        let duplicates = Self::find_duplicates(&collected.named_items, &collected.ffi_items);
+        let duplicates = Self::find_duplicates(
+            &collected.named_items,
+            &collected.impl_items,
+            &collected.ffi_items,
+        );
 
         Self::generate_lib_rs(
             &src_2,
@@ -580,8 +586,9 @@ impl Feature {
         }
 
         println!(
-            "Deduplicated {} types and {} FFI declarations to lib.rs",
+            "Deduplicated {} types, {} impl blocks, and {} FFI declarations to lib.rs",
             duplicates.named_remove_set.len(),
+            duplicates.impl_to_extract.len(),
             duplicates.ffi_remove_set.len()
         );
         Ok(())
@@ -609,6 +616,7 @@ impl Feature {
     fn collect_items_from_files(mod_files: &[PathBuf]) -> Result<CollectedItems> {
         let mut named_items: HashMap<String, Vec<syn::Item>> = HashMap::new();
         let mut ffi_items: HashMap<String, Vec<syn::ForeignItem>> = HashMap::new();
+        let mut impl_items: HashMap<String, Vec<syn::ItemImpl>> = HashMap::new();
         let mut foreign_mod_template: Option<syn::ItemForeignMod> = None;
 
         for mod_file in mod_files {
@@ -647,6 +655,11 @@ impl Feature {
                             .or_default()
                             .push(syn::Item::Type(t));
                     }
+                    syn::Item::Impl(impl_item) => {
+                        if let Some(type_name) = Self::impl_self_type_name(&impl_item) {
+                            impl_items.entry(type_name).or_default().push(impl_item);
+                        }
+                    }
                     syn::Item::ForeignMod(fm) => {
                         if foreign_mod_template.is_none() {
                             let mut template = fm.clone();
@@ -666,6 +679,7 @@ impl Feature {
         Ok(CollectedItems {
             named_items,
             ffi_items,
+            impl_items,
             foreign_mod_template,
         })
     }
@@ -686,14 +700,17 @@ impl Feature {
 
     fn find_duplicates(
         named_items: &HashMap<String, Vec<syn::Item>>,
+        impl_items: &HashMap<String, Vec<syn::ItemImpl>>,
         ffi_items: &HashMap<String, Vec<syn::ForeignItem>>,
     ) -> Duplicates {
         let mut named_to_extract: Vec<syn::Item> = Vec::new();
         let mut named_remove_set: HashSet<String> = HashSet::new();
+        let mut impl_to_extract: Vec<syn::ItemImpl> = Vec::new();
         let mut ffi_to_extract: Vec<syn::ForeignItem> = Vec::new();
         let mut ffi_remove_set: HashSet<String> = HashSet::new();
 
-        for (name, items) in named_items {
+        // 类型去重（只比较类型本身，不比较 impl 块）
+        for (type_name, items) in named_items {
             if items.len() > 0 {
                 let first_tokens = Self::item_body(&items[0]);
                 if items
@@ -701,7 +718,19 @@ impl Feature {
                     .all(|item| Self::item_body(item) == first_tokens)
                 {
                     named_to_extract.push(items[0].clone());
-                    named_remove_set.insert(name.clone());
+                    named_remove_set.insert(type_name.clone());
+
+                    // 收集该类型的所有 impl 块（无论内容是否相同）
+                    if let Some(impls) = impl_items.get(type_name) {
+                        // 去重：每个独特的 impl 只保留一份
+                        let mut seen_impls: HashSet<String> = HashSet::new();
+                        for impl_item in impls {
+                            let impl_tokens = impl_item.to_token_stream().to_string();
+                            if seen_impls.insert(impl_tokens) {
+                                impl_to_extract.push(impl_item.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -716,6 +745,7 @@ impl Feature {
         Duplicates {
             named_to_extract,
             named_remove_set,
+            impl_to_extract,
             ffi_to_extract,
             ffi_remove_set,
         }
@@ -728,7 +758,20 @@ impl Feature {
         foreign_mod_template: &Option<syn::ItemForeignMod>,
     ) -> Result<()> {
         let mut lib_items: Vec<syn::Item> = Vec::new();
+
         lib_items.extend(duplicates.named_to_extract.clone());
+
+        for type_item in &duplicates.named_to_extract {
+            if let Some(type_name) = Self::item_name(type_item) {
+                for impl_item in &duplicates.impl_to_extract {
+                    if let Some(impl_type_name) = Self::impl_self_type_name(impl_item) {
+                        if impl_type_name == type_name {
+                            lib_items.push(syn::Item::Impl(impl_item.clone()));
+                        }
+                    }
+                }
+            }
+        }
 
         if !duplicates.ffi_to_extract.is_empty() {
             if let Some(mut fm) = foreign_mod_template.clone() {
@@ -776,6 +819,13 @@ impl Feature {
                 syn::Item::Union(u) => !duplicates.named_remove_set.contains(&u.ident.to_string()),
                 syn::Item::Const(c) => !duplicates.named_remove_set.contains(&c.ident.to_string()),
                 syn::Item::Type(t) => !duplicates.named_remove_set.contains(&t.ident.to_string()),
+                syn::Item::Impl(impl_item) => {
+                    if let Some(type_name) = Self::impl_self_type_name(impl_item) {
+                        !duplicates.named_remove_set.contains(&type_name)
+                    } else {
+                        true
+                    }
+                }
                 syn::Item::ForeignMod(fm) => {
                     fm.items
                         .retain(|ffi| !duplicates.ffi_remove_set.contains(&Self::ffi_name(ffi)));
@@ -1204,6 +1254,7 @@ mod tests {
         let duplicates = Duplicates {
             named_to_extract: vec![],
             named_remove_set: std::collections::HashSet::new(),
+            impl_to_extract: vec![],
             ffi_to_extract: vec![],
             ffi_remove_set: std::collections::HashSet::new(),
         };
@@ -1234,6 +1285,7 @@ mod tests {
         let duplicates = Duplicates {
             named_to_extract: vec![],
             named_remove_set: std::collections::HashSet::new(),
+            impl_to_extract: vec![],
             ffi_to_extract: vec![],
             ffi_remove_set: std::collections::HashSet::new(),
         };
@@ -1391,5 +1443,200 @@ impl OtherStruct {
         assert!(deps.is_pub("PubType"));
         assert!(!deps.is_pub("PrivateType"));
         assert!(!deps.is_pub("UnknownType"));
+    }
+
+    #[test]
+    fn test_deduplicate_with_same_impl_blocks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_a = src_2.join("mod_a.rs");
+        let mod_b = src_2.join("mod_b.rs");
+
+        fs::write(
+            &mod_a,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
+        )
+        .unwrap();
+        fs::write(
+            &mod_b,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
+        )
+        .unwrap();
+
+        let mod_files = vec![mod_a.clone(), mod_b.clone()];
+        let collected = Feature::collect_items_from_files(&mod_files).unwrap();
+        let duplicates = Feature::find_duplicates(
+            &collected.named_items,
+            &collected.impl_items,
+            &collected.ffi_items,
+        );
+
+        assert_eq!(duplicates.named_remove_set.len(), 1);
+        assert!(duplicates.named_remove_set.contains("MyStruct"));
+        assert_eq!(duplicates.impl_to_extract.len(), 1);
+        assert_eq!(
+            Feature::impl_self_type_name(&duplicates.impl_to_extract[0]),
+            Some("MyStruct".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_with_different_impl_blocks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_a = src_2.join("mod_a.rs");
+        let mod_b = src_2.join("mod_b.rs");
+
+        fs::write(
+            &mod_a,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
+        )
+        .unwrap();
+        fs::write(
+            &mod_b,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn bar(&self) -> i32 { self.x + 1 } }",
+        )
+        .unwrap();
+
+        let mod_files = vec![mod_a.clone(), mod_b.clone()];
+        let collected = Feature::collect_items_from_files(&mod_files).unwrap();
+        let duplicates = Feature::find_duplicates(
+            &collected.named_items,
+            &collected.impl_items,
+            &collected.ffi_items,
+        );
+
+        assert_eq!(duplicates.named_remove_set.len(), 1);
+        assert!(duplicates.named_remove_set.contains("MyStruct"));
+        assert_eq!(duplicates.impl_to_extract.len(), 2);
+    }
+
+    #[test]
+    fn test_deduplicate_with_one_impl_block() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_a = src_2.join("mod_a.rs");
+        let mod_b = src_2.join("mod_b.rs");
+
+        fs::write(&mod_a, "struct MyStruct { x: i32 }").unwrap();
+        fs::write(
+            &mod_b,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
+        )
+        .unwrap();
+
+        let mod_files = vec![mod_a.clone(), mod_b.clone()];
+        let collected = Feature::collect_items_from_files(&mod_files).unwrap();
+        let duplicates = Feature::find_duplicates(
+            &collected.named_items,
+            &collected.impl_items,
+            &collected.ffi_items,
+        );
+
+        assert_eq!(duplicates.named_remove_set.len(), 1);
+        assert!(duplicates.named_remove_set.contains("MyStruct"));
+        assert_eq!(duplicates.impl_to_extract.len(), 1);
+        assert_eq!(
+            Feature::impl_self_type_name(&duplicates.impl_to_extract[0]),
+            Some("MyStruct".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deduplicate_with_multiple_impl_blocks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_a = src_2.join("mod_a.rs");
+        let mod_b = src_2.join("mod_b.rs");
+
+        fs::write(
+            &mod_a,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
+        )
+        .unwrap();
+        fs::write(&mod_b, "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }\nimpl MyStruct { fn bar(&self) -> i32 { self.x + 1 } }").unwrap();
+
+        let mod_files = vec![mod_a.clone(), mod_b.clone()];
+        let collected = Feature::collect_items_from_files(&mod_files).unwrap();
+        let duplicates = Feature::find_duplicates(
+            &collected.named_items,
+            &collected.impl_items,
+            &collected.ffi_items,
+        );
+
+        assert_eq!(duplicates.named_remove_set.len(), 1);
+        assert!(duplicates.named_remove_set.contains("MyStruct"));
+        assert_eq!(duplicates.impl_to_extract.len(), 2);
+    }
+
+    #[test]
+    fn test_deduplicate_no_duplicate_types() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_a = src_2.join("mod_a.rs");
+        let mod_b = src_2.join("mod_b.rs");
+
+        fs::write(
+            &mod_a,
+            "struct MyStruct { x: i32 }\nimpl MyStruct { fn foo(&self) -> i32 { self.x } }",
+        )
+        .unwrap();
+        fs::write(
+            &mod_b,
+            "struct OtherStruct { y: i32 }\nimpl OtherStruct { fn bar(&self) -> i32 { self.y } }",
+        )
+        .unwrap();
+
+        let mod_files = vec![mod_a.clone(), mod_b.clone()];
+        let collected = Feature::collect_items_from_files(&mod_files).unwrap();
+        let duplicates = Feature::find_duplicates(
+            &collected.named_items,
+            &collected.impl_items,
+            &collected.ffi_items,
+        );
+
+        assert_eq!(duplicates.named_remove_set.len(), 2);
+        assert!(duplicates.named_remove_set.contains("MyStruct"));
+        assert!(duplicates.named_remove_set.contains("OtherStruct"));
+        assert_eq!(duplicates.impl_to_extract.len(), 2);
+    }
+
+    #[test]
+    fn test_deduplicate_trait_impl() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_a = src_2.join("mod_a.rs");
+        let mod_b = src_2.join("mod_b.rs");
+
+        fs::write(&mod_a, "struct MyStruct { x: i32 }\nimpl Clone for MyStruct { fn clone(&self) -> Self { *self } }").unwrap();
+        fs::write(&mod_b, "struct MyStruct { x: i32 }\nimpl Clone for MyStruct { fn clone(&self) -> Self { *self } }").unwrap();
+
+        let mod_files = vec![mod_a.clone(), mod_b.clone()];
+        let collected = Feature::collect_items_from_files(&mod_files).unwrap();
+        let duplicates = Feature::find_duplicates(
+            &collected.named_items,
+            &collected.impl_items,
+            &collected.ffi_items,
+        );
+
+        assert_eq!(duplicates.named_remove_set.len(), 1);
+        assert!(duplicates.named_remove_set.contains("MyStruct"));
+        assert_eq!(duplicates.impl_to_extract.len(), 1);
+        assert_eq!(
+            Feature::impl_self_type_name(&duplicates.impl_to_extract[0]),
+            Some("MyStruct".to_string())
+        );
     }
 }
