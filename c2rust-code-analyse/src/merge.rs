@@ -187,7 +187,7 @@ impl Feature {
         for type_item in &type_items {
             let mut type_item = type_item.clone();
             if let Some(type_name) = Self::item_name(&type_item) {
-                //Self::set_item_visibility(&mut type_item, deps.is_pub(&type_name));
+                Self::set_item_visibility(&mut type_item, deps.is_pub(&type_name));
                 if let Some(impl_blocks) = impl_map.get(&type_name) {
                     for impl_block in impl_blocks {
                         merged_items.push(syn::Item::Impl(impl_block.clone()));
@@ -670,6 +670,20 @@ impl Feature {
         })
     }
 
+    fn item_body(item: &syn::Item) -> String {
+        let mut item = item.clone();
+        let (attrs, vis) = match item {
+            syn::Item::Struct(ref mut i) => (&mut i.attrs, &mut i.vis),
+            syn::Item::Union(ref mut i) => (&mut i.attrs, &mut i.vis),
+            syn::Item::Type(ref mut i) => (&mut i.attrs, &mut i.vis),
+            syn::Item::Const(ref mut i) => (&mut i.attrs, &mut i.vis),
+            _ => return item.to_token_stream().to_string(),
+        };
+        attrs.clear();
+        *vis = syn::Visibility::Inherited;
+        item.to_token_stream().to_string()
+    }
+
     fn find_duplicates(
         named_items: &HashMap<String, Vec<syn::Item>>,
         ffi_items: &HashMap<String, Vec<syn::ForeignItem>>,
@@ -680,11 +694,11 @@ impl Feature {
         let mut ffi_remove_set: HashSet<String> = HashSet::new();
 
         for (name, items) in named_items {
-            if items.len() > 1 {
-                let first_tokens = items[0].to_token_stream().to_string();
+            if items.len() > 0 {
+                let first_tokens = Self::item_body(&items[0]);
                 if items
                     .iter()
-                    .all(|item| item.to_token_stream().to_string() == first_tokens)
+                    .all(|item| Self::item_body(item) == first_tokens)
                 {
                     named_to_extract.push(items[0].clone());
                     named_remove_set.insert(name.clone());
@@ -693,7 +707,7 @@ impl Feature {
         }
 
         for (name, items) in ffi_items {
-            if items.len() > 1 {
+            if items.len() > 0 {
                 ffi_to_extract.push(items[0].clone());
                 ffi_remove_set.insert(name.clone());
             }
