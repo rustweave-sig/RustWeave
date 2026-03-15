@@ -746,7 +746,7 @@ impl Feature {
             // 大模型生成的代码语法错误，需要大模型修正，直接返回.
             return Ok(true);
         };
-        Self::remove_foreign_mod(&mut ast, &file.with_file_name("mod.rs"))?;
+        Self::remove_duplicate_items(&mut ast, &file.with_file_name("mod.rs"))?;
 
         let is_fun = prefix.starts_with("fun_");
         let name = Self::normalize_name(link_name);
@@ -992,7 +992,7 @@ impl Feature {
         len != attrs.len()
     }
 
-    fn remove_foreign_mod(ast: &mut syn::File, mod_rs: &Path) -> Result<()> {
+    fn remove_duplicate_items(ast: &mut syn::File, mod_rs: &Path) -> Result<()> {
         let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let mod_ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
         struct Visitor(HashSet<String>);
@@ -1002,6 +1002,21 @@ impl Feature {
             }
             fn visit_foreign_item_static(&mut self, v: &syn::ForeignItemStatic) {
                 self.0.insert(v.ident.to_string());
+            }
+            fn visit_item_struct(&mut self, i: &syn::ItemStruct) {
+                self.0.insert(i.ident.to_string());
+            }
+            fn visit_item_union(&mut self, i: &syn::ItemUnion) {
+                self.0.insert(i.ident.to_string());
+            }
+            fn visit_item_type(&mut self, i: &syn::ItemType) {
+                self.0.insert(i.ident.to_string());
+            }
+            fn visit_item_const(&mut self, i: &syn::ItemConst) {
+                self.0.insert(i.ident.to_string());
+            }
+            fn visit_item_static(&mut self, i: &syn::ItemStatic) {
+                self.0.insert(i.ident.to_string());
             }
         }
         let mut ffi_names = Visitor(HashSet::new());
@@ -1015,8 +1030,27 @@ impl Feature {
                     _ => true,
                 });
             }
+
+            fn visit_item_mut(&mut self, i: &mut syn::Item) {
+                syn::visit_mut::visit_item_mut(self, i);
+                let should_remove = match i {
+                    syn::Item::Struct(s) => self.0.contains(&s.ident.to_string()),
+                    syn::Item::Union(u) => self.0.contains(&u.ident.to_string()),
+                    syn::Item::Type(t) => self.0.contains(&t.ident.to_string()),
+                    syn::Item::Const(c) => self.0.contains(&c.ident.to_string()),
+                    syn::Item::Static(s) => self.0.contains(&s.ident.to_string()),
+                    _ => false,
+                };
+                if should_remove {
+                    *i = syn::Item::Verbatim(quote::quote!());
+                }
+            }
         }
         visit_file_mut(&mut ffi_names, ast);
+
+        ast.items.retain(
+            |item| !matches!(item, syn::Item::Verbatim(t) if t.to_string().trim().is_empty()),
+        );
 
         Ok(())
     }
@@ -1146,5 +1180,136 @@ mod tests {
         let content_c = fs::read_to_string(&fun_foo_c_rs).unwrap();
         assert_eq!(content_b.trim(), "pub fn foo() -> i32 { 42 }");
         assert_eq!(content_c.trim(), "pub fn foo() -> i32 { 42 }");
+    }
+
+    #[test]
+    fn test_remove_duplicate_items_struct() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let mod_dir = root.join("rust/src/mod_a");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        let target_rs = mod_dir.join("target.rs");
+
+        let mod_content = r#"
+struct MyStruct {
+    x: i32,
+}
+"#;
+        let target_content = r#"
+struct MyStruct {
+    x: i32,
+}
+
+struct OtherStruct {
+    y: f64,
+}
+"#;
+
+        fs::write(&mod_rs, mod_content).unwrap();
+        fs::write(&target_rs, target_content).unwrap();
+
+        let mut ast = syn::parse_file(&fs::read_to_string(&target_rs).unwrap()).unwrap();
+        Feature::remove_duplicate_items(&mut ast, &mod_rs).unwrap();
+
+        let result = prettyplease::unparse(&ast);
+        assert!(!result.contains("struct MyStruct"));
+        assert!(result.contains("struct OtherStruct"));
+    }
+
+    #[test]
+    fn test_remove_duplicate_items_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let mod_dir = root.join("rust/src/mod_a");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        let target_rs = mod_dir.join("target.rs");
+
+        let mod_content = r#"
+type MyType = i32;
+"#;
+        let target_content = r#"
+type MyType = i32;
+
+type OtherType = f64;
+"#;
+
+        fs::write(&mod_rs, mod_content).unwrap();
+        fs::write(&target_rs, target_content).unwrap();
+
+        let mut ast = syn::parse_file(&fs::read_to_string(&target_rs).unwrap()).unwrap();
+        Feature::remove_duplicate_items(&mut ast, &mod_rs).unwrap();
+
+        let result = prettyplease::unparse(&ast);
+        assert!(!result.contains("type MyType"));
+        assert!(result.contains("type OtherType"));
+    }
+
+    #[test]
+    fn test_remove_duplicate_items_mixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let mod_dir = root.join("rust/src/mod_a");
+        fs::create_dir_all(&mod_dir).unwrap();
+
+        let mod_rs = mod_dir.join("mod.rs");
+        let target_rs = mod_dir.join("target.rs");
+
+        let mod_content = r#"
+struct MyStruct {
+    x: i32,
+}
+
+union MyUnion {
+    x: i32,
+    y: f64,
+}
+
+type MyType = i32;
+
+const MY_CONST: i32 = 42;
+
+static MY_STATIC: i32 = 100;
+"#;
+        let target_content = r#"
+struct MyStruct {
+    x: i32,
+}
+
+union MyUnion {
+    x: i32,
+    y: f64,
+}
+
+type MyType = i32;
+
+const MY_CONST: i32 = 42;
+
+static MY_STATIC: i32 = 100;
+
+struct KeepStruct {
+    z: bool,
+}
+"#;
+
+        fs::write(&mod_rs, mod_content).unwrap();
+        fs::write(&target_rs, target_content).unwrap();
+
+        let mut ast = syn::parse_file(&fs::read_to_string(&target_rs).unwrap()).unwrap();
+        Feature::remove_duplicate_items(&mut ast, &mod_rs).unwrap();
+
+        let result = prettyplease::unparse(&ast);
+        assert!(!result.contains("struct MyStruct"));
+        assert!(!result.contains("union MyUnion"));
+        assert!(!result.contains("type MyType"));
+        assert!(!result.contains("const MY_CONST"));
+        assert!(!result.contains("static MY_STATIC"));
+        assert!(result.contains("struct KeepStruct"));
     }
 }

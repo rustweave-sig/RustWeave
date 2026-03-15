@@ -1,7 +1,7 @@
-# 扩展 remove_foreign_mod 功能以支持 ItemStruct/Union/Type/Const/Static 去重
+# 扩展 remove_duplicate_items 功能以支持 ItemStruct/Union/Type/Const/Static 去重
 
 ## 目标概述
-扩展 `Feature::remove_foreign_mod` 功能，使其不仅删除重复的 FFI 定义（ForeignItem::Fn, ForeignItem::Static），还能删除重复定义的 ItemStruct, ItemUnion, ItemType, ItemConst, ItemStatic。
+扩展 `Feature::remove_duplicate_items` 功能，使其不仅删除重复的 FFI 定义（ForeignItem::Fn, ForeignItem::Static），还能删除重复定义的 ItemStruct, ItemUnion, ItemType, ItemConst, ItemStatic。
 
 ## 涉及的文件和模块
 - **主要文件**：`/home/dududingding/h00339793/rust/C2RustXW-CLI/c2rust-code-analyse/src/feature.rs`
@@ -10,14 +10,14 @@
 ## 技术选型与修改思路
 
 ### 核心逻辑
-参考现有的 `remove_foreign_mod` 函数的双 Visitor 模式：
+参考现有的 `remove_duplicate_items` 函数的双 Visitor 模式：
 1. **Read-only Visitor（Visit trait）**：从 mod.rs 文件收集需要保留的 item 名称
 2. **Mutable Visitor（VisitMut trait）**：遍历目标文件，删除重复项
 
 ### 修改方案
 
 #### 1. 扩展 Visit trait 的 Visitor 结构体
-在 `remove_foreign_mod` 函数中的 `Visitor` 结构体，新增以下方法：
+在 `remove_duplicate_items` 函数中的 `Visitor` 结构体，新增以下方法：
 
 ```rust
 impl Visit<'_> for Visitor {
@@ -116,7 +116,7 @@ ast.items.retain(|item| {
 
 ## 实施计划
 
-1. 修改 `src/feature.rs` 中的 `remove_foreign_mod` 函数
+1. 修改 `src/feature.rs` 中的 `remove_duplicate_items` 函数
 2. 扩展 Visit trait 添加 4 个新方法
 3. 扩展 VisitMut trait 添加 `visit_item_mut` 方法
 4. 在 `visit_file_mut` 后添加清理逻辑
