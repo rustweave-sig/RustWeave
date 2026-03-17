@@ -469,8 +469,12 @@ impl Feature {
         }
         // 如果有多个文件，这些文件当前机制下是相互独立的，同一个类型，同一个FFI函数会重复声明
         // 这里抑制这些重复FFI声明可能导致的告警
-        // TODO: 后续应该比较Rust的类型定义和FFI声明，如果相同，提取到lib.rs中.
         impl VisitMut for Visitor<'_> {
+            // bindgen可能将C的指针转换为数组引用，引用声明周期需要确定为`static
+            fn visit_type_reference_mut(&mut self, refer: &mut syn::TypeReference) {
+                refer.lifetime = Some(syn::parse2(quote!('static)).unwrap());
+            }
+
             fn visit_item_mut(&mut self, item: &mut syn::Item) {
                 match item {
                     syn::Item::ForeignMod(m) => visit_item_foreign_mod_mut(self, m),
@@ -486,6 +490,7 @@ impl Feature {
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.ident = syn::Ident::new(new_name, item.ident.span());
                 }
+                self.visit_type_mut(&mut item.ty);
             }
 
             fn visit_foreign_item_static_mut(&mut self, item: &mut syn::ForeignItemStatic) {
@@ -495,6 +500,7 @@ impl Feature {
                     let new_name = name.splitn(5, '_').last().unwrap();
                     item.ident = syn::Ident::new(new_name, item.ident.span());
                 }
+                self.visit_type_mut(&mut item.ty);
             }
 
             fn visit_foreign_item_fn_mut(&mut self, item: &mut syn::ForeignItemFn) {
