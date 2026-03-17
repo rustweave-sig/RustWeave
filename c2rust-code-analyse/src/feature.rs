@@ -227,20 +227,26 @@ impl Feature {
                 }
             }
 
+            let mod_rs_needs_sync = Self::mod_rs_needs_sync(&mod_dir, &translated)?;
+
             // 应用更新到file的节点
-            if is_updated || Self::update_force() {
+            if is_updated || mod_rs_needs_sync {
                 changed = true;
                 Self::update_mod_rs(&mod_dir, translated)?;
-                // 保存file的JSON状态
-                file.save_json()?;
-                let code = file.export_c_code(&c_root)?;
-                let c_file = file.path().with_extension("c");
-                fs::write(&c_file, code.as_bytes())
-                    .log_err(&format!("update {}", c_file.display()))?;
-                println!(
-                    "Saved JSON state and exported C code for file: {}",
-                    mod_name
-                );
+                if is_updated {
+                    // 保存file的JSON状态
+                    file.save_json()?;
+                    let code = file.export_c_code(&c_root)?;
+                    let c_file = file.path().with_extension("c");
+                    fs::write(&c_file, code.as_bytes())
+                        .log_err(&format!("update {}", c_file.display()))?;
+                    println!(
+                        "Saved JSON state and exported C code for file: {}",
+                        mod_name
+                    );
+                } else {
+                    println!("Synchronized module registry for file: {}", mod_name);
+                }
             }
         }
 
@@ -556,6 +562,56 @@ impl Feature {
         let formatted = prettyplease::unparse(&ast);
         fs::write(&mod_rs, formatted.as_bytes()).log_err(&format!("write {}", mod_rs.display()))?;
         Ok(())
+    }
+
+    fn mod_rs_needs_sync(mod_dir: &Path, translated: &HashMap<String, String>) -> Result<bool> {
+        let mod_rs = mod_dir.join("mod.rs");
+        if !mod_rs.exists() {
+            return Ok(true);
+        }
+
+        let content = fs::read_to_string(&mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
+        let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
+
+        let expected: HashSet<String> = translated.values().cloned().collect();
+        let mut actual_mods = HashSet::new();
+        let mut actual_pub_uses = HashSet::new();
+
+        for item in ast.items {
+            match item {
+                syn::Item::Mod(item)
+                    if item.content.is_none()
+                        && (item.ident == "fun"
+                            || item.ident == "var"
+                            || item.ident.to_string().starts_with("fun_")
+                            || item.ident.to_string().starts_with("var_")) =>
+                {
+                    actual_mods.insert(item.ident.to_string());
+                }
+                syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                    if let Some(name) = Self::extract_pub_use_module_name(&item.tree) {
+                        actual_pub_uses.insert(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(actual_mods != expected || actual_pub_uses != expected)
+    }
+
+    fn extract_pub_use_module_name(tree: &syn::UseTree) -> Option<String> {
+        let syn::UseTree::Path(path) = tree else {
+            return None;
+        };
+        if !matches!(&*path.tree, syn::UseTree::Glob(_)) {
+            return None;
+        }
+        let ident = path.ident.to_string();
+        if ident.starts_with("fun_") || ident.starts_with("var_") {
+            return Some(ident);
+        }
+        None
     }
 
     fn normalize_c_code(node: &Node, c_root: &Path) -> Result<String> {
