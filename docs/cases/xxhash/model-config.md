@@ -1,0 +1,21 @@
+# 模型配置
+
+- 模型名称：`qwen3-max`
+- 服务端 / `base_url`：兼容 DashScope 的接口地址
+- 调用方式：通过 Python `openai` 客户端使用 OpenAI-compatible chat completions API
+- 相关配置项：
+  - 必须存在于项目本地 `.c2rust/config.toml` 的 `[model]` 下
+  - 本案例中观测到的必填字段：
+    - `model`
+    - `base_url`
+    - `api_key`
+  - 本案例中出现的可选字段：
+    - `temperature`
+    - `top_p`
+    - `seed`
+    - `max_retries`
+    - `timeout`
+- 说明：
+  - 即使全局 `C2RUST_HOME` 下已有配置，也不会自动同步到项目本地 `.c2rust/config.toml`
+  - 因此当前实际可信的配置源是项目本地 `[model]`
+  - 文档和日志中只保留字段名，不保留任何密钥真实值
