@@ -1,6 +1,7 @@
 use crate::{get_root, File, Node, Result, ToError};
 use hierr::Error;
 use quote::{quote, ToTokens};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::env::{remove_var, set_var, var};
 use std::ffi::OsStr;
@@ -743,6 +744,15 @@ impl Feature {
         Ok(())
     }
 
+    fn is_weak_linkage(file: &Path) -> bool {
+        let Ok(content) = fs::read_to_string(file) else {
+            return false;
+        };
+        let content = &content[..100.min(content.len())];
+        let regex = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*weak\s*\)\s*\)").unwrap();
+        regex.is_match(content)
+    }
+
     // 大模型返回的文件可能不符合要求, 或者被意外破坏，需要修正.
     fn validate_file(
         file: &Path,
@@ -770,10 +780,11 @@ impl Feature {
 
         let is_fun = prefix.starts_with("fun_");
         let name = Self::normalize_name(link_name);
+        let is_weak_linkage = Self::is_weak_linkage(&file.with_extension("c"));
         let is_changed = if is_fun {
-            Self::validate_fun(&mut ast, name, link_name)
+            Self::validate_fun(&mut ast, name, link_name, is_weak_linkage)
         } else {
-            Self::validate_var(&mut ast, name, link_name)
+            Self::validate_var(&mut ast, name, link_name, is_weak_linkage)
         };
 
         let Ok(is_changed) = is_changed else {
@@ -903,7 +914,12 @@ impl Feature {
         visitor.0
     }
 
-    fn validate_fun(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
+    fn validate_fun(
+        ast: &mut syn::File,
+        name: &str,
+        link_name: &str,
+        is_weak_linkage: bool,
+    ) -> Result<bool> {
         let mut main_item = None;
         ast.items.iter_mut().any(|item| match item {
             syn::Item::Fn(item) if item.sig.ident.to_string() == name => {
@@ -942,10 +958,17 @@ impl Feature {
             is_changed = true;
             main_item.vis = syn::parse_str("pub").unwrap();
         }
+        let updated = Self::update_weak_linkage(&mut main_item.attrs, is_weak_linkage);
+        is_changed |= updated;
         Ok(is_changed)
     }
 
-    fn validate_var(ast: &mut syn::File, name: &str, link_name: &str) -> Result<bool> {
+    fn validate_var(
+        ast: &mut syn::File,
+        name: &str,
+        link_name: &str,
+        is_weak_linkage: bool,
+    ) -> Result<bool> {
         let mut main_item = None;
         ast.items.iter_mut().any(|item| match item {
             syn::Item::Static(item) if item.ident.to_string() == name => {
@@ -976,30 +999,56 @@ impl Feature {
             is_changed = true;
             main_item.vis = syn::parse_str("pub").unwrap();
         }
+        let updated = Self::update_weak_linkage(&mut main_item.attrs, is_weak_linkage);
+        is_changed |= updated;
         Ok(is_changed)
     }
 
+    // 返回是否修改
+    fn update_weak_linkage(attrs: &mut Vec<syn::Attribute>, is_weak_linkage: bool) -> bool {
+        let re = Regex::new(r#"linkage\s*=\s*"weak""#).unwrap();
+
+        let mut weak = false;
+        let mut is_changed = false;
+        attrs.retain(|attr| {
+            let s = attr.to_token_stream().to_string();
+            if re.is_match(&s) {
+                weak = true;
+                is_changed = !is_weak_linkage;
+                return is_weak_linkage;
+            }
+            true
+        });
+
+        if is_weak_linkage && !weak {
+            is_changed = true;
+            attrs.extend(
+                syn::Attribute::parse_outer
+                    .parse_str(&format!(r#"#[linkage = "weak"]"#))
+                    .unwrap(),
+            );
+        }
+
+        is_changed
+    }
+
     fn has_export_name_attr(attrs: &mut Vec<syn::Attribute>, expected_name: &str) -> bool {
+        let re = Regex::new(r#"export_name\s*=\s*"([^"]*)""#).unwrap();
+
         let mut found = false;
         attrs.retain(|attr| {
             let s = attr.to_token_stream().to_string();
-            if s.contains("export_name") {
-                if let Some(start) = s.find("export_name") {
-                    let rest = &s[start..];
-                    if let Some(quote_start) = rest.find('"') {
-                        let rest = &rest[quote_start + 1..];
-                        if let Some(quote_end) = rest.find('"') {
-                            let value = &rest[..quote_end];
-                            if value == expected_name {
-                                found = true;
-                                return true;
-                            }
-                        }
+            match re.captures(&s) {
+                Some(caps) => {
+                    if &caps[1] == expected_name {
+                        found = true;
+                        true
+                    } else {
+                        false
                     }
                 }
-                return false;
+                None => true,
             }
-            true
         });
         found
     }
@@ -1345,5 +1394,68 @@ struct KeepStruct {
         assert!(!result.contains("const MY_CONST"));
         assert!(result.contains("static MY_STATIC"));
         assert!(result.contains("struct KeepStruct"));
+    }
+
+    #[test]
+    fn test_has_export_name_attr_standard_format() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name = "foo"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "foo");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_compact_format() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name="bar"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "bar");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_multiple_spaces() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name  =  "baz"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "baz");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_wrong_name() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name = "wrong"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "correct");
+        assert!(!result);
+        assert_eq!(attrs.len(), 0);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_no_export_name() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[inline] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "foo");
+        assert!(!result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_multiple_attrs() {
+        let mut attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote! { #[export_name = "target"] },
+            syn::parse_quote! { #[inline] },
+        ];
+        let result = Feature::has_export_name_attr(&mut attrs, "target");
+        assert!(result);
+        assert_eq!(attrs.len(), 2);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_mixed_export_names() {
+        let mut attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote! { #[export_name = "keep"] },
+            syn::parse_quote! { #[export_name = "delete"] },
+        ];
+        let result = Feature::has_export_name_attr(&mut attrs, "keep");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+        assert!(attrs[0].to_token_stream().to_string().contains("keep"));
     }
 }
