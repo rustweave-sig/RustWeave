@@ -628,43 +628,30 @@ impl Feature {
             let ast =
                 syn::parse_file(&content).log_err(&format!("parse {}", mod_file.display()))?;
 
+            let mut file_type_items: Vec<(String, TypeItem)> = Vec::new();
+            let mut file_impls: Vec<(String, syn::ItemImpl)> = Vec::new();
+
             for item in ast.items {
                 match item {
                     syn::Item::Struct(s) => {
                         let name = s.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(TypeItem::new(syn::Item::Struct(s)));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Struct(s))));
                     }
                     syn::Item::Union(u) => {
                         let name = u.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(TypeItem::new(syn::Item::Union(u)));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Union(u))));
                     }
                     syn::Item::Const(c) => {
                         let name = c.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(TypeItem::new(syn::Item::Const(c)));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Const(c))));
                     }
                     syn::Item::Type(t) => {
                         let name = t.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(TypeItem::new(syn::Item::Type(t)));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Type(t))));
                     }
                     syn::Item::Impl(impl_block) => {
                         if let Some(type_name) = Self::impl_self_type_name(&impl_block) {
-                            if let Some(type_items) = named_items.get_mut(&type_name) {
-                                for type_item in type_items {
-                                    type_item.add_impl(impl_block.clone());
-                                }
-                            }
+                            file_impls.push((type_name, impl_block));
                         }
                     }
                     syn::Item::ForeignMod(fm) => {
@@ -680,6 +667,15 @@ impl Feature {
                     }
                     _ => {}
                 }
+            }
+
+            for (type_name, mut type_item) in file_type_items {
+                for (impl_type_name, impl_block) in &file_impls {
+                    if *impl_type_name == type_name {
+                        type_item.add_impl(impl_block.clone());
+                    }
+                }
+                named_items.entry(type_name).or_default().push(type_item);
             }
         }
 
