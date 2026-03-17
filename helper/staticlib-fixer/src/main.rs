@@ -6,7 +6,7 @@ use object::write::{
 };
 use object::{
     BinaryFormat, Endianness, File, Object as _, ObjectKind, ObjectSection, RelocationTarget,
-    SectionKind, SymbolKind, SymbolScope,
+    SectionKind, SymbolKind,
 };
 use rand::Rng as _;
 use rand::rng;
@@ -111,8 +111,10 @@ fn main() -> Result<()> {
                 new_data
             }
             Err(err) => {
-                println!("   - Skipping member: {identifier} ({err})");
-                continue;
+                // Fall back to original bytes — the obj likely doesn't contain
+                // symbols we need to rename (e.g. std library objects with COMDAT).
+                println!("   - Could not rewrite {identifier} ({err}), keeping original bytes");
+                data
             }
         };
 
@@ -397,17 +399,10 @@ fn patch_object_file(data: &[u8], symbols_to_rename: &[String], suffix: &str) ->
             }
         }
 
-        let sec_sym = Symbol {
-            name: name_vec.clone(),
-            value: 0,
-            size: 0,
-            kind: SymbolKind::Section,
-            scope: SymbolScope::Compilation,
-            weak: false,
-            section: SymbolSection::Section(new_section_id),
-            flags: SymbolFlags::None,
-        };
-        let sec_sym_id = writer.add_symbol(sec_sym);
+        // Use the section symbol that add_section() already created internally.
+        // Manually adding a second section symbol breaks ELF's .symtab sh_info
+        // ordering invariant (all STB_LOCAL symbols must precede STB_GLOBAL ones).
+        let sec_sym_id = writer.section_symbol(new_section_id);
 
         section_map.insert(section.index().0, new_section_id);
         section_sym_map.insert(section.index().0, sec_sym_id);
