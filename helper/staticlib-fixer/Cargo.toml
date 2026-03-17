@@ -16,6 +16,8 @@ ar = "0.9.0"
 clap = { version = "4.5.42", features = ["derive"] }
 object = { version = "0.37.1", features = ["write_core"] }
 rand = "0.9.2"
+# Pin ruzstd to avoid 0.8.2+ which uses unstable `unsigned_is_multiple_of` (requires Rust 1.87+)
+ruzstd = ">=0.8.0, <0.8.2"
 
 [profile.release]
 lto = "fat"
