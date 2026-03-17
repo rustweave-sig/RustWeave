@@ -20,7 +20,9 @@
 - `code_analyse --feature default --init`
 - `cargo install bindgen-cli`
 - 创建 `tools/.local-dev/bin/python -> /usr/bin/python3`
-- `c2rust-config config --model --set ...`
+- `c2rust-xw env set model ...`
+- `c2rust-xw env set base_url ...`
+- `c2rust-xw env set api_key ...`
 
 ## CLI 翻译尝试
 

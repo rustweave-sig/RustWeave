@@ -62,7 +62,7 @@
    - 提供 `python -> python3` 的本地兼容入口
 
 2. 模型配置补齐
-   - 在项目本地 `.c2rust/config.toml` 中补齐 `[model]`
+   - 通过 `c2rust-xw env` 在用户级环境层补齐模型配置
 
 3. 构建捕获命令调整
    - 为避免增量构建捕获到 `0` 个编译单元，实际使用：
@@ -125,7 +125,7 @@
 - 调用方式：
   - Python `openai` 客户端
   - OpenAI-compatible chat completions API
-- 本次验证依赖的项目本地配置项：
+- 本次验证依赖的用户级环境配置项：
   - `model`
   - `base_url`
   - `api_key`
@@ -138,8 +138,8 @@
 
 当前明确结论：
 
-- 全局 `C2RUST_HOME` 配置不会自动传播到项目本地 `.c2rust/config.toml`
-- 因此当前实际可信配置源是项目本地 `[model]`
+- 项目 `.c2rust/config.toml` 应只保留项目级配置
+- 模型配置应统一来自 `c2rust-xw env` 或 `C2RUST_*` 环境变量
 
 补充材料：
 - [model-config.md](./model-config.md)

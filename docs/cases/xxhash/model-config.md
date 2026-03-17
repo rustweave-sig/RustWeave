@@ -3,19 +3,28 @@
 - 模型名称：`qwen3-max`
 - 服务端 / `base_url`：兼容 DashScope 的接口地址
 - 调用方式：通过 Python `openai` 客户端使用 OpenAI-compatible chat completions API
-- 相关配置项：
-  - 必须存在于项目本地 `.c2rust/config.toml` 的 `[model]` 下
-  - 本案例中观测到的必填字段：
-    - `model`
-    - `base_url`
-    - `api_key`
-  - 本案例中出现的可选字段：
-    - `temperature`
-    - `top_p`
-    - `seed`
-    - `max_retries`
-    - `timeout`
+- 当前推荐配置入口：
+  - `c2rust-xw env set model ...`
+  - `c2rust-xw env set base_url ...`
+  - `c2rust-xw env set api_key ...`
+- 默认存储位置：
+  - Linux / WSL：`~/.config/c2rust-xw/env.toml`
+  - 也可通过 `C2RUST_XW_ENV_FILE` 覆盖
+- 运行时优先级：
+  - 命令行 / 环境变量覆盖
+  - 用户级 `env.toml`
+  - 兼容性回退：项目本地旧 `[model]`
+- 本案例中的必填字段：
+  - `model`
+  - `base_url`
+  - `api_key`
+- 本案例中的可选字段：
+  - `temperature`
+  - `top_p`
+  - `seed`
+  - `max_retries`
+  - `timeout`
 - 说明：
-  - 即使全局 `C2RUST_HOME` 下已有配置，也不会自动同步到项目本地 `.c2rust/config.toml`
-  - 因此当前实际可信的配置源是项目本地 `[model]`
+  - 项目 `.c2rust/config.toml` 现在应只承载项目级配置，如 `build/test/clean`
+  - 模型密钥不应再进入待翻译项目目录，也不应进入 Git
   - 文档和日志中只保留字段名，不保留任何密钥真实值

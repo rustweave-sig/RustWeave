@@ -131,12 +131,12 @@
 
 - 编号：`XXH-CONFIG-001`
 - 层级：模型配置解析
-- 现象：项目本地 `.c2rust/config.toml` 最初没有 `[model]` 值，即使全局 `C2RUST_HOME` 下已有配置
+- 现象：旧链路要求项目本地 `.c2rust/config.toml` 带 `[model]`，即使用户本机环境里已有模型配置也不会自动生效
 - 复现命令：环境修复后第一次成功触发 LLM 调用时
 - 影响：Python OpenAI 客户端会收到空的 `base_url`，并报 `Request URL is missing an 'http://' or 'https://' protocol`
-- 现阶段绕过方式：使用 `c2rust-config config --model --set ...` 显式补齐项目本地模型配置
-- 希望达到的效果：模型配置应只有一个清晰可信来源，或存在自动同步 / 继承路径
-- 可选实现思路：在 `init` 阶段自动复制或继承 `[model]` 配置
+- 现阶段处理状态：已按“项目配置 / 用户级环境配置分层”方向整改
+- 当前推荐做法：使用 `c2rust-xw env set ...` 写入用户级环境配置，由运行时与项目配置合并
+- 希望达到的效果：模型配置只保留在本机环境层，项目 `.c2rust/config.toml` 只保留项目级配置
 
 ## XXH-RECOVER-001
 

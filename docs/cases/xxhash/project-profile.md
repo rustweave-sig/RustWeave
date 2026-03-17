@@ -16,7 +16,7 @@
 - 原生依赖说明：
   - 在 WSL Ubuntu 下，`gcc`、`clang`、`make`、`git` 即可完成原生构建验证
   - CLI 翻译阶段还额外依赖 `bindgen` 与可调用的 `python`
-  - LLM 翻译阶段要求项目本地 `.c2rust/config.toml` 中存在有效的 `[model]`
+  - LLM 翻译阶段要求本机环境层存在有效模型配置（如 `c2rust-xw env` 或 `C2RUST_*` 环境变量）
 - 选择该项目作为 CLI 验证案例的原因：
   - 构建与测试路径明确
   - 复杂度高于 `cJSON`

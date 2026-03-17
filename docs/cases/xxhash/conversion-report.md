@@ -61,7 +61,7 @@
    - 提供 `python -> python3` 的本地兼容链接
 
 2. 补齐模型配置
-   - 将项目本地 `.c2rust/config.toml` 中的 `[model]` 配置补全
+   - 使用 `c2rust-xw env` 在用户级环境层补齐模型配置
 
 3. 调整构建捕获命令
    - 直接跑增量 `make xxhsum` 时，可能因为目标已是最新而捕获到 `0` 个编译单元
@@ -122,14 +122,14 @@
 
 - 缺少 `bindgen`
 - `python` 不可用，只存在 `python3`
-- 项目本地模型配置缺失
+- 用户级模型环境缺失
 - 一次失败的 `code_analyse --init` 后，feature 处于半初始化状态，导致后续运行出现 `0/0 files processed`
 
 对应处理：
 
 - 安装 `bindgen-cli`
 - 增加 `python` 兼容入口
-- 补全项目本地 `[model]`
+- 通过 `c2rust-xw env set ...` 补齐用户级模型配置
 - 使用 `code_analyse --feature default --init` 或后续 `feature reinit`
 
 ### 3.3 翻译操作方式
@@ -226,7 +226,7 @@
 - 调用模式：
   - 通过 Python `openai` 客户端
   - 使用 OpenAI-compatible chat completions API
-- 本次验证中实际依赖的项目本地配置项包括：
+- 本次验证中实际依赖的用户级环境配置项包括：
   - `model`
   - `base_url`
   - `api_key`
@@ -239,9 +239,9 @@
 
 本次暴露出的配置事实：
 
-- 全局 `C2RUST_HOME` 下已有模型配置，并不会自动传播到项目本地 `.c2rust/config.toml`
-- 项目本地 `[model]` 缺失时，翻译阶段会在真正模型调用前后出现配置错误
-- 因此目前实际运行时，以“项目本地 `.c2rust/config.toml` 中的 `[model]`”为准
+- 项目 `.c2rust/config.toml` 应只承载项目级配置
+- 模型配置应通过 `c2rust-xw env` 或 `C2RUST_MODEL/C2RUST_BASE_URL/C2RUST_API_KEY` 提供
+- 运行时需要把“用户级模型配置”和“项目级 build/test/clean 配置”合并后再交给翻译器
 
 补充材料：
 [model-config.md](./model-config.md)
@@ -260,9 +260,9 @@
 
 2. 模型配置源不清晰
    - 问题：
-     - 全局配置与项目本地配置不自动同步，容易导致“看起来已配置，实际不可用”
+     - 过去模型配置混在项目 `.c2rust/config.toml` 中，既有外泄风险，也容易出现多副本漂移
    - 希望达到的效果：
-     - 形成唯一可信配置源，或在 init 阶段自动同步/继承
+     - 形成“项目配置留仓库、模型配置留本机环境”的清晰分层
 
 3. WSL 下命令与 PATH 兼容性不足
    - 问题：
