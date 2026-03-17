@@ -14,34 +14,42 @@ git clone https://gitcode.com/xuanwu/C2RustXW-CLI.git
 ```shell
 c2rust-xw init
 ```
-2. 创建Makefile
+2. 配置本机模型环境
+```shell
+c2rust-xw env set model "XXX"
+c2rust-xw env set base_url "XXX"
+c2rust-xw env set api_key "XXX"
+```
+3. 创建 Makefile
 ```shell
 mkdir build && cd build && cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
-3. 执行构建
+4. 配置项目构建/测试/清理命令
+```shell
+c2rust-config config --make --set build.dir "build"
+c2rust-config config --make --set build.cmd "make"
+c2rust-config config --make --set test.dir "build"
+c2rust-config config --make --set test.cmd "make test"
+c2rust-config config --make --set clean.dir "build"
+c2rust-config config --make --set clean.cmd "make clean"
+```
+5. 执行构建
 ```shell
 c2rust-xw build -- make
 ```
-4. 执行测试
+6. 执行测试
 ```shell
 c2rust-xw test -- make test
 ```
-5. 执行清除
+7. 执行清除
 ```shell
 c2rust-xw clean -- make clean
 ```
-6. 创建model配置
-```shell
-c2rust-config config --model --set model "XXX"
-c2rust-config config --model --set base_url "XXX"
-c2rust-config config --model --set api_key "XXX"
-```
-7. 执行翻译：c2rust-xw translate（需要python环境）
-	- pip install openai httpx tomli
-	- python3 -m venv /root/c2rust_venv
-	- source /root/c2rust_venv/bin/activate
-    
-8.合并代码
+8. 执行翻译：`c2rust-xw translate`（需要 python 环境）
+   - `pip install openai httpx tomli`
+   - `python3 -m venv /root/c2rust_venv`
+   - `source /root/c2rust_venv/bin/activate`
+9. 合并代码
 ```shell
 c2rust-xw merge
 ```

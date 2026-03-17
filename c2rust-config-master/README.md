@@ -1,6 +1,6 @@
 # c2rust-config
 
-一个用于 c2rust 翻译工作的 Rust 配置管理工具。该工具管理存储在 `.c2rust/config.toml` 文件中的配置数据。
+一个用于 c2rust 翻译工作的 Rust 配置管理工具。该工具只管理项目级配置，并将其存储在 `.c2rust/config.toml` 文件中。
 
 ## 安装
 
@@ -11,10 +11,11 @@ cargo build --release
 
 ## 使用方法
 
-该工具提供一个 `config` 子命令, 包含三种配置模式：
+该工具提供一个 `config` 子命令，包含两种项目配置模式：
 - `--global`：全局配置（例如编译器设置）
-- `--model`：模型相关配置（例如 AI 模型 API 密钥）
 - `--make`：构建/清理/测试相关配置
+
+模型、`base_url`、`api_key` 等用户级敏感配置已经迁移到 `c2rust-xw env`，不再写入项目 `.c2rust/config.toml`。
 
 ### 命令结构
 
@@ -24,7 +25,6 @@ c2rust-config config [模式] [操作] [键] [值...]
 
 **模式**（必须指定其中一个）：
 - `--global`：全局配置
-- `--model`：模型配置
 - `--make`：构建/测试配置
 
 **操作**（必须指定其中一个）：
@@ -60,11 +60,6 @@ c2rust-config config --make --set test.cmd "make test"
 c2rust-config config --global --set compiler "gcc"
 c2rust-config config --global --add compiler "clang"
 c2rust-config config --global --list
-
-# 模型配置
-c2rust-config config --model --set api_key "your-api-key"
-c2rust-config config --model --set model_name "gpt-4"
-c2rust-config config --model --list
 
 # 构建配置操作
 c2rust-config config --make --set build.dir "build"
@@ -117,11 +112,6 @@ c2rust-config config --make --feature debug --list
 [global]
 # 全局设置，一般无需配置
 compiler = ["gcc"]
-
-[model]
-# AI 模型相关配置
-api_key = "your-api-key"
-model_name = "gpt-4"
 
 [feature.default]
 # 路径相对于项目根目录（包含 .c2rust 的目录）
@@ -211,8 +201,6 @@ mkdir .c2rust
 **注意**：`config.toml` 文件不存在时会自动创建，包含以下默认结构：
 ```toml
 [global]
-
-[model]
 
 [feature.default]
 ```

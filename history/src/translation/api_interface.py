@@ -4,16 +4,16 @@ import httpx
 # 阿里百炼大模型API KEY列表，可以根据translate_entry启动的进程来使用API KEYAdd commentMore actions
 # 尽量保证一个进程一个API KEY
 API_KEY_LIST = [
-    "sk-527ab50d5ca54a67b96397d9cb141cc9",
-    "sk-5ab0a5c6c3cb43d494558395e3e71dbb",
-    "sk-1dd0b55e7e104a9dafbcac6f85ae5859",
-    "sk-ca6b3484177e4f3fb0c8dcda0f94a1bd",
-    "sk-a13cfdc30e5b451fb76e2ca96549dcb4",
-    "sk-c57494a0c37f4633a5d12b4395474465",
-    "sk-b25b95f0d6064b99b0c5aa03f834bd2a",
-    "sk-9063b0627c05497e9af747aa4c35b847",
-    "sk-0fba6af841b745a7a74c562eb32a0e8f",
-    "sk-18dca314ef334a719da9edd950b2a0b9",
+    "your-api-key-1",
+    "your-api-key-2",
+    "your-api-key-3",
+    "your-api-key-4",
+    "your-api-key-5",
+    "your-api-key-6",
+    "your-api-key-7",
+    "your-api-key-8",
+    "your-api-key-9",
+    "your-api-key-10",
 ]
 
 # return a new openai instance, maybe gpt/qwen/llama
@@ -26,11 +26,11 @@ def init_openai_instance():
     # # gpt4
     # custom_base_url = 'https://api.xty.app/v1'
     # #  API KEY
-    # api_key = 'sk-TfvVImBDiombumqk61317e0964934bE19e0d6f4851382f84'
+    # api_key = 'your-api-key'
 
 
     # # Transfer API KEY
-    # custom_api_key = 'sk-527ab50d5ca54a67b96397d9cb141cc9'
+    # custom_api_key = 'your-api-key'
 
     # 使用进程专属API KEY
     custom_api_key = api_key

@@ -2,17 +2,14 @@
 [global]
 
 [model]
-#model = "glm-4.6"
-#base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-#api_key = "sk-18dca314ef334a719da9edd950b2a0b9"
-model = "qwen3-max"
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-api_key = "sk-a13cfdc30e5b451fb76e2ca96549dcb4"
+model = "your-model-name"
+base_url = "https://your-llm-endpoint.example/v1"
+api_key = "your-api-key"
 temperature = 0
 top_p = 1
 seed = 42
 max_retries = 10
-timeout =  500
+timeout = 500
 
 #具体feature的配置
 [feature.default]
