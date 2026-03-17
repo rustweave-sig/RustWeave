@@ -179,7 +179,7 @@ impl Feature {
 
         for module_name in &module_names {
             let rs_file = mod_dir.join(module_name).with_extension("rs");
-            Self::parse_rust_file(&rs_file, &mut items, &mut deps)?;
+            Self::merge_main_item(&rs_file, &mut items, &mut deps)?;
         }
 
         let mod_rs = mod_dir.join("mod.rs");
@@ -257,7 +257,7 @@ impl Feature {
         Ok(modules)
     }
 
-    fn parse_rust_file(
+    fn merge_main_item(
         rs_file: &Path,
         all_items: &mut Vec<syn::Item>,
         deps: &mut DepNames,
