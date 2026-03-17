@@ -55,6 +55,14 @@ impl Visit<'_> for DepNames {
         visit_path(self, path);
     }
 
+    fn visit_use_name(&mut self, name: &syn::UseName) {
+        self.mark_used(name.ident.to_string());
+    }
+
+    fn visit_use_rename(&mut self, rename: &syn::UseRename) {
+        self.mark_used(rename.ident.to_string());
+    }
+
     // macro只能通过字符串匹配
     fn visit_macro(&mut self, mac: &syn::Macro) {
         self.mac_tokens.push_str(&mac.tokens.to_string());
@@ -80,13 +88,44 @@ impl Visit<'_> for PubDepVisitor<'_> {
 }
 
 struct CollectedItems {
-    named_items: HashMap<String, Vec<syn::Item>>,
+    named_items: HashMap<String, Vec<TypeItem>>,
     ffi_items: HashMap<String, Vec<syn::ForeignItem>>,
     foreign_mod_template: Option<syn::ItemForeignMod>,
 }
 
+struct TypeItem {
+    type_def: syn::Item,
+    impl_blocks: Vec<syn::ItemImpl>,
+}
+
+impl TypeItem {
+    fn new(type_def: syn::Item) -> Self {
+        Self {
+            type_def,
+            impl_blocks: Vec::new(),
+        }
+    }
+
+    fn name(&self) -> Option<String> {
+        Feature::item_name(&self.type_def)
+    }
+
+    fn add_impl(&mut self, impl_block: syn::ItemImpl) {
+        self.impl_blocks.push(impl_block);
+    }
+}
+
+impl Clone for TypeItem {
+    fn clone(&self) -> Self {
+        Self {
+            type_def: self.type_def.clone(),
+            impl_blocks: self.impl_blocks.clone(),
+        }
+    }
+}
+
 struct Duplicates {
-    named_to_extract: Vec<syn::Item>,
+    named_to_extract: Vec<TypeItem>,
     named_remove_set: HashSet<String>,
     ffi_to_extract: Vec<syn::ForeignItem>,
     ffi_remove_set: HashSet<String>,
@@ -140,33 +179,11 @@ impl Feature {
 
         for module_name in &module_names {
             let rs_file = mod_dir.join(module_name).with_extension("rs");
-            Self::parse_rust_file(&rs_file, &mut items, &mut deps)?;
+            Self::merge_main_item(&rs_file, &mut items, &mut deps)?;
         }
 
         let mod_rs = mod_dir.join("mod.rs");
-        let (type_items, all_impls, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
-
-        let dep_type_names: std::collections::HashSet<String> = type_items
-            .iter()
-            .filter_map(|item| Self::item_name(item))
-            .collect();
-
-        let filtered_impls: Vec<syn::ItemImpl> = all_impls
-            .into_iter()
-            .filter(|impl_item| {
-                Self::impl_self_type_name(impl_item)
-                    .map(|name| dep_type_names.contains(&name))
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        let mut impl_map: std::collections::HashMap<String, Vec<syn::ItemImpl>> =
-            std::collections::HashMap::new();
-        for impl_block in filtered_impls {
-            if let Some(type_name) = Self::impl_self_type_name(&impl_block) {
-                impl_map.entry(type_name).or_default().push(impl_block);
-            }
-        }
+        let (type_items, foreign_mod) = Self::extract_dependencies(&mod_rs, &mut deps)?;
 
         let mut merged_items = Vec::new();
         merged_items.push(syn::parse2(quote! { use super::*; }).unwrap());
@@ -177,16 +194,14 @@ impl Feature {
         }
 
         for type_item in &type_items {
-            let mut type_item = type_item.clone();
-            if let Some(type_name) = Self::item_name(&type_item) {
-                Self::set_item_visibility(&mut type_item, deps.is_pub(&type_name));
-                if let Some(impl_blocks) = impl_map.get(&type_name) {
-                    for impl_block in impl_blocks {
-                        merged_items.push(syn::Item::Impl(impl_block.clone()));
-                    }
+            if let Some(type_name) = type_item.name() {
+                let mut type_def = type_item.type_def.clone();
+                Self::set_item_visibility(&mut type_def, deps.is_pub(&type_name));
+                merged_items.push(type_def);
+                for impl_block in &type_item.impl_blocks {
+                    merged_items.push(syn::Item::Impl(impl_block.clone()));
                 }
             }
-            merged_items.push(type_item);
         }
         if let Some(fm) = foreign_mod {
             merged_items.push(syn::Item::ForeignMod(fm));
@@ -242,7 +257,7 @@ impl Feature {
         Ok(modules)
     }
 
-    fn parse_rust_file(
+    fn merge_main_item(
         rs_file: &Path,
         all_items: &mut Vec<syn::Item>,
         deps: &mut DepNames,
@@ -339,7 +354,6 @@ impl Feature {
     ) -> Result<()> {
         if Self::remove_private_attr(&mut fn_item.attrs) {
             fn_item.vis = syn::Visibility::Inherited;
-            fn_item.sig.abi = None;
         }
         // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
         let content =
@@ -423,18 +437,13 @@ impl Feature {
     fn extract_dependencies(
         mod_rs: &Path,
         deps: &mut DepNames,
-    ) -> Result<(
-        Vec<syn::Item>,
-        Vec<syn::ItemImpl>,
-        Option<syn::ItemForeignMod>,
-    )> {
+    ) -> Result<(Vec<TypeItem>, Option<syn::ItemForeignMod>)> {
         let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
 
-        let mut all_types: HashMap<String, syn::Item> = HashMap::new();
+        let mut all_types: HashMap<String, TypeItem> = HashMap::new();
         let mut all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
         let mut foreign_mod_template: Option<syn::ItemForeignMod> = None;
-        let mut all_impls: Vec<syn::ItemImpl> = Vec::new();
 
         for item in ast.items {
             match item {
@@ -450,12 +459,16 @@ impl Feature {
                         }
                     }
                 }
-                syn::Item::Impl(impl_item) => {
-                    all_impls.push(impl_item);
+                syn::Item::Impl(impl_block) => {
+                    if let Some(type_name) = Self::impl_self_type_name(&impl_block) {
+                        if let Some(type_item) = all_types.get_mut(&type_name) {
+                            type_item.add_impl(impl_block);
+                        }
+                    }
                 }
                 _ => {
                     if let Some(name) = Self::item_name(&item) {
-                        all_types.insert(name, item);
+                        all_types.insert(name, TypeItem::new(item));
                     }
                 }
             }
@@ -463,15 +476,15 @@ impl Feature {
 
         all_types.insert(
             "c_size_t".to_string(),
-            syn::parse_str("type c_size_t = usize;").unwrap(),
+            TypeItem::new(syn::parse_str("type c_size_t = usize;").unwrap()),
         );
         all_types.insert(
             "c_ssize_t".to_string(),
-            syn::parse_str("type c_ssize_t = isize;").unwrap(),
+            TypeItem::new(syn::parse_str("type c_ssize_t = isize;").unwrap()),
         );
         all_types.insert(
             "c_ptrdiff_t".to_string(),
-            syn::parse_str("type c_ptrdiff_t = isize;").unwrap(),
+            TypeItem::new(syn::parse_str("type c_ptrdiff_t = isize;").unwrap()),
         );
 
         let mut dep_types = Vec::new();
@@ -486,14 +499,14 @@ impl Feature {
             None
         };
 
-        Ok((dep_types, all_impls, foreign_mod))
+        Ok((dep_types, foreign_mod))
     }
 
     fn filter_dependencies(
-        mut all_types: HashMap<String, syn::Item>,
+        mut all_types: HashMap<String, TypeItem>,
         all_ffi: HashMap<String, syn::ForeignItem>,
         deps: &mut DepNames,
-        dep_types: &mut Vec<syn::Item>,
+        dep_types: &mut Vec<TypeItem>,
         dep_ffi: &mut Vec<syn::ForeignItem>,
     ) {
         for (name, item) in all_ffi {
@@ -506,13 +519,18 @@ impl Feature {
         let mut new_dep = true;
         while new_dep {
             new_dep = false;
-            all_types.retain(|name, item| {
+            all_types.retain(|name, type_item| {
                 if deps.contains(name) {
-                    if deps.is_pub(name) {
-                        PubDepVisitor(deps).visit_item(item);
+                    visit_item(deps, &type_item.type_def);
+                    for impl_block in &type_item.impl_blocks {
+                        visit_item(deps, &syn::Item::Impl(impl_block.clone()));
                     }
-                    visit_item(deps, item);
-                    dep_types.push(item.clone());
+
+                    if deps.is_pub(name) {
+                        PubDepVisitor(deps).visit_item(&type_item.type_def);
+                    }
+
+                    dep_types.push(type_item.clone());
                     new_dep = true;
                     return false;
                 }
@@ -520,7 +538,7 @@ impl Feature {
             });
         }
 
-        dep_types.sort_by(|a, b| Self::item_name(b).cmp(&Self::item_name(a)));
+        dep_types.sort_by(|a, b| a.name().cmp(&b.name()));
         dep_ffi.sort_by(|a, b| Self::foreign_item_name(b).cmp(&Self::foreign_item_name(a)));
     }
 
@@ -600,7 +618,7 @@ impl Feature {
     }
 
     fn collect_items_from_files(mod_files: &[PathBuf]) -> Result<CollectedItems> {
-        let mut named_items: HashMap<String, Vec<syn::Item>> = HashMap::new();
+        let mut named_items: HashMap<String, Vec<TypeItem>> = HashMap::new();
         let mut ffi_items: HashMap<String, Vec<syn::ForeignItem>> = HashMap::new();
         let mut foreign_mod_template: Option<syn::ItemForeignMod> = None;
 
@@ -610,35 +628,31 @@ impl Feature {
             let ast =
                 syn::parse_file(&content).log_err(&format!("parse {}", mod_file.display()))?;
 
+            let mut file_type_items: Vec<(String, TypeItem)> = Vec::new();
+            let mut file_impls: Vec<(String, syn::ItemImpl)> = Vec::new();
+
             for item in ast.items {
                 match item {
                     syn::Item::Struct(s) => {
                         let name = s.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(syn::Item::Struct(s));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Struct(s))));
                     }
                     syn::Item::Union(u) => {
                         let name = u.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(syn::Item::Union(u));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Union(u))));
                     }
                     syn::Item::Const(c) => {
                         let name = c.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(syn::Item::Const(c));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Const(c))));
                     }
                     syn::Item::Type(t) => {
                         let name = t.ident.to_string();
-                        named_items
-                            .entry(name)
-                            .or_default()
-                            .push(syn::Item::Type(t));
+                        file_type_items.push((name, TypeItem::new(syn::Item::Type(t))));
+                    }
+                    syn::Item::Impl(impl_block) => {
+                        if let Some(type_name) = Self::impl_self_type_name(&impl_block) {
+                            file_impls.push((type_name, impl_block));
+                        }
                     }
                     syn::Item::ForeignMod(fm) => {
                         if foreign_mod_template.is_none() {
@@ -654,6 +668,15 @@ impl Feature {
                     _ => {}
                 }
             }
+
+            for (type_name, mut type_item) in file_type_items {
+                for (impl_type_name, impl_block) in &file_impls {
+                    if *impl_type_name == type_name {
+                        type_item.add_impl(impl_block.clone());
+                    }
+                }
+                named_items.entry(type_name).or_default().push(type_item);
+            }
         }
 
         Ok(CollectedItems {
@@ -663,24 +686,38 @@ impl Feature {
         })
     }
 
+    fn item_body(item: &syn::Item) -> String {
+        let mut item = item.clone();
+        let (attrs, vis) = match item {
+            syn::Item::Struct(ref mut i) => (&mut i.attrs, &mut i.vis),
+            syn::Item::Union(ref mut i) => (&mut i.attrs, &mut i.vis),
+            syn::Item::Type(ref mut i) => (&mut i.attrs, &mut i.vis),
+            syn::Item::Const(ref mut i) => (&mut i.attrs, &mut i.vis),
+            _ => return item.to_token_stream().to_string(),
+        };
+        attrs.clear();
+        *vis = syn::Visibility::Inherited;
+        item.to_token_stream().to_string()
+    }
+
     fn find_duplicates(
-        named_items: &HashMap<String, Vec<syn::Item>>,
+        named_items: &HashMap<String, Vec<TypeItem>>,
         ffi_items: &HashMap<String, Vec<syn::ForeignItem>>,
     ) -> Duplicates {
-        let mut named_to_extract: Vec<syn::Item> = Vec::new();
+        let mut named_to_extract: Vec<TypeItem> = Vec::new();
         let mut named_remove_set: HashSet<String> = HashSet::new();
         let mut ffi_to_extract: Vec<syn::ForeignItem> = Vec::new();
         let mut ffi_remove_set: HashSet<String> = HashSet::new();
 
-        for (name, items) in named_items {
-            if items.len() > 1 {
-                let first_tokens = items[0].to_token_stream().to_string();
-                if items
+        for (type_name, type_items) in named_items {
+            if type_items.len() > 1 {
+                let first_type_body = Self::item_body(&type_items[0].type_def);
+                if type_items
                     .iter()
-                    .all(|item| item.to_token_stream().to_string() == first_tokens)
+                    .all(|type_item| Self::item_body(&type_item.type_def) == first_type_body)
                 {
-                    named_to_extract.push(items[0].clone());
-                    named_remove_set.insert(name.clone());
+                    named_to_extract.push(type_items[0].clone());
+                    named_remove_set.insert(type_name.clone());
                 }
             }
         }
@@ -707,7 +744,13 @@ impl Feature {
         foreign_mod_template: &Option<syn::ItemForeignMod>,
     ) -> Result<()> {
         let mut lib_items: Vec<syn::Item> = Vec::new();
-        lib_items.extend(duplicates.named_to_extract.clone());
+
+        for type_item in &duplicates.named_to_extract {
+            lib_items.push(type_item.type_def.clone());
+            for impl_block in &type_item.impl_blocks {
+                lib_items.push(syn::Item::Impl(impl_block.clone()));
+            }
+        }
 
         if !duplicates.ffi_to_extract.is_empty() {
             if let Some(mut fm) = foreign_mod_template.clone() {
@@ -755,6 +798,13 @@ impl Feature {
                 syn::Item::Union(u) => !duplicates.named_remove_set.contains(&u.ident.to_string()),
                 syn::Item::Const(c) => !duplicates.named_remove_set.contains(&c.ident.to_string()),
                 syn::Item::Type(t) => !duplicates.named_remove_set.contains(&t.ident.to_string()),
+                syn::Item::Impl(impl_block) => {
+                    if let Some(type_name) = Self::impl_self_type_name(&impl_block) {
+                        !duplicates.named_remove_set.contains(&type_name)
+                    } else {
+                        true
+                    }
+                }
                 syn::Item::ForeignMod(fm) => {
                     fm.items
                         .retain(|ffi| !duplicates.ffi_remove_set.contains(&Self::ffi_name(ffi)));
@@ -934,14 +984,14 @@ mod tests {
         deps.used_names.insert("UsedType".to_string(), false);
         deps.used_names.insert("used_func".to_string(), false);
 
-        let mut all_types: HashMap<String, syn::Item> = HashMap::new();
+        let mut all_types: HashMap<String, TypeItem> = HashMap::new();
         all_types.insert(
             "UsedType".to_string(),
-            syn::parse_str("struct UsedType { x: i32 }").unwrap(),
+            TypeItem::new(syn::parse_str("struct UsedType { x: i32 }").unwrap()),
         );
         all_types.insert(
             "UnusedType".to_string(),
-            syn::parse_str("struct UnusedType { x: i32 }").unwrap(),
+            TypeItem::new(syn::parse_str("struct UnusedType { x: i32 }").unwrap()),
         );
 
         let mut all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
@@ -961,10 +1011,7 @@ mod tests {
 
         assert_eq!(dep_types.len(), 1);
         assert_eq!(dep_ffi.len(), 1);
-        assert_eq!(
-            Feature::item_name(&dep_types[0]),
-            Some("UsedType".to_string())
-        );
+        assert_eq!(dep_types[0].name(), Some("UsedType".to_string()));
         assert_eq!(
             Feature::foreign_item_name(&dep_ffi[0]),
             Some("used_func".to_string())
@@ -976,18 +1023,18 @@ mod tests {
         let mut deps = DepNames::new();
         deps.used_names.insert("TypeA".to_string(), false);
 
-        let mut all_types: HashMap<String, syn::Item> = HashMap::new();
+        let mut all_types: HashMap<String, TypeItem> = HashMap::new();
         all_types.insert(
             "TypeA".to_string(),
-            syn::parse_str("struct TypeA { b: TypeB }").unwrap(),
+            TypeItem::new(syn::parse_str("struct TypeA { b: TypeB }").unwrap()),
         );
         all_types.insert(
             "TypeB".to_string(),
-            syn::parse_str("struct TypeB { x: i32 }").unwrap(),
+            TypeItem::new(syn::parse_str("struct TypeB { x: i32 }").unwrap()),
         );
         all_types.insert(
             "TypeC".to_string(),
-            syn::parse_str("struct TypeC { x: i32 }").unwrap(),
+            TypeItem::new(syn::parse_str("struct TypeC { x: i32 }").unwrap()),
         );
 
         let all_ffi: HashMap<String, syn::ForeignItem> = HashMap::new();
@@ -997,10 +1044,8 @@ mod tests {
         Feature::filter_dependencies(all_types, all_ffi, &mut deps, &mut dep_types, &mut dep_ffi);
 
         assert_eq!(dep_types.len(), 2);
-        let names: std::collections::HashSet<_> = dep_types
-            .iter()
-            .filter_map(|t| Feature::item_name(t))
-            .collect();
+        let names: std::collections::HashSet<_> =
+            dep_types.iter().filter_map(|t| t.name()).collect();
         assert!(names.contains("TypeA"));
         assert!(names.contains("TypeB"));
         assert!(!names.contains("TypeC"));
@@ -1202,7 +1247,7 @@ mod tests {
         let lib_rs_path = src_2.join("lib.rs");
         let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
 
-        assert!(lib_content.contains("use core::ffi::*;"));
+        assert!(lib_content.contains("use ::core::ffi::*;"));
         assert!(lib_content.contains("mod mod_test;"));
         assert!(!lib_content.contains("use mod_test as fun_foo;"));
         assert!(!lib_content.contains("pub use mod_test::*;"));
@@ -1259,43 +1304,6 @@ mod tests {
             Feature::impl_self_type_name(&impl_block),
             Some("MyGeneric".to_string())
         );
-    }
-
-    #[test]
-    fn test_extract_dependencies_preserves_impls() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mod_rs_path = temp_dir.path().join("mod.rs");
-
-        let mod_rs_content = r#"
-struct MyStruct;
-impl MyStruct {
-    fn foo(&self) {}
-}
-
-struct OtherStruct;
-impl OtherStruct {
-    fn bar(&self) {}
-}
-"#;
-
-        fs::write(&mod_rs_path, mod_rs_content).unwrap();
-
-        let mut deps = DepNames::new();
-        deps.used_names.insert("MyStruct".to_string(), false);
-        deps.used_names.insert("OtherStruct".to_string(), false);
-
-        let (type_items, impl_blocks, _foreign_mod) =
-            Feature::extract_dependencies(&mod_rs_path, &mut deps).unwrap();
-
-        assert_eq!(type_items.len(), 2);
-        assert_eq!(impl_blocks.len(), 2);
-
-        let impl_types: Vec<String> = impl_blocks
-            .iter()
-            .filter_map(|impl_block| Feature::impl_self_type_name(impl_block))
-            .collect();
-        assert!(impl_types.contains(&"MyStruct".to_string()));
-        assert!(impl_types.contains(&"OtherStruct".to_string()));
     }
 
     #[test]
@@ -1370,5 +1378,25 @@ impl OtherStruct {
         assert!(deps.is_pub("PubType"));
         assert!(!deps.is_pub("PrivateType"));
         assert!(!deps.is_pub("UnknownType"));
+    }
+
+    #[test]
+    fn test_deduplicate_basic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src_2 = temp_dir.path().join("src.2");
+        fs::create_dir_all(&src_2).unwrap();
+
+        let mod_a = src_2.join("mod_a.rs");
+        let mod_b = src_2.join("mod_b.rs");
+
+        fs::write(&mod_a, "struct MyStruct { x: i32 }").unwrap();
+        fs::write(&mod_b, "struct MyStruct { x: i32 }").unwrap();
+
+        let mod_files = vec![mod_a.clone(), mod_b.clone()];
+        let collected = Feature::collect_items_from_files(&mod_files).unwrap();
+        let duplicates = Feature::find_duplicates(&collected.named_items, &collected.ffi_items);
+
+        assert_eq!(duplicates.named_remove_set.len(), 1);
+        assert!(duplicates.named_remove_set.contains("MyStruct"));
     }
 }

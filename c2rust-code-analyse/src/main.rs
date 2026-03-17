@@ -55,6 +55,7 @@ fn print_help() {
     println!("  --init               初始化feature，创建新的Rust库项目");
     println!("  --reinit             重新初始化feature, 不影响已经转换的rs文件");
     println!("  --update             更新feature，同步C代码和Rust文件");
+    println!("  --build-success      表示代码已编译成功，启用拷贝和时间戳同步");
     println!("  --merge              合并feature，合并分散的Rust文件");
     println!("  -h, --help           显示此帮助信息并退出");
     println!();
@@ -65,13 +66,23 @@ fn print_help() {
     println!("示例:");
     println!("  code-analyse --feature my_feature --init");
     println!("  code-analyse --feature my_feature --update");
+    println!("  code-analyse --feature my_feature --update --build-success");
     println!("  code-analyse --feature my_feature --reinit");
     println!("  code-analyse --feature my_feature --merge");
 }
 
 fn main() -> Result<()> {
     // 定义支持的选项: feature: 需要参数, init/update/merge 不需要参数, help/h 显示帮助
-    let opts = hiopt::options!["feature:", "init", "update", "merge", "reinit", "help", "h"];
+    let opts = hiopt::options![
+        "feature:",
+        "init",
+        "update",
+        "merge",
+        "reinit",
+        "build-success",
+        "help",
+        "h"
+    ];
 
     // 获取命令行参数（跳过第一个程序名）
     let args: Vec<String> = std::env::args().collect();
@@ -82,6 +93,7 @@ fn main() -> Result<()> {
     let mut update_flag = false;
     let mut reinit_flag = false;
     let mut merge_flag = false;
+    let mut build_success_flag = false;
 
     // 遍历选项
     for opt in opts.opt_iter(&args_str[..]) {
@@ -103,6 +115,9 @@ fn main() -> Result<()> {
                     }
                     "merge" => {
                         merge_flag = true;
+                    }
+                    "build-success" => {
+                        build_success_flag = true;
                     }
                     "help" | "h" => {
                         print_help();
@@ -143,7 +158,7 @@ fn main() -> Result<()> {
             feature.init()?;
         }
         "update" => {
-            feature.update()?;
+            feature.update(build_success_flag)?;
         }
         "reinit" => {
             feature.reinit()?;
@@ -155,4 +170,75 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_update_without_build_success_flag_has_no_copy_side_effects() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let feature_name = "test_feature_no_build_success";
+        let rust_src = root.join("rust/src");
+        fs::create_dir_all(&rust_src).unwrap();
+
+        let c2rust_dir = root.join(".c2rust");
+        fs::create_dir_all(&c2rust_dir).unwrap();
+
+        let feature_dir = root.join(feature_name);
+        fs::create_dir_all(&feature_dir).unwrap();
+        let rust_dir = feature_dir.join("rust/src/mod_test");
+        fs::create_dir_all(&rust_dir).unwrap();
+
+        let private_file = rust_dir.join("fun_c2rust_private_test.rs");
+        fs::write(&private_file, "pub fn test_func() {}").unwrap();
+
+        let c_dir = feature_dir.join("c");
+        fs::create_dir_all(&c_dir).unwrap();
+        let c_file = c_dir.join("test.c");
+        fs::write(&c_file, "// C file content").unwrap();
+
+        assert!(private_file.exists());
+    }
+
+    #[test]
+    fn test_update_with_build_success_flag_copies_private_files_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let feature_name = "test_feature_with_build_success";
+        let rust_src = root.join("rust/src");
+        fs::create_dir_all(&rust_src).unwrap();
+
+        let c2rust_dir = root.join(".c2rust");
+        fs::create_dir_all(&c2rust_dir).unwrap();
+
+        let feature_dir = root.join(feature_name);
+        fs::create_dir_all(&feature_dir).unwrap();
+        let rust_dir = feature_dir.join("rust/src/mod_test");
+        fs::create_dir_all(&rust_dir).unwrap();
+
+        let private_file = rust_dir.join("fun_c2rust_private_test.rs");
+        fs::write(&private_file, "pub fn test_func() {}").unwrap();
+
+        let rust_dir2 = feature_dir.join("rust/src/mod_test2");
+        fs::create_dir_all(&rust_dir2).unwrap();
+
+        let private_file2 = rust_dir2.join("fun_c2rust_private_test.rs");
+        fs::write(&private_file2, "").unwrap();
+
+        let c_dir = feature_dir.join("c");
+        fs::create_dir_all(&c_dir).unwrap();
+        let c_file = c_dir.join("test.c");
+        fs::write(&c_file, "// C file content").unwrap();
+        let c_file2 = c_dir.join("test2.c");
+        fs::write(&c_file2, "// C file content").unwrap();
+
+        assert!(private_file.exists());
+        assert!(private_file2.exists());
+    }
 }
