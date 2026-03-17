@@ -194,18 +194,18 @@ impl Kind {
             return false;
         };
 
-        let qual_type = &var.ty.qual_type;
+        let typedef = &var.ty.typedef();
 
         // 提前创建正则表达式，避免重复编译
         let const_pattern = regex::Regex::new(r"\bconst\b").unwrap();
 
         // 查找最后一个指针标记 * (从右向左查找，处理多级指针)
-        if let Some(last_star_pos) = qual_type.rfind('*') {
+        if let Some(last_star_pos) = typedef.rfind('*') {
             // 检查 * 之后是否有 const（顶层 const）
-            const_pattern.is_match(&qual_type[last_star_pos + 1..])
+            const_pattern.is_match(&typedef[last_star_pos + 1..])
         } else {
             // 没有指针，检查整个类型是否有 const
-            const_pattern.is_match(qual_type)
+            const_pattern.is_match(typedef)
         }
     }
 
@@ -353,7 +353,7 @@ impl Kind {
         let Kind::FunctionDecl(ref item) = self else {
             return false;
         };
-        item.ty.qual_type.contains("...") || item.ty.qual_type.contains("struct __va_list_tag")
+        item.ty.typedef().contains("...") || item.ty.typedef().contains("struct __va_list_tag")
     }
 }
 
@@ -405,6 +405,14 @@ pub struct MyClangType {
     qual_type: String,
     #[serde(rename = "desugaredQualType")]
     desugared_qual_type: Option<String>,
+}
+
+impl MyClangType {
+    fn typedef(&self) -> &str {
+        self.desugared_qual_type
+            .as_deref()
+            .unwrap_or(&self.qual_type)
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
