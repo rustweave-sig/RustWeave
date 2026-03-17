@@ -1,6 +1,7 @@
 use crate::{get_root, File, Node, Result, ToError};
 use hierr::Error;
 use quote::{quote, ToTokens};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::env::{remove_var, set_var, var};
 use std::ffi::OsStr;
@@ -980,26 +981,22 @@ impl Feature {
     }
 
     fn has_export_name_attr(attrs: &mut Vec<syn::Attribute>, expected_name: &str) -> bool {
+        let re = Regex::new(r#"export_name\s*=\s*"([^"]*)""#).unwrap();
+
         let mut found = false;
         attrs.retain(|attr| {
             let s = attr.to_token_stream().to_string();
-            if s.contains("export_name") {
-                if let Some(start) = s.find("export_name") {
-                    let rest = &s[start..];
-                    if let Some(quote_start) = rest.find('"') {
-                        let rest = &rest[quote_start + 1..];
-                        if let Some(quote_end) = rest.find('"') {
-                            let value = &rest[..quote_end];
-                            if value == expected_name {
-                                found = true;
-                                return true;
-                            }
-                        }
+            match re.captures(&s) {
+                Some(caps) => {
+                    if &caps[1] == expected_name {
+                        found = true;
+                        true
+                    } else {
+                        false
                     }
                 }
-                return false;
+                None => true,
             }
-            true
         });
         found
     }
@@ -1345,5 +1342,68 @@ struct KeepStruct {
         assert!(!result.contains("const MY_CONST"));
         assert!(result.contains("static MY_STATIC"));
         assert!(result.contains("struct KeepStruct"));
+    }
+
+    #[test]
+    fn test_has_export_name_attr_standard_format() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name = "foo"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "foo");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_compact_format() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name="bar"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "bar");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_multiple_spaces() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name  =  "baz"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "baz");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_wrong_name() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[export_name = "wrong"] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "correct");
+        assert!(!result);
+        assert_eq!(attrs.len(), 0);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_no_export_name() {
+        let mut attrs: Vec<syn::Attribute> = vec![syn::parse_quote! { #[inline] }];
+        let result = Feature::has_export_name_attr(&mut attrs, "foo");
+        assert!(!result);
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_multiple_attrs() {
+        let mut attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote! { #[export_name = "target"] },
+            syn::parse_quote! { #[inline] },
+        ];
+        let result = Feature::has_export_name_attr(&mut attrs, "target");
+        assert!(result);
+        assert_eq!(attrs.len(), 2);
+    }
+
+    #[test]
+    fn test_has_export_name_attr_mixed_export_names() {
+        let mut attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote! { #[export_name = "keep"] },
+            syn::parse_quote! { #[export_name = "delete"] },
+        ];
+        let result = Feature::has_export_name_attr(&mut attrs, "keep");
+        assert!(result);
+        assert_eq!(attrs.len(), 1);
+        assert!(attrs[0].to_token_stream().to_string().contains("keep"));
     }
 }
