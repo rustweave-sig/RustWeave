@@ -3,10 +3,7 @@ use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use syn::{
-    parse::Parser,
-    visit::{visit_foreign_item, visit_item, visit_path, Visit},
-};
+use syn::visit::{visit_foreign_item, visit_item, visit_path, Visit};
 use walkdir::WalkDir;
 
 struct DepNames {
@@ -293,10 +290,7 @@ impl Feature {
             }
         }
         if let Some(syn::Item::Fn(mut fn_item)) = main_item {
-            Self::merge_item_fn(
-                other_items,
-                &mut fn_item,
-            )?;
+            Self::merge_item_fn(other_items, &mut fn_item)?;
             if matches!(fn_item.vis, syn::Visibility::Public(_)) {
                 PubDepVisitor(deps).visit_signature(&fn_item.sig);
             }
@@ -330,10 +324,7 @@ impl Feature {
         false
     }
 
-    fn merge_item_fn(
-        items: Vec<syn::Item>,
-        fn_item: &mut syn::ItemFn,
-    ) -> Result<()> {
+    fn merge_item_fn(items: Vec<syn::Item>, fn_item: &mut syn::ItemFn) -> Result<()> {
         if Self::remove_private_attr(&mut fn_item.attrs) {
             fn_item.vis = syn::Visibility::Inherited;
         }
@@ -451,19 +442,6 @@ impl Feature {
             }
         }
 
-        all_types.insert(
-            "c_size_t".to_string(),
-            TypeItem::new(syn::parse_str("type c_size_t = usize;").unwrap()),
-        );
-        all_types.insert(
-            "c_ssize_t".to_string(),
-            TypeItem::new(syn::parse_str("type c_ssize_t = isize;").unwrap()),
-        );
-        all_types.insert(
-            "c_ptrdiff_t".to_string(),
-            TypeItem::new(syn::parse_str("type c_ptrdiff_t = isize;").unwrap()),
-        );
-
         let mut dep_types = Vec::new();
         let mut dep_ffi = Vec::new();
         Self::filter_dependencies(all_types, all_ffi, deps, &mut dep_types, &mut dep_ffi);
@@ -556,12 +534,7 @@ impl Feature {
         let collected = Self::collect_items_from_files(&mod_files)?;
         let duplicates = Self::find_duplicates(&collected.named_items, &collected.ffi_items);
 
-        Self::generate_lib_rs(
-            &src_2,
-            &mod_files,
-            &duplicates,
-            &collected.foreign_mod_template,
-        )?;
+        Self::update_lib_rs(&src_2, &duplicates, &collected.foreign_mod_template)?;
 
         if !duplicates.named_remove_set.is_empty() || !duplicates.ffi_remove_set.is_empty() {
             Self::remove_duplicates_from_files(&mod_files, &duplicates)?;
@@ -714,13 +687,17 @@ impl Feature {
         }
     }
 
-    fn generate_lib_rs(
+    fn update_lib_rs(
         src_2: &Path,
-        mod_files: &[PathBuf],
         duplicates: &Duplicates,
         foreign_mod_template: &Option<syn::ItemForeignMod>,
     ) -> Result<()> {
-        let mut lib_items: Vec<syn::Item> = Vec::new();
+        let lib_rs_file = src_2.parent().unwrap().join("src/lib.rs");
+        let content =
+            fs::read_to_string(&lib_rs_file).log_err(&format!("read {}", lib_rs_file.display()))?;
+        let mut lib_rs =
+            syn::parse_file(&content).log_err(&format!("parse {}", lib_rs_file.display()))?;
+        let lib_items = &mut lib_rs.items;
 
         for type_item in &duplicates.named_to_extract {
             lib_items.push(type_item.type_def.clone());
@@ -736,26 +713,7 @@ impl Feature {
             }
         }
 
-        let attrs: Vec<syn::Attribute> = syn::Attribute::parse_inner
-            .parse_str(Self::lib_attrs())
-            .unwrap_or_default();
-
-        let mut lib_file = syn::File {
-            shebang: None,
-            attrs,
-            items: vec![syn::parse_str("use ::core::ffi::*;").unwrap()],
-        };
-
-        lib_file.items.extend(lib_items);
-
-        for mod_file in mod_files {
-            let mod_name = mod_file.file_stem().unwrap().to_string_lossy().to_string();
-            lib_file
-                .items
-                .push(syn::parse_str(&format!("mod {mod_name};")).unwrap());
-        }
-
-        let lib_content = prettyplease::unparse(&lib_file);
+        let lib_content = prettyplease::unparse(&lib_rs);
         let lib_rs_path = src_2.join("lib.rs");
         fs::write(&lib_rs_path, lib_content.as_bytes())
             .log_err(&format!("write {}", lib_rs_path.display()))?;
@@ -1201,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_lib_rs_basic() {
+    fn test_update_lib_rs_basic() {
         let duplicates = Duplicates {
             named_to_extract: vec![],
             named_remove_set: std::collections::HashSet::new(),
@@ -1218,7 +1176,7 @@ mod tests {
 
         let mod_files = vec![mod_file];
 
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
+        let result = Feature::update_lib_rs(&src_2, &mod_files, &duplicates, &None);
         assert!(result.is_ok());
 
         let lib_rs_path = src_2.join("lib.rs");
@@ -1248,7 +1206,7 @@ mod tests {
 
         let mod_files = vec![mod_file];
 
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
+        let result = Feature::update_lib_rs(&src_2, &mod_files, &duplicates, &None);
         assert!(result.is_ok());
 
         let lib_rs_path = src_2.join("lib.rs");
