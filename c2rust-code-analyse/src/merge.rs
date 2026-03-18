@@ -128,6 +128,29 @@ struct Duplicates {
     ffi_remove_set: HashSet<String>,
 }
 
+impl Duplicates {
+    fn remove(&mut self, names: &HashSet<String>) {
+        self.named_to_extract.retain(|item| {
+            if let Some(name) = Feature::item_name(&item.type_def) {
+                if names.contains(&name) {
+                    println!("{name} - remove type item defined in mod");
+                    return false;
+                }
+            }
+            true
+        });
+        self.ffi_to_extract.retain(|item| {
+            if let Some(name) = Feature::foreign_item_name(&item) {
+                if names.contains(&name) {
+                    println!("{name} - remove foreign item defined in mod");
+                    return false;
+                }
+            }
+            true
+        });
+    }
+}
+
 impl Feature {
     /// 将每个 mod_xxx 目录下的 fun_*.rs、var_*.rs 和 mod.rs 合并为单个 mod_xxx.rs 文件
     /// mod.rs 中仅保留该模块实际依赖的类型和 FFI 声明
@@ -362,6 +385,7 @@ impl Feature {
             syn::Item::Union(item) => Some(item.ident.to_string()),
             syn::Item::Const(item) => Some(item.ident.to_string()),
             syn::Item::Type(item) => Some(item.ident.to_string()),
+            syn::Item::Fn(item) => Some(item.sig.ident.to_string()),
             _ => None,
         }
     }
@@ -532,9 +556,9 @@ impl Feature {
         }
 
         let collected = Self::collect_items_from_files(&mod_files)?;
-        let duplicates = Self::find_duplicates(&collected.named_items, &collected.ffi_items);
+        let mut duplicates = Self::find_duplicates(&collected.named_items, &collected.ffi_items);
 
-        Self::update_lib_rs(&src_2, &duplicates, &collected.foreign_mod_template)?;
+        Self::update_lib_rs(&src_2, &mut duplicates, &collected.foreign_mod_template)?;
 
         if !duplicates.named_remove_set.is_empty() || !duplicates.ffi_remove_set.is_empty() {
             Self::remove_duplicates_from_files(&mod_files, &duplicates)?;
@@ -689,7 +713,7 @@ impl Feature {
 
     fn update_lib_rs(
         src_2: &Path,
-        duplicates: &Duplicates,
+        duplicates: &mut Duplicates,
         foreign_mod_template: &Option<syn::ItemForeignMod>,
     ) -> Result<()> {
         let lib_rs_file = src_2.parent().unwrap().join("src/lib.rs");
@@ -698,6 +722,14 @@ impl Feature {
         let mut lib_rs =
             syn::parse_file(&content).log_err(&format!("parse {}", lib_rs_file.display()))?;
         let lib_items = &mut lib_rs.items;
+        // c类型，函数都在同一个名字空间.
+        let mut used_names = HashSet::new();
+        lib_items.iter().for_each(|item| {
+            if let Some(name) = Self::item_name(item) {
+                used_names.insert(name);
+            }
+        });
+        duplicates.remove(&used_names);
 
         for type_item in &duplicates.named_to_extract {
             lib_items.push(type_item.type_def.clone());
