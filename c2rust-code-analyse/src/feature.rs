@@ -403,9 +403,8 @@ impl Feature {
     }
 
     pub fn lib_attrs() -> &'static str {
-        r#"
-// 对应__attribute__((weak))弱链接符号.
-// 构建环境需要设置变量RUSTC_BOOTSRAP=1
+r#"// 对应__attribute__((weak))弱链接符号.
+// 构建环境需要设置变量RUSTC_BOOTSTRAP=1
 #![feature(linkage)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -415,7 +414,7 @@ impl Feature {
 #![allow(improper_ctypes)]
 #![allow(unused_imports)]
 #![allow(dead_code)]
-        "#
+"#
     }
 
     fn add_cstddef_items(items: Vec<syn::Item>) -> Vec<syn::Item> {

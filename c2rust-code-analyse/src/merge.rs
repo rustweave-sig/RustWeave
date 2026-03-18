@@ -692,7 +692,7 @@ impl Feature {
         duplicates: &Duplicates,
         foreign_mod_template: &Option<syn::ItemForeignMod>,
     ) -> Result<()> {
-        let lib_rs_file = src_2.join("src/lib.rs");
+        let lib_rs_file = src_2.parent().unwrap().join("rust/src/lib.rs");
         let content =
             fs::read_to_string(&lib_rs_file).log_err(&format!("read {}", lib_rs_file.display()))?;
         let mut lib_rs =
