@@ -401,18 +401,6 @@ impl MyClangType {
             .unwrap_or(&self.qual_type)
     }
 
-    fn define_var(&self, name: &str) -> String {
-        let ty = self.typedef();
-        let (off, end) = Self::ignore_fn_range(ty);
-        //可能是数组，查找第一个[即可.
-        let insert_pos = if let Some(pos) = ty[off..end].find('[') {
-            pos + off
-        } else {
-            end
-        };
-        format!("{} {}{}", &ty[..insert_pos], name, &ty[insert_pos..])
-    }
-
     fn fill_array_size(&self, c_code: &mut String) -> Result<()> {
         let ty = Self::ignore_fn(self.typedef());
         let (off, end) = Self::ignore_fn_range(ty);
@@ -887,7 +875,7 @@ impl File {
                         code.drain(pos..);
                     }
                     code.insert_str(0, "extern ");
-                    var.ty.fill_array_size(&mut code);
+                    var.ty.fill_array_size(&mut code)?;
                 }
             }
             if let Some(rename) = node.kind.rename_macro() {
@@ -1150,29 +1138,14 @@ mod tests {
         assert!(!MyClangType::is_const_ty("const int(*)(const int)"));
     }
 
-    #[test]
-    fn test_define_var() {
-        #[allow(non_local_definitions)]
-        impl MyClangType {
-            fn new(s: &str) -> Self {
-                Self {
-                    qual_type: s.to_string(),
-                    desugared_qual_type: None,
-                }
+    #[allow(non_local_definitions)]
+    impl MyClangType {
+        fn new(s: &str) -> Self {
+            Self {
+                qual_type: s.to_string(),
+                desugared_qual_type: None,
             }
         }
-        assert_eq!(
-            MyClangType::new("const int").define_var("name"),
-            "const int name"
-        );
-        assert_eq!(
-            MyClangType::new("const int [3][4]").define_var("name"),
-            "const int  name[3][4]"
-        );
-        assert_eq!(
-            MyClangType::new("const int (*)(int)[3][4]").define_var("name"),
-            "const int (* name)(int)[3][4]"
-        );
     }
 
     #[test]

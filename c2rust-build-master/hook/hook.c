@@ -100,7 +100,7 @@ static int parse_args(int argc, char* argv[], char* extracted[], char* cfiles[])
                 if (i < argc) {
                     extracted[cnt++] = argv[i];
                 }
-        } else if (strncmp(&arg[1], "std=", 4) == 0) {
+        } else if (strncmp(&arg[1], "std=", 4) == 0 || strcmp(&arg[1], "fshort-enums") == 0) {
                 extracted[cnt++] = arg;
         }
     }
@@ -119,6 +119,17 @@ static const char* strip_prefix(const char* path, const char* prefix) {
         } else {
                 return 0;
         }
+}
+
+static void save_options(const char* path, int argc, char* argv[]) {
+        int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        if (fd == -1) {
+                return;
+        }
+        for (int i = 0; i < argc; ++i) {
+            dprintf(fd, "\"%s\" ", argv[i]);
+        }
+        close(fd);
 }
 
 static void preprocess_cfile(const char* cc, int argc, char* argv[], const char* cfile, const char* project_root, const char* feature_root) {
@@ -140,6 +151,14 @@ static void preprocess_cfile(const char* cc, int argc, char* argv[], const char*
         if (cmd_len >= sizeof(cmd)) return;
         system(cmd);
         *filename = '/'; //恢复文件名.
+
+        // 需要存储编译选项，bindgen的时候会用上, 存储的文件名后缀为.c2rust.opts
+        int len = snprintf(&full_path[full_path_len], sizeof(full_path) - full_path_len, ".opts");
+        if (len < sizeof(full_path) - full_path_len) {
+                // 如果没有生成这个文件，也继续.
+                save_options(full_path, argc, argv);
+        }
+        full_path[full_path_len] = 0;
 
         // 预处理命令, gcc和clang有差异. 不能强制用clang来替代，如果当前是gcc会导致混合构建的时候出错.
         // clang解析gcc生成的文件可能出现错误，但是仍然能够生成json文件, 具有一定容错性.
