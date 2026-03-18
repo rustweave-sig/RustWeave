@@ -3,10 +3,7 @@ use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use syn::{
-    parse::Parser,
-    visit::{visit_foreign_item, visit_item, visit_path, Visit},
-};
+use syn::visit::{visit_foreign_item, visit_item, visit_path, Visit};
 use walkdir::WalkDir;
 
 struct DepNames {
@@ -129,6 +126,29 @@ struct Duplicates {
     named_remove_set: HashSet<String>,
     ffi_to_extract: Vec<syn::ForeignItem>,
     ffi_remove_set: HashSet<String>,
+}
+
+impl Duplicates {
+    fn remove(&mut self, names: &HashSet<String>) {
+        self.named_to_extract.retain(|item| {
+            if let Some(name) = Feature::item_name(&item.type_def) {
+                if names.contains(&name) {
+                    println!("{name} - remove type item defined in mod");
+                    return false;
+                }
+            }
+            true
+        });
+        self.ffi_to_extract.retain(|item| {
+            if let Some(name) = Feature::foreign_item_name(&item) {
+                if names.contains(&name) {
+                    println!("{name} - remove foreign item defined in mod");
+                    return false;
+                }
+            }
+            true
+        });
+    }
 }
 
 impl Feature {
@@ -293,12 +313,7 @@ impl Feature {
             }
         }
         if let Some(syn::Item::Fn(mut fn_item)) = main_item {
-            let decl_file = Self::decl_filename(main_item_name);
-            Self::merge_item_fn(
-                other_items,
-                &mut fn_item,
-                &rs_file.with_file_name(decl_file),
-            )?;
+            Self::merge_item_fn(other_items, &mut fn_item)?;
             if matches!(fn_item.vis, syn::Visibility::Public(_)) {
                 PubDepVisitor(deps).visit_signature(&fn_item.sig);
             }
@@ -332,35 +347,11 @@ impl Feature {
         false
     }
 
-    // 只交换类型
-    fn merge_fn_signature(fn_item: &mut syn::ItemFn, sig: &mut syn::Signature) {
-        fn_item
-            .sig
-            .inputs
-            .iter_mut()
-            .zip(sig.inputs.iter_mut())
-            .for_each(|args| {
-                if let (syn::FnArg::Typed(ref mut arg), syn::FnArg::Typed(ref mut decl)) = args {
-                    core::mem::swap(&mut arg.ty, &mut decl.ty);
-                }
-            });
-        core::mem::swap(&mut fn_item.sig.output, &mut sig.output);
-    }
-
-    fn merge_item_fn(
-        items: Vec<syn::Item>,
-        fn_item: &mut syn::ItemFn,
-        decl_file: &Path,
-    ) -> Result<()> {
+    fn merge_item_fn(items: Vec<syn::Item>, fn_item: &mut syn::ItemFn) -> Result<()> {
         if Self::remove_private_attr(&mut fn_item.attrs) {
             fn_item.vis = syn::Visibility::Inherited;
         }
-        // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
-        let content =
-            fs::read_to_string(decl_file).log_err(&format!("read {}", decl_file.display()))?;
-        let mut sig: syn::Signature = syn::parse_str(&content)
-            .log_err(&format!("parse {} -> {content}", decl_file.display()))?;
-        Self::merge_fn_signature(fn_item, &mut sig);
+
         if items.is_empty() {
             return Ok(());
         }
@@ -394,6 +385,7 @@ impl Feature {
             syn::Item::Union(item) => Some(item.ident.to_string()),
             syn::Item::Const(item) => Some(item.ident.to_string()),
             syn::Item::Type(item) => Some(item.ident.to_string()),
+            syn::Item::Fn(item) => Some(item.sig.ident.to_string()),
             _ => None,
         }
     }
@@ -473,19 +465,6 @@ impl Feature {
                 }
             }
         }
-
-        all_types.insert(
-            "c_size_t".to_string(),
-            TypeItem::new(syn::parse_str("type c_size_t = usize;").unwrap()),
-        );
-        all_types.insert(
-            "c_ssize_t".to_string(),
-            TypeItem::new(syn::parse_str("type c_ssize_t = isize;").unwrap()),
-        );
-        all_types.insert(
-            "c_ptrdiff_t".to_string(),
-            TypeItem::new(syn::parse_str("type c_ptrdiff_t = isize;").unwrap()),
-        );
 
         let mut dep_types = Vec::new();
         let mut dep_ffi = Vec::new();
@@ -577,14 +556,9 @@ impl Feature {
         }
 
         let collected = Self::collect_items_from_files(&mod_files)?;
-        let duplicates = Self::find_duplicates(&collected.named_items, &collected.ffi_items);
+        let mut duplicates = Self::find_duplicates(&collected.named_items, &collected.ffi_items);
 
-        Self::generate_lib_rs(
-            &src_2,
-            &mod_files,
-            &duplicates,
-            &collected.foreign_mod_template,
-        )?;
+        Self::update_lib_rs(&src_2, &mut duplicates, &collected.foreign_mod_template)?;
 
         if !duplicates.named_remove_set.is_empty() || !duplicates.ffi_remove_set.is_empty() {
             Self::remove_duplicates_from_files(&mod_files, &duplicates)?;
@@ -737,13 +711,25 @@ impl Feature {
         }
     }
 
-    fn generate_lib_rs(
+    fn update_lib_rs(
         src_2: &Path,
-        mod_files: &[PathBuf],
-        duplicates: &Duplicates,
+        duplicates: &mut Duplicates,
         foreign_mod_template: &Option<syn::ItemForeignMod>,
     ) -> Result<()> {
-        let mut lib_items: Vec<syn::Item> = Vec::new();
+        let lib_rs_file = src_2.parent().unwrap().join("src/lib.rs");
+        let content =
+            fs::read_to_string(&lib_rs_file).log_err(&format!("read {}", lib_rs_file.display()))?;
+        let mut lib_rs =
+            syn::parse_file(&content).log_err(&format!("parse {}", lib_rs_file.display()))?;
+        let lib_items = &mut lib_rs.items;
+        // c类型，函数都在同一个名字空间.
+        let mut used_names = HashSet::new();
+        lib_items.iter().for_each(|item| {
+            if let Some(name) = Self::item_name(item) {
+                used_names.insert(name);
+            }
+        });
+        duplicates.remove(&used_names);
 
         for type_item in &duplicates.named_to_extract {
             lib_items.push(type_item.type_def.clone());
@@ -759,26 +745,7 @@ impl Feature {
             }
         }
 
-        let attrs: Vec<syn::Attribute> = syn::Attribute::parse_inner
-            .parse_str(Self::lib_attrs())
-            .unwrap_or_default();
-
-        let mut lib_file = syn::File {
-            shebang: None,
-            attrs,
-            items: vec![syn::parse_str("use ::core::ffi::*;").unwrap()],
-        };
-
-        lib_file.items.extend(lib_items);
-
-        for mod_file in mod_files {
-            let mod_name = mod_file.file_stem().unwrap().to_string_lossy().to_string();
-            lib_file
-                .items
-                .push(syn::parse_str(&format!("mod {mod_name};")).unwrap());
-        }
-
-        let lib_content = prettyplease::unparse(&lib_file);
+        let lib_content = prettyplease::unparse(&lib_rs);
         let lib_rs_path = src_2.join("lib.rs");
         fs::write(&lib_rs_path, lib_content.as_bytes())
             .log_err(&format!("write {}", lib_rs_path.display()))?;
@@ -922,19 +889,6 @@ mod tests {
             syn::parse_str("#[_c2rust_private_abc] #[inline] fn test() {}").unwrap();
         assert!(Feature::remove_private_attr(&mut fn_item.attrs));
         assert_eq!(fn_item.attrs.len(), 1);
-    }
-
-    #[test]
-    fn test_merge_fn_signature() {
-        let mut fn_item: syn::ItemFn =
-            syn::parse_str("fn test(a: i32, b: i64) -> i32 { 0 }").unwrap();
-        let mut sig: syn::Signature =
-            syn::parse_str("fn test(x: *const i32, y: *mut i64) -> *const i32").unwrap();
-
-        Feature::merge_fn_signature(&mut fn_item, &mut sig);
-
-        assert_eq!(fn_item.sig.inputs.len(), 2);
-        assert!(matches!(fn_item.sig.output, syn::ReturnType::Type(_, _)));
     }
 
     #[test]
@@ -1221,66 +1175,6 @@ mod tests {
 
         let result = Feature::collect_modules_from_mod_rs(&mod_dir);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_generate_lib_rs_basic() {
-        let duplicates = Duplicates {
-            named_to_extract: vec![],
-            named_remove_set: std::collections::HashSet::new(),
-            ffi_to_extract: vec![],
-            ffi_remove_set: std::collections::HashSet::new(),
-        };
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let src_2 = temp_dir.path().join("src.2");
-        fs::create_dir_all(&src_2).unwrap();
-
-        let mod_file = src_2.join("mod_test.rs");
-        fs::write(&mod_file, "pub fn foo() {} pub static BAR: i32 = 42;").unwrap();
-
-        let mod_files = vec![mod_file];
-
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
-        assert!(result.is_ok());
-
-        let lib_rs_path = src_2.join("lib.rs");
-        let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
-
-        assert!(lib_content.contains("use ::core::ffi::*;"));
-        assert!(lib_content.contains("mod mod_test;"));
-        assert!(!lib_content.contains("use mod_test as fun_foo;"));
-        assert!(!lib_content.contains("pub use mod_test::*;"));
-    }
-
-    #[test]
-    fn test_verify_no_aliases_in_lib_rs() {
-        let duplicates = Duplicates {
-            named_to_extract: vec![],
-            named_remove_set: std::collections::HashSet::new(),
-            ffi_to_extract: vec![],
-            ffi_remove_set: std::collections::HashSet::new(),
-        };
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let src_2 = temp_dir.path().join("src.2");
-        fs::create_dir_all(&src_2).unwrap();
-
-        let mod_file = src_2.join("mod_test.rs");
-        fs::write(&mod_file, "pub fn foo() {}").unwrap();
-
-        let mod_files = vec![mod_file];
-
-        let result = Feature::generate_lib_rs(&src_2, &mod_files, &duplicates, &None);
-        assert!(result.is_ok());
-
-        let lib_rs_path = src_2.join("lib.rs");
-        let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
-
-        assert!(!lib_content.contains("use mod_test as fun_"));
-        assert!(!lib_content.contains("use mod_test as var_"));
-        assert!(!lib_content.contains("as "));
-        assert!(lib_content.contains("mod mod_test;"));
     }
 
     #[test]
