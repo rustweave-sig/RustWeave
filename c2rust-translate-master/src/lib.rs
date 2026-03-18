@@ -25,6 +25,25 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::Path;
 
+/// Interval (in successfully processed files) at which periodic git GC is triggered.
+/// Increasing this value reduces GC frequency; decreasing it compacts the repo more often.
+const GIT_GC_INTERVAL: usize = 10;
+
+/// Run periodic `git reflog expire` + `git gc` every [`GIT_GC_INTERVAL`] successfully
+/// processed files to keep the `.c2rust/.git` directory from growing unbounded.
+///
+/// Should be called after every successful file translation regardless of which loop
+/// produced it, so that long runs with many skipped-file retries also get periodic
+/// compaction.  Both reflog expiry and GC failures are non-fatal (warnings only).
+fn maybe_run_periodic_git_gc(progress_state: &util::ProgressState) {
+    if progress_state.processed_count % GIT_GC_INTERVAL == 0
+        && progress_state.processed_count > 0
+    {
+        git::git_expire_reflog();
+        git::git_gc(false); // cheap periodic compaction, default prune grace period
+    }
+}
+
 /// Main translation workflow for a feature
 ///
 /// Executes the complete C to Rust translation workflow in 5 steps:
@@ -80,10 +99,16 @@ pub fn translate_feature(
 
     // Print summary even if step 5 fails, so progress is not lost
     if let Err(e) = step5_result {
+        // Compact history even when translation aborts early.
+        git::git_expire_reflog();
+        git::git_gc(true);
         stats.print_summary();
         return Err(e);
     }
 
+    // Run final aggressive GC after all translations complete to keep .git as compact as possible.
+    git::git_expire_reflog();
+    git::git_gc(true);
     stats.print_summary();
     Ok(())
 }
@@ -400,6 +425,7 @@ fn handle_skipped_files_loop(
                             progress_state.mark_processed();
                             update_interval_counter(translations_since_last_test, tests_ran);
                             save_stats_or_warn(stats, feature);
+                            maybe_run_periodic_git_gc(progress_state);
                         }
                     }
                 }
@@ -462,6 +488,7 @@ fn run_final_interval_test_if_needed(
                 "{}",
                 "✓ Final hybrid build tests passed".bright_green().bold()
             );
+            analyzer::update_code_analysis_build_success(feature)?;
         }
         Err(test_error) => {
             if should_continue_on_test_error() {
@@ -580,6 +607,7 @@ fn process_selected_files(
                 update_interval_counter(translations_since_last_test, tests_ran);
                 // Save stats immediately after successful completion.
                 save_stats_or_warn(stats, feature);
+                maybe_run_periodic_git_gc(progress_state);
             }
         }
     }
@@ -1218,7 +1246,9 @@ where
                     )
                     .yellow()
                 );
-                finalize_file_processing(feature, file_name, format_progress)?;
+                // tests_passed=false: tests ran but failed; we're only accepting because
+                // C2RUST_TEST_CONTINUE_ON_ERROR is set — this must not emit --build-success.
+                finalize_file_processing(feature, file_name, format_progress, false)?;
                 // C2RUST_TEST_CONTINUE_ON_ERROR was set: tests ran (and failed) but we're
                 // treating the failure as non-fatal and accepting the translation anyway.
                 Ok((true, true))
@@ -1314,7 +1344,12 @@ where
             "│ {}",
             "Auto-accept mode: automatically accepting translation".bright_green()
         );
-        finalize_file_processing(feature, file_name, format_progress)?;
+        finalize_file_processing(
+            feature,
+            file_name,
+            format_progress,
+            matches!(test_status, TestStatus::Passed),
+        )?;
         // In auto-accept mode we skip user interaction. Tests are considered to have
         // run only when the status is `Passed` (c2rust_test executed before this call).
         // `SkippedNoConfig` and `DeferredByInterval` both indicate tests did not run.
@@ -1351,7 +1386,7 @@ where
             match choice {
                 interaction::CompileSuccessChoice::Accept => {
                     println!("│ {}", "You chose: Accept this code".bright_cyan());
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, false)?;
                 }
                 interaction::CompileSuccessChoice::AutoAccept => {
                     println!(
@@ -1359,7 +1394,7 @@ where
                         "You chose: Auto-accept all subsequent translations".bright_cyan()
                     );
                     interaction::enable_auto_accept_mode();
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, false)?;
                 }
                 interaction::CompileSuccessChoice::ManualFix => {
                     println!("│ {}", "You chose: Manual fix".bright_cyan());
@@ -1374,7 +1409,7 @@ where
                         "│ {}",
                         "✓ Build passes after manual changes (tests skipped)".bright_green()
                     );
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, false)?;
                 }
                 interaction::CompileSuccessChoice::Exit => {
                     println!("│ {}", "You chose: Exit".yellow());
@@ -1411,7 +1446,7 @@ where
             let tests_ran = match choice {
                 interaction::CompileSuccessChoice::Accept => {
                     println!("│ {}", "You chose: Accept this code".bright_cyan());
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, false)?;
                     false
                 }
                 interaction::CompileSuccessChoice::AutoAccept => {
@@ -1420,7 +1455,7 @@ where
                         "You chose: Auto-accept all subsequent translations".bright_cyan()
                     );
                     interaction::enable_auto_accept_mode();
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, false)?;
                     false
                 }
                 interaction::CompileSuccessChoice::ManualFix => {
@@ -1436,7 +1471,7 @@ where
                         "│ {}",
                         "✓ All builds and tests pass after manual changes".bright_green()
                     );
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, true)?;
                     true // tests actually ran
                 }
                 interaction::CompileSuccessChoice::Exit => {
@@ -1468,7 +1503,7 @@ where
             match choice {
                 interaction::CompileSuccessChoice::Accept => {
                     println!("│ {}", "You chose: Accept this code".bright_cyan());
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, true)?;
                 }
                 interaction::CompileSuccessChoice::AutoAccept => {
                     println!(
@@ -1476,7 +1511,7 @@ where
                         "You chose: Auto-accept all subsequent translations".bright_cyan()
                     );
                     interaction::enable_auto_accept_mode();
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, true)?;
                 }
                 interaction::CompileSuccessChoice::ManualFix => {
                     println!("│ {}", "You chose: Manual fix".bright_cyan());
@@ -1490,7 +1525,7 @@ where
                         "│ {}",
                         "✓ All builds and tests pass after manual changes".bright_green()
                     );
-                    finalize_file_processing(feature, file_name, format_progress)?;
+                    finalize_file_processing(feature, file_name, format_progress, true)?;
                 }
                 interaction::CompileSuccessChoice::Exit => {
                     println!("│ {}", "You chose: Exit".yellow());
@@ -1503,8 +1538,22 @@ where
     }
 }
 
-/// Finalize file processing: commit changes and update analysis
-fn finalize_file_processing<F>(feature: &str, file_name: &str, format_progress: &F) -> Result<()>
+/// Finalize file processing: commit changes and update code analysis.
+///
+/// `tests_passed` must be `true` only when tests actually ran **and** passed for
+/// this translation — it causes `--build-success` to be forwarded to `code_analyse`
+/// so it can distinguish a verified translation from a skipped/deferred/failed one.
+///
+/// Pass `false` when:
+/// - tests were skipped because the test configuration was unavailable (`SkippedNoConfig`)
+/// - tests were deferred by `C2RUST_TEST_INTERVAL` and no manual re-run was triggered (`DeferredByInterval`)
+/// - tests ran but failed and the caller is continuing due to `C2RUST_TEST_CONTINUE_ON_ERROR`
+fn finalize_file_processing<F>(
+    feature: &str,
+    file_name: &str,
+    format_progress: &F,
+    tests_passed: bool,
+) -> Result<()>
 where
     F: Fn(&str) -> String,
 {
@@ -1528,7 +1577,11 @@ where
         format_progress("Update Analysis").bright_magenta().bold()
     );
     println!("│ {}", "Updating code analysis...".bright_blue());
-    analyzer::update_code_analysis(feature)?;
+    if tests_passed {
+        analyzer::update_code_analysis_build_success(feature)?;
+    } else {
+        analyzer::update_code_analysis(feature)?;
+    }
     println!("│ {}", "✓ Code analysis updated".bright_green());
 
     // Commit analysis
