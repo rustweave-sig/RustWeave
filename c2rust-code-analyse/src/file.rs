@@ -193,20 +193,7 @@ impl Kind {
         let Kind::VarDecl(var) = self else {
             return false;
         };
-
-        let typedef = &var.ty.typedef();
-
-        // 提前创建正则表达式，避免重复编译
-        let const_pattern = regex::Regex::new(r"\bconst\b").unwrap();
-
-        // 查找最后一个指针标记 * (从右向左查找，处理多级指针)
-        if let Some(last_star_pos) = typedef.rfind('*') {
-            // 检查 * 之后是否有 const（顶层 const）
-            const_pattern.is_match(&typedef[last_star_pos + 1..])
-        } else {
-            // 没有指针，检查整个类型是否有 const
-            const_pattern.is_match(typedef)
-        }
+        var.ty.is_const()
     }
 
     // root: $C2RUST_PROJECT_ROOT/.c2rust/c
@@ -412,6 +399,59 @@ impl MyClangType {
         self.desugared_qual_type
             .as_deref()
             .unwrap_or(&self.qual_type)
+    }
+
+    fn define_var(&self, name: &str) -> String {
+        let ty = self.typedef();
+        let (off, end) = Self::ignore_fn_range(ty);
+        //可能是数组，查找第一个[即可.
+        let insert_pos = if let Some(pos) = ty[off..end].find('[') {
+            pos + off
+        } else {
+            end
+        };
+        format!("{} {}{}", &ty[..insert_pos], name, &ty[insert_pos..])
+    }
+
+    fn is_const(&self) -> bool {
+        Self::is_const_ty(self.typedef())
+    }
+
+    fn is_const_ty(ty: &str) -> bool {
+        let re = regex::Regex::new(r"\bconst\b[^\*]*$").unwrap();
+        re.is_match(Self::ignore_fn(ty))
+    }
+
+    fn ignore_fn(ty: &str) -> &str {
+        let (off, end) = Self::ignore_fn_range(ty);
+        &ty[off..end]
+    }
+
+    fn ignore_fn_range(ty: &str) -> (usize, usize) {
+        let re = regex::Regex::new(r"^[^\(]*\(\s*[^\s]").unwrap();
+        let mut off = 0;
+        let mut end = ty.len();
+        while let Some(m) = re.find(&ty[off..end]) {
+            if ty.as_bytes()[off + m.len() - 1] != b'*' {
+                break;
+            }
+            off += m.len();
+            let mut cnt = 1;
+            for n in off..end {
+                match ty.as_bytes()[n] {
+                    b'(' => cnt += 1,
+                    b')' => {
+                        cnt -= 1;
+                        if cnt == 0 {
+                            end = n;
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        (off, end)
     }
 }
 
@@ -807,17 +847,12 @@ impl File {
                     }
                     code.insert_str(0, "extern ");
                 }
-            }
-            if node.kind.has_committed() {
                 // 全局变量可能是static int g_i32[] = { ... }
-                // 这种形式需要全部传递给bindgen，否则不知道其数组大小.
-                if let Kind::VarDecl(_) = node.kind {
-                    if let Some(pos) = code.find('=') {
-                        code.drain(pos..);
-                        code.push(';');
-                    }
-                    code.insert_str(0, "extern ");
+                // 数组大小只能从var.ty中提取.
+                if let Kind::VarDecl(ref var) = node.kind {
+                    code = format!("extern {};", var.ty.define_var(&var.name));
                 }
+
             }
             if let Some(rename) = node.kind.rename_macro() {
                 // 在哪里插入这个宏是一个问题，函数本身可能递归，函数前和后也可能存在一些特定的扩展属性以及注释信息.
@@ -1048,5 +1083,50 @@ mod tests {
             Some("_c2rust_private_xyz789_static_var")
         );
         assert!(node.inner[2].kind.global_name().is_none());
+    }
+
+    #[test]
+    fn test_ignore_fn() {
+        assert_eq!(
+            MyClangType::ignore_fn(" const int (* foo (int, int*) )(int, int)"),
+            " foo (int, int*) "
+        );
+        assert_eq!(
+            MyClangType::ignore_fn(" const int (*(*foo (int, int*))(const char*) )(int, int)"),
+            "foo (int, int*)"
+        );
+        assert_eq!(
+            MyClangType::ignore_fn("int foo(int, int)"),
+            "int foo(int, int)"
+        );
+    }
+
+    #[test]
+    fn test_is_const() {
+        assert!(MyClangType::is_const_ty("const int"));
+        assert!(MyClangType::is_const_ty("int const"));
+        assert!(MyClangType::is_const_ty("volatile const int"));
+        assert!(MyClangType::is_const_ty("volatile const int [3]"));
+        assert!(MyClangType::is_const_ty("volatile const int [4][3]"));
+        assert!(!MyClangType::is_const_ty("volatile const int* [4][3]"));
+        assert!(!MyClangType::is_const_ty("int const* "));
+        assert!(!MyClangType::is_const_ty("const int*"));
+        assert!(!MyClangType::is_const_ty("const int(*)(const int)"));
+    }
+
+    #[test]
+    fn test_define_var() {
+        #[allow(non_local_definitions)]
+        impl MyClangType {
+            fn new(s: &str) -> Self {
+                Self {
+                    qual_type: s.to_string(),
+                    desugared_qual_type: None,
+                }
+            }
+        }
+        assert_eq!(MyClangType::new("const int").define_var("name"), "const int name");
+        assert_eq!(MyClangType::new("const int [3][4]").define_var("name"), "const int  name[3][4]");
+        assert_eq!(MyClangType::new("const int (*)(int)[3][4]").define_var("name"), "const int (* name)(int)[3][4]");
     }
 }
