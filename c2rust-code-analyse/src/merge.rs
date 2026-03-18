@@ -2,6 +2,7 @@ use crate::{Feature, File, Result, ToError};
 use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::env::var;
 use std::path::{Path, PathBuf};
 use syn::{
     parse::Parser,
@@ -360,7 +361,9 @@ impl Feature {
             fs::read_to_string(decl_file).log_err(&format!("read {}", decl_file.display()))?;
         let mut sig: syn::Signature = syn::parse_str(&content)
             .log_err(&format!("parse {} -> {content}", decl_file.display()))?;
-        Self::merge_fn_signature(fn_item, &mut sig);
+
+        //... 暂时不需要，实际应该放到update中
+        //Self::merge_fn_signature(fn_item, &mut sig);
         if items.is_empty() {
             return Ok(());
         }
