@@ -57,11 +57,17 @@ fn print_help() {
     println!("  --update             更新feature，同步C代码和Rust文件");
     println!("  --build-success      表示代码已编译成功，启用拷贝和时间戳同步");
     println!("  --merge              合并feature，合并分散的Rust文件");
+    println!("  --sync               同步两个feature之间的Rust代码");
+    println!("  --from-feature <名>  源feature名称（配合--sync使用）");
+    println!("  --dst-feature <名>   目标feature名称（配合--sync使用）");
     println!("  -h, --help           显示此帮助信息并退出");
     println!();
     println!("说明:");
     println!("  这是一个C到Rust代码转换工具的一部分，用于管理特定feature的C/Rust代码转换。");
-    println!("  必须指定 --feature 选项和 exactly one of --init, --update, --reinit, or --merge。");
+    println!(
+        "  常规模式：必须指定 --feature 和 exactly one of --init, --update, --reinit, or --merge。"
+    );
+    println!("  同步模式：使用 --sync --from-feature <src> --dst-feature <dst>");
     println!();
     println!("示例:");
     println!("  code-analyse --feature my_feature --init");
@@ -69,6 +75,7 @@ fn print_help() {
     println!("  code-analyse --feature my_feature --update --build-success");
     println!("  code-analyse --feature my_feature --reinit");
     println!("  code-analyse --feature my_feature --merge");
+    println!("  code-analyse --sync --from-feature src_feat --dst-feature dst_feat");
 }
 
 fn main() -> Result<()> {
@@ -80,6 +87,9 @@ fn main() -> Result<()> {
         "merge",
         "reinit",
         "build-success",
+        "sync",
+        "from-feature:",
+        "dst-feature:",
         "help",
         "h"
     ];
@@ -94,6 +104,9 @@ fn main() -> Result<()> {
     let mut reinit_flag = false;
     let mut merge_flag = false;
     let mut build_success_flag = false;
+    let mut sync_flag = false;
+    let mut from_feature_name = None;
+    let mut dst_feature_name = None;
 
     // 遍历选项
     for opt in opts.opt_iter(&args_str[..]) {
@@ -119,6 +132,15 @@ fn main() -> Result<()> {
                     "build-success" => {
                         build_success_flag = true;
                     }
+                    "sync" => {
+                        sync_flag = true;
+                    }
+                    "from-feature" => {
+                        from_feature_name = arg.map(|s| s.to_string());
+                    }
+                    "dst-feature" => {
+                        dst_feature_name = arg.map(|s| s.to_string());
+                    }
                     "help" | "h" => {
                         print_help();
                         return Ok(());
@@ -131,6 +153,20 @@ fn main() -> Result<()> {
                 return Err(Error::inval());
             }
         }
+    }
+
+    if sync_flag {
+        let src_name = from_feature_name.ok_or_else(|| {
+            eprintln!("Error: --from-feature is required when --sync is specified");
+            Error::inval()
+        })?;
+        let dst_name = dst_feature_name.ok_or_else(|| {
+            eprintln!("Error: --dst-feature is required when --sync is specified");
+            Error::inval()
+        })?;
+
+        Feature::sync(&src_name, &dst_name)?;
+        return Ok(());
     }
 
     // 检查是否指定了feature
