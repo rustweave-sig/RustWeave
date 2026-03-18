@@ -413,6 +413,39 @@ impl MyClangType {
         format!("{} {}{}", &ty[..insert_pos], name, &ty[insert_pos..])
     }
 
+    fn fill_array_size(&self, c_code: &mut String) -> Result<()> {
+        let ty = Self::ignore_fn(self.typedef());
+        let (off, end) = Self::ignore_fn_range(ty);
+        let ty_without_fn = &ty[off..end];
+
+        let array_re = regex::Regex::new(r"(\[\s*\d*\s*\]\s*)+$").unwrap();
+
+        let c_code_match = if let Some(cap) = array_re.captures(c_code) {
+            cap[0].to_string()
+        } else {
+            return Ok(());
+        };
+
+        let typedef_match = if let Some(cap) = array_re.captures(ty_without_fn) {
+            cap[0].to_string()
+        } else {
+            return Err(Error::inval());
+        };
+
+        let typedef_count = typedef_match.chars().filter(|&c| c == '[').count();
+        let c_code_count = c_code_match.chars().filter(|&c| c == '[').count();
+
+        if c_code_count != typedef_count {
+            return Err(Error::inval());
+        }
+
+        let cap = array_re.captures(c_code).unwrap();
+        let (start, end) = (cap.get(0).unwrap().start(), cap.get(0).unwrap().end());
+        c_code.replace_range(start..end, &typedef_match);
+
+        Ok(())
+    }
+
     fn is_const(&self) -> bool {
         Self::is_const_ty(self.typedef())
     }
@@ -850,9 +883,12 @@ impl File {
                 // 全局变量可能是static int g_i32[] = { ... }
                 // 数组大小只能从var.ty中提取.
                 if let Kind::VarDecl(ref var) = node.kind {
-                    code = format!("extern {}", var.ty.define_var(&var.name));
+                    if let Some(pos) = code.find('=') {
+                        code.drain(pos..);
+                    }
+                    code.insert_str(0, "extern ");
+                    var.ty.fill_array_size(&mut code);
                 }
-
             }
             if let Some(rename) = node.kind.rename_macro() {
                 // 在哪里插入这个宏是一个问题，函数本身可能递归，函数前和后也可能存在一些特定的扩展属性以及注释信息.
@@ -1125,8 +1161,121 @@ mod tests {
                 }
             }
         }
-        assert_eq!(MyClangType::new("const int").define_var("name"), "const int name");
-        assert_eq!(MyClangType::new("const int [3][4]").define_var("name"), "const int  name[3][4]");
-        assert_eq!(MyClangType::new("const int (*)(int)[3][4]").define_var("name"), "const int (* name)(int)[3][4]");
+        assert_eq!(
+            MyClangType::new("const int").define_var("name"),
+            "const int name"
+        );
+        assert_eq!(
+            MyClangType::new("const int [3][4]").define_var("name"),
+            "const int  name[3][4]"
+        );
+        assert_eq!(
+            MyClangType::new("const int (*)(int)[3][4]").define_var("name"),
+            "const int (* name)(int)[3][4]"
+        );
+    }
+
+    #[test]
+    fn test_fill_array_size_all_empty() {
+        let ty = MyClangType::new("const int name [5] [10]");
+        let mut code = "const int name [] []".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name [5] [10]");
+    }
+
+    #[test]
+    fn test_fill_array_size_partial_empty() {
+        let ty = MyClangType::new("const int name [5] [10]");
+        let mut code = "const int name [] [10]".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name [5] [10]");
+    }
+
+    #[test]
+    fn test_fill_array_size_with_spaces() {
+        let ty = MyClangType::new("const int name [ 5 ] [ 10 ]");
+        let mut code = "const int name [ ] [ ]".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name [ 5 ] [ 10 ]");
+    }
+
+    #[test]
+    fn test_fill_array_size_multiple_spaces_between() {
+        let ty = MyClangType::new("const int name [5]  [10]");
+        let mut code = "const int name []  []".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name [5]  [10]");
+    }
+
+    #[test]
+    fn test_fill_array_size_no_array() {
+        let ty = MyClangType::new("const int name");
+        let mut code = "const int name".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name");
+    }
+
+    #[test]
+    fn test_fill_array_size_code_no_brackets() {
+        let ty = MyClangType::new("const int name [5]");
+        let mut code = "const int name".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name");
+    }
+
+    #[test]
+    fn test_fill_array_size_count_mismatch() {
+        let ty = MyClangType::new("const int name [5] [10]");
+        let mut code = "const int name []".to_string();
+        let result = ty.fill_array_size(&mut code);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fill_array_size_typedef_no_array_code_has() {
+        let ty = MyClangType::new("const int name");
+        let mut code = "const int name []".to_string();
+        let result = ty.fill_array_size(&mut code);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fill_array_size_many_spaces() {
+        let ty = MyClangType::new("const int name   [   5   ]   [   10   ]");
+        let mut code = "const int name   [   ]   [   ]".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name   [   5   ]   [   10   ]");
+    }
+
+    #[test]
+    fn test_fill_array_size_only_empty() {
+        let ty = MyClangType::new("const int name []");
+        let mut code = "const int name []".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name []");
+    }
+
+    #[test]
+    fn test_fill_array_size_typedef_leading_space() {
+        let ty = MyClangType::new("const int name [5]");
+        let mut code = "const int name [5]".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name [5]");
+    }
+
+    #[test]
+    fn test_fill_array_size_partial_lost() {
+        let ty = MyClangType::new("const int name [3] [7] [15]");
+        let mut code = "const int name [] [7] [15]".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name [3] [7] [15]");
+    }
+
+    #[test]
+    fn test_fill_array_size_all_correct() {
+        let ty = MyClangType::new("const int name [5] [10]");
+        let mut code = "const int name [5] [10]".to_string();
+        ty.fill_array_size(&mut code).unwrap();
+        assert_eq!(code, "const int name [5] [10]");
     }
 }
