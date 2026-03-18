@@ -2,7 +2,6 @@ use crate::{Feature, File, Result, ToError};
 use quote::{quote, ToTokens};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::env::var;
 use std::path::{Path, PathBuf};
 use syn::{
     parse::Parser,
@@ -294,11 +293,9 @@ impl Feature {
             }
         }
         if let Some(syn::Item::Fn(mut fn_item)) = main_item {
-            let decl_file = Self::decl_filename(main_item_name);
             Self::merge_item_fn(
                 other_items,
                 &mut fn_item,
-                &rs_file.with_file_name(decl_file),
             )?;
             if matches!(fn_item.vis, syn::Visibility::Public(_)) {
                 PubDepVisitor(deps).visit_signature(&fn_item.sig);
@@ -333,37 +330,14 @@ impl Feature {
         false
     }
 
-    // 只交换类型
-    fn merge_fn_signature(fn_item: &mut syn::ItemFn, sig: &mut syn::Signature) {
-        fn_item
-            .sig
-            .inputs
-            .iter_mut()
-            .zip(sig.inputs.iter_mut())
-            .for_each(|args| {
-                if let (syn::FnArg::Typed(ref mut arg), syn::FnArg::Typed(ref mut decl)) = args {
-                    core::mem::swap(&mut arg.ty, &mut decl.ty);
-                }
-            });
-        core::mem::swap(&mut fn_item.sig.output, &mut sig.output);
-    }
-
     fn merge_item_fn(
         items: Vec<syn::Item>,
         fn_item: &mut syn::ItemFn,
-        decl_file: &Path,
     ) -> Result<()> {
         if Self::remove_private_attr(&mut fn_item.attrs) {
             fn_item.vis = syn::Visibility::Inherited;
         }
-        // 替换签名，items可能存在ItemUse, 函数签名和decl_file中的不一致.
-        let content =
-            fs::read_to_string(decl_file).log_err(&format!("read {}", decl_file.display()))?;
-        let mut sig: syn::Signature = syn::parse_str(&content)
-            .log_err(&format!("parse {} -> {content}", decl_file.display()))?;
 
-        //... 暂时不需要，实际应该放到update中
-        //Self::merge_fn_signature(fn_item, &mut sig);
         if items.is_empty() {
             return Ok(());
         }
