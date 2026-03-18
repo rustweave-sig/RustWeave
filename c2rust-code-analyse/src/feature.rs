@@ -494,6 +494,16 @@ impl Feature {
         Ok(mod_name)
     }
 
+    fn append_clang_options(cmd: &mut Command, file: &File) {
+        const SHORT_ENUMS: &'static str = "-fshort-enums";
+
+        let opts = file.path().with_extension("c2rust.opts");
+        let opts = fs::read_to_string(opts).unwrap_or(String::new());
+        if opts.contains(SHORT_ENUMS) {
+            cmd.arg(SHORT_ENUMS);
+        }
+    }
+
     pub fn generate_mod_rs(
         &self,
         file: &File,
@@ -504,8 +514,8 @@ impl Feature {
         let header = file.export_header(&self.root.join("c"))?;
         fs::write(&types_h, header.as_bytes()).log_err(&format!("write {}", types_h.display()))?;
 
-        let output = Command::new("bindgen")
-            .current_dir(mod_dir)
+        let mut cmd = Command::new("bindgen");
+        cmd.current_dir(mod_dir)
             .arg(types_h)
             .arg("-o")
             .arg("mod.rs")
@@ -520,9 +530,11 @@ impl Feature {
             .arg("-fno-builtin")
             .arg("-xc")
             .arg("-Wno-duplicate-decl-specifier")
-            .arg("-Wno-attributes")
-            .output()
-            .log_err("bindgen")?;
+            .arg("-Wno-attributes");
+
+        Self::append_clang_options(&mut cmd, file);
+
+        let output = cmd.output().log_err("bindgen")?;
         if !output.status.success() {
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
             return Err(Error::last());
