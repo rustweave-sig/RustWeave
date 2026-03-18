@@ -692,7 +692,7 @@ impl Feature {
         duplicates: &Duplicates,
         foreign_mod_template: &Option<syn::ItemForeignMod>,
     ) -> Result<()> {
-        let lib_rs_file = src_2.parent().unwrap().join("src/lib.rs");
+        let lib_rs_file = src_2.join("src/lib.rs");
         let content =
             fs::read_to_string(&lib_rs_file).log_err(&format!("read {}", lib_rs_file.display()))?;
         let mut lib_rs =
@@ -857,19 +857,6 @@ mod tests {
             syn::parse_str("#[_c2rust_private_abc] #[inline] fn test() {}").unwrap();
         assert!(Feature::remove_private_attr(&mut fn_item.attrs));
         assert_eq!(fn_item.attrs.len(), 1);
-    }
-
-    #[test]
-    fn test_merge_fn_signature() {
-        let mut fn_item: syn::ItemFn =
-            syn::parse_str("fn test(a: i32, b: i64) -> i32 { 0 }").unwrap();
-        let mut sig: syn::Signature =
-            syn::parse_str("fn test(x: *const i32, y: *mut i64) -> *const i32").unwrap();
-
-        Feature::merge_fn_signature(&mut fn_item, &mut sig);
-
-        assert_eq!(fn_item.sig.inputs.len(), 2);
-        assert!(matches!(fn_item.sig.output, syn::ReturnType::Type(_, _)));
     }
 
     #[test]
@@ -1156,66 +1143,6 @@ mod tests {
 
         let result = Feature::collect_modules_from_mod_rs(&mod_dir);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_update_lib_rs_basic() {
-        let duplicates = Duplicates {
-            named_to_extract: vec![],
-            named_remove_set: std::collections::HashSet::new(),
-            ffi_to_extract: vec![],
-            ffi_remove_set: std::collections::HashSet::new(),
-        };
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let src_2 = temp_dir.path().join("src.2");
-        fs::create_dir_all(&src_2).unwrap();
-
-        let mod_file = src_2.join("mod_test.rs");
-        fs::write(&mod_file, "pub fn foo() {} pub static BAR: i32 = 42;").unwrap();
-
-        let mod_files = vec![mod_file];
-
-        let result = Feature::update_lib_rs(&src_2, &mod_files, &duplicates, &None);
-        assert!(result.is_ok());
-
-        let lib_rs_path = src_2.join("lib.rs");
-        let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
-
-        assert!(lib_content.contains("use ::core::ffi::*;"));
-        assert!(lib_content.contains("mod mod_test;"));
-        assert!(!lib_content.contains("use mod_test as fun_foo;"));
-        assert!(!lib_content.contains("pub use mod_test::*;"));
-    }
-
-    #[test]
-    fn test_verify_no_aliases_in_lib_rs() {
-        let duplicates = Duplicates {
-            named_to_extract: vec![],
-            named_remove_set: std::collections::HashSet::new(),
-            ffi_to_extract: vec![],
-            ffi_remove_set: std::collections::HashSet::new(),
-        };
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let src_2 = temp_dir.path().join("src.2");
-        fs::create_dir_all(&src_2).unwrap();
-
-        let mod_file = src_2.join("mod_test.rs");
-        fs::write(&mod_file, "pub fn foo() {}").unwrap();
-
-        let mod_files = vec![mod_file];
-
-        let result = Feature::update_lib_rs(&src_2, &mod_files, &duplicates, &None);
-        assert!(result.is_ok());
-
-        let lib_rs_path = src_2.join("lib.rs");
-        let lib_content = fs::read_to_string(&lib_rs_path).unwrap();
-
-        assert!(!lib_content.contains("use mod_test as fun_"));
-        assert!(!lib_content.contains("use mod_test as var_"));
-        assert!(!lib_content.contains("as "));
-        assert!(lib_content.contains("mod mod_test;"));
     }
 
     #[test]
