@@ -269,6 +269,108 @@ impl Feature {
         Ok(())
     }
 
+    /// 同步两个 feature 之间的 Rust 代码
+    /// 将 src_feature 中有内容的 rs 文件拷贝到 dst_feature 中对应的空 rs 文件
+    /// 条件：两个 feature 中对应的 .c 文件内容相同
+    pub fn sync(src_name: &str, dst_name: &str) -> Result<()> {
+        let project_root = crate::get_root()?;
+        let src_feature_path = project_root.join(".c2rust").join(src_name);
+        let dst_feature_path = project_root.join(".c2rust").join(dst_name);
+        let src_rust_src = src_feature_path.join("rust/src");
+        let dst_rust_src = dst_feature_path.join("rust/src");
+
+        println!("Starting sync from '{}' to '{}'...", src_name, dst_name);
+        let mut synced_count = 0;
+
+        for entry in WalkDir::new(&src_rust_src)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let src_mod_dir = entry.path();
+            if !src_mod_dir.is_dir() {
+                continue;
+            }
+
+            let mod_name = src_mod_dir
+                .file_name()
+                .ok_or(Error::inval())?
+                .to_string_lossy();
+            if !mod_name.starts_with("mod_") {
+                continue;
+            }
+
+            let dst_mod_dir = dst_rust_src.join(&*mod_name);
+
+            if !dst_mod_dir.exists() {
+                continue;
+            }
+
+            for file_entry in WalkDir::new(&src_mod_dir)
+                .min_depth(1)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let src_rs_file = file_entry.path();
+                if !src_rs_file.is_file() || src_rs_file.extension() != Some(OsStr::new("rs")) {
+                    continue;
+                }
+
+                let file_name = src_rs_file
+                    .file_name()
+                    .ok_or(Error::inval())?
+                    .to_string_lossy();
+                if !(file_name.starts_with("fun_") || file_name.starts_with("var_")) {
+                    continue;
+                }
+
+                let dst_rs_file = dst_mod_dir.join(&*file_name);
+
+                if !dst_rs_file.exists() {
+                    continue;
+                }
+
+                let dst_rs_content = fs::read_to_string(&dst_rs_file)
+                    .log_err(&format!("read {}", dst_rs_file.display()))?;
+                if !dst_rs_content.trim().is_empty() {
+                    continue;
+                }
+
+                let src_c_file = src_rs_file.with_extension("c");
+                let dst_c_file = dst_rs_file.with_extension("c");
+
+                if !src_c_file.exists() || !dst_c_file.exists() {
+                    continue;
+                }
+
+                let src_c_content = fs::read_to_string(&src_c_file)
+                    .log_err(&format!("read {}", src_c_file.display()))?;
+                let dst_c_content = fs::read_to_string(&dst_c_file)
+                    .log_err(&format!("read {}", dst_c_file.display()))?;
+
+                if src_c_content != dst_c_content {
+                    continue;
+                }
+
+                let src_rs_content = fs::read_to_string(&src_rs_file)
+                    .log_err(&format!("read {}", src_rs_file.display()))?;
+                fs::write(&dst_rs_file, src_rs_content.as_bytes())
+                    .log_err(&format!("write {}", dst_rs_file.display()))?;
+
+                println!(
+                    "  Synced: {}/{} -> {}/{}",
+                    mod_name, file_name, mod_name, file_name
+                );
+                synced_count += 1;
+            }
+        }
+
+        println!("Sync completed: {} file(s) synced", synced_count);
+        Ok(())
+    }
+
     fn set_staticlib(&self) -> Result<()> {
         let toml_path = self.root.join("rust/Cargo.toml");
         let content =
@@ -1457,5 +1559,229 @@ struct KeepStruct {
         assert!(result);
         assert_eq!(attrs.len(), 1);
         assert!(attrs[0].to_token_stream().to_string().contains("keep"));
+    }
+
+    fn create_sync_test_structure(
+        temp_dir: &Path,
+        src_name: &str,
+        dst_name: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let c2rust_dir = temp_dir.join(".c2rust");
+        fs::create_dir_all(&c2rust_dir).unwrap();
+
+        let src_feature = c2rust_dir.join(src_name);
+        let dst_feature = c2rust_dir.join(dst_name);
+
+        let src_mod = src_feature.join("rust/src/mod_a");
+        let dst_mod = dst_feature.join("rust/src/mod_a");
+        fs::create_dir_all(&src_mod).unwrap();
+        fs::create_dir_all(&dst_mod).unwrap();
+
+        let src_fun_rs = src_mod.join("fun_foo.rs");
+        let dst_fun_rs = dst_mod.join("fun_foo.rs");
+        let src_fun_c = src_mod.join("fun_foo.c");
+        let dst_fun_c = dst_mod.join("fun_foo.c");
+
+        (src_fun_rs, dst_fun_rs, src_fun_c, dst_fun_c)
+    }
+
+    #[test]
+    fn test_sync_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_root = temp_dir.path();
+
+        let (src_fun_rs, dst_fun_rs, src_fun_c, dst_fun_c) =
+            create_sync_test_structure(test_root, "src_feat", "dst_feat");
+
+        fs::write(&src_fun_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&dst_fun_rs, "").unwrap();
+        fs::write(&src_fun_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_c, "int foo() { return 42; }").unwrap();
+
+        std::env::set_current_dir(test_root).unwrap();
+        Feature::sync("src_feat", "dst_feat").unwrap();
+
+        let content = fs::read_to_string(&dst_fun_rs).unwrap();
+        assert_eq!(content.trim(), "pub fn foo() -> i32 { 42 }");
+    }
+
+    #[test]
+    fn test_sync_c_content_different() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_root = temp_dir.path();
+
+        let (src_fun_rs, dst_fun_rs, src_fun_c, dst_fun_c) =
+            create_sync_test_structure(test_root, "src_feat", "dst_feat");
+
+        fs::write(&src_fun_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&dst_fun_rs, "").unwrap();
+        fs::write(&src_fun_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_c, "int foo() { return 100; }").unwrap();
+
+        std::env::set_current_dir(test_root).unwrap();
+        Feature::sync("src_feat", "dst_feat").unwrap();
+
+        let content = fs::read_to_string(&dst_fun_rs).unwrap();
+        assert!(content.trim().is_empty());
+    }
+
+    #[test]
+    fn test_sync_target_not_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_root = temp_dir.path();
+
+        let (src_fun_rs, dst_fun_rs, src_fun_c, dst_fun_c) =
+            create_sync_test_structure(test_root, "src_feat", "dst_feat");
+
+        fs::write(&src_fun_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&dst_fun_rs, "pub fn bar() -> i32 { 100 }").unwrap();
+        fs::write(&src_fun_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_c, "int foo() { return 42; }").unwrap();
+
+        std::env::set_current_dir(test_root).unwrap();
+        Feature::sync("src_feat", "dst_feat").unwrap();
+
+        let content = fs::read_to_string(&dst_fun_rs).unwrap();
+        assert_eq!(content.trim(), "pub fn bar() -> i32 { 100 }");
+    }
+
+    #[test]
+    fn test_sync_multiple_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_root = temp_dir.path();
+
+        let c2rust_dir = test_root.join(".c2rust");
+        fs::create_dir_all(&c2rust_dir).unwrap();
+
+        let src_feature = c2rust_dir.join("src_feat");
+        let dst_feature = c2rust_dir.join("dst_feat");
+
+        let src_mod_a = src_feature.join("rust/src/mod_a");
+        let dst_mod_a = dst_feature.join("rust/src/mod_a");
+        let src_mod_b = src_feature.join("rust/src/mod_b");
+        let dst_mod_b = dst_feature.join("rust/src/mod_b");
+        fs::create_dir_all(&src_mod_a).unwrap();
+        fs::create_dir_all(&dst_mod_a).unwrap();
+        fs::create_dir_all(&src_mod_b).unwrap();
+        fs::create_dir_all(&dst_mod_b).unwrap();
+
+        let src_fun_foo_a_rs = src_mod_a.join("fun_foo.rs");
+        let dst_fun_foo_a_rs = dst_mod_a.join("fun_foo.rs");
+        let src_fun_foo_a_c = src_mod_a.join("fun_foo.c");
+        let dst_fun_foo_a_c = dst_mod_a.join("fun_foo.c");
+
+        let src_var_bar_a_rs = src_mod_a.join("var_bar.rs");
+        let dst_var_bar_a_rs = dst_mod_a.join("var_bar.rs");
+        let src_var_bar_a_c = src_mod_a.join("var_bar.c");
+        let dst_var_bar_a_c = dst_mod_a.join("var_bar.c");
+
+        let src_fun_foo_b_rs = src_mod_b.join("fun_foo.rs");
+        let dst_fun_foo_b_rs = dst_mod_b.join("fun_foo.rs");
+        let src_fun_foo_b_c = src_mod_b.join("fun_foo.c");
+        let dst_fun_foo_b_c = dst_mod_b.join("fun_foo.c");
+
+        fs::write(&src_fun_foo_a_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&dst_fun_foo_a_rs, "").unwrap();
+        fs::write(&src_fun_foo_a_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_foo_a_c, "int foo() { return 42; }").unwrap();
+
+        fs::write(&src_var_bar_a_rs, "pub static mut BAR: i32 = 100;").unwrap();
+        fs::write(&dst_var_bar_a_rs, "pub static mut BAZ: i32 = 200;").unwrap();
+        fs::write(&src_var_bar_a_c, "int BAR = 100;").unwrap();
+        fs::write(&dst_var_bar_a_c, "int BAR = 100;").unwrap();
+
+        fs::write(&src_fun_foo_b_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&dst_fun_foo_b_rs, "").unwrap();
+        fs::write(&src_fun_foo_b_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_foo_b_c, "int foo() { return 100; }").unwrap();
+
+        std::env::set_current_dir(test_root).unwrap();
+        Feature::sync("src_feat", "dst_feat").unwrap();
+
+        let content_foo_a = fs::read_to_string(&dst_fun_foo_a_rs).unwrap();
+        assert_eq!(content_foo_a.trim(), "pub fn foo() -> i32 { 42 }");
+
+        let content_bar_a = fs::read_to_string(&dst_var_bar_a_rs).unwrap();
+        assert_eq!(content_bar_a.trim(), "pub static mut BAZ: i32 = 200;");
+
+        let content_foo_b = fs::read_to_string(&dst_fun_foo_b_rs).unwrap();
+        assert!(content_foo_b.trim().is_empty());
+    }
+
+    #[test]
+    fn test_sync_module_not_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_root = temp_dir.path();
+
+        let c2rust_dir = test_root.join(".c2rust");
+        fs::create_dir_all(&c2rust_dir).unwrap();
+
+        let src_feature = c2rust_dir.join("src_feat");
+        let dst_feature = c2rust_dir.join("dst_feat");
+
+        let src_mod_a = src_feature.join("rust/src/mod_a");
+        let src_mod_b = src_feature.join("rust/src/mod_b");
+        let dst_mod_b = dst_feature.join("rust/src/mod_b");
+        fs::create_dir_all(&src_mod_a).unwrap();
+        fs::create_dir_all(&src_mod_b).unwrap();
+        fs::create_dir_all(&dst_mod_b).unwrap();
+
+        let src_fun_foo_b_rs = src_mod_b.join("fun_foo.rs");
+        let dst_fun_foo_b_rs = dst_mod_b.join("fun_foo.rs");
+        let src_fun_foo_b_c = src_mod_b.join("fun_foo.c");
+        let dst_fun_foo_b_c = dst_mod_b.join("fun_foo.c");
+
+        fs::write(&src_fun_foo_b_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&dst_fun_foo_b_rs, "").unwrap();
+        fs::write(&src_fun_foo_b_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_foo_b_c, "int foo() { return 42; }").unwrap();
+
+        std::env::set_current_dir(test_root).unwrap();
+        Feature::sync("src_feat", "dst_feat").unwrap();
+
+        let content_foo_b = fs::read_to_string(&dst_fun_foo_b_rs).unwrap();
+        assert_eq!(content_foo_b.trim(), "pub fn foo() -> i32 { 42 }");
+    }
+
+    #[test]
+    fn test_sync_dst_file_not_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_root = temp_dir.path();
+
+        let (src_fun_rs, dst_fun_rs, src_fun_c, dst_fun_c) =
+            create_sync_test_structure(test_root, "src_feat", "dst_feat");
+
+        fs::write(&src_fun_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&src_fun_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_c, "int foo() { return 42; }").unwrap();
+        fs::write(&dst_fun_rs, "").unwrap();
+        fs::remove_file(&dst_fun_rs).unwrap();
+
+        std::env::set_current_dir(test_root).unwrap();
+        Feature::sync("src_feat", "dst_feat").unwrap();
+
+        assert!(!dst_fun_rs.exists());
+    }
+
+    #[test]
+    fn test_sync_c_file_not_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let test_root = temp_dir.path();
+
+        let (src_fun_rs, dst_fun_rs, src_fun_c, dst_fun_c) =
+            create_sync_test_structure(test_root, "src_feat", "dst_feat");
+
+        fs::write(&src_fun_rs, "pub fn foo() -> i32 { 42 }").unwrap();
+        fs::write(&dst_fun_rs, "").unwrap();
+        fs::write(&dst_fun_c, "int foo() { return 42; }").unwrap();
+        fs::write(&src_fun_c, "int foo() { return 42; }").unwrap();
+        fs::remove_file(&src_fun_c).unwrap();
+
+        std::env::set_current_dir(test_root).unwrap();
+        Feature::sync("src_feat", "dst_feat").unwrap();
+
+        assert!(!src_fun_c.exists());
+        let content = fs::read_to_string(&dst_fun_rs).unwrap();
+        assert!(content.trim().is_empty());
     }
 }
