@@ -889,8 +889,8 @@ r#"// 对应__attribute__((weak))弱链接符号.
         let Ok(content) = fs::read_to_string(file) else {
             return false;
         };
-        let content = &content[..100.min(content.len())];
-        let regex = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*weak\s*\)\s*\)").unwrap();
+        let content = &content.as_bytes()[..100.min(content.len())];
+        let regex = regex::bytes::Regex::new(r"__attribute__\s*\(\s*\(\s*weak\s*\)\s*\)").unwrap();
         regex.is_match(content)
     }
 
