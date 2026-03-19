@@ -136,6 +136,8 @@ impl Feature {
             .current_dir(&self.root)
             .arg("new")
             .arg("--lib")
+            .arg("--edition")
+            .arg("2021")
             .arg("rust")
             .output()
             .log_err("cargo")?;
@@ -1095,7 +1097,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
-                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
+                    .parse_str(&format!(r#"#[export_name = "{link_name}"]"#))
                     .unwrap(),
             );
         }
@@ -1175,7 +1177,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
-                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
+                    .parse_str(&format!(r#"#[export_name = "{link_name}"]"#))
                     .unwrap(),
             );
         }

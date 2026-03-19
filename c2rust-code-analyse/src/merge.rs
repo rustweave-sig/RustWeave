@@ -838,6 +838,9 @@ mod tests {
         assert_eq!(Feature::item_name(&item), Some("MyType".to_string()));
 
         let item: syn::Item = syn::parse_str("fn my_func() {}").unwrap();
+        assert_eq!(Feature::item_name(&item), Some("my_func".to_string()));
+    
+        let item: syn::Item = syn::parse_str("use std::ffi::*;").unwrap();
         assert_eq!(Feature::item_name(&item), None);
     }
 
