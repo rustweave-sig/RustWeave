@@ -1,2 +1,4 @@
 ./c2rust-build-master/hook/*.so
 ./hybrid-build/*.so
+
+**/Cargo.lock
