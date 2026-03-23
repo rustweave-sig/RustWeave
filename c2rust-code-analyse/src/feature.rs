@@ -1321,6 +1321,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
                     syn::Item::Union(u) => self.0.contains(&u.ident.to_string()),
                     syn::Item::Type(t) => self.0.contains(&t.ident.to_string()),
                     syn::Item::Const(c) => self.0.contains(&c.ident.to_string()),
+                    syn::Item::Verbatim(_) => true,
                     _ => false,
                 };
                 if should_remove {
@@ -1332,8 +1333,9 @@ r#"// 对应__attribute__((weak))弱链接符号.
         let mut visitor = Visitor(item_names, false);
         visit_file_mut(&mut visitor, ast);
 
+        // Verbatim一定是非法语句，遇到过大模型返回这类语句，强制删除，否则prettyplease::unparse会panic.
         ast.items.retain(|item| {
-            !matches!(item, syn::Item::Verbatim(t) if t.to_string().trim().is_empty())
+            !matches!(item, syn::Item::Verbatim(_))
                 && !matches!(item, syn::Item::ForeignMod(m) if m.items.is_empty())
         });
 
