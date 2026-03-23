@@ -1,0 +1,23 @@
+# 项目概况
+
+- 项目名称：`xxHash`
+- 仓库地址：`https://github.com/Cyan4973/xxHash`
+- 本次测试提交：`82cead715cbfddd9e6093db8df95155077ce6e64`
+- 项目类型：带 CLI、benchmark 与测试集的 C 库
+- 代码规模：
+  - 跟踪文件总数：`79`
+  - `*.c` / `*.h` 文件数：`43`
+  - C 源码与头文件总行数：约 `63,596` 行
+- 关键目录：
+  - 项目根目录：`xxhash.c`、`xxhash.h`、顶层 `Makefile`
+  - `cli/`：`xxhsum` 命令实现及辅助模块
+  - `tests/`：sanity、Unicode 与 CLI 行为测试
+  - `build/`：共享 make 片段，如 `build/make/multiconf.make`
+- 原生依赖说明：
+  - 在 WSL Ubuntu 下，`gcc`、`clang`、`make`、`git` 即可完成原生构建验证
+  - CLI 翻译阶段还额外依赖 `bindgen` 与可调用的 `python`
+  - LLM 翻译阶段要求本机环境层存在有效模型配置（如 `c2rust-xw env` 或 `C2RUST_*` 环境变量）
+- 选择该项目作为 CLI 验证案例的原因：
+  - 构建与测试路径明确
+  - 复杂度高于 `cJSON`
+  - 适合作为中等复杂度的真实工程案例
