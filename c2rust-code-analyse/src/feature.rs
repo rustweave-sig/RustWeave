@@ -249,11 +249,11 @@ impl Feature {
             let mod_rs_needs_sync = Self::mod_rs_needs_sync(&mod_dir, &translated)?;
 
             // 应用更新到file的节点
-            if is_updated || mod_rs_needs_sync {
+            if is_updated || Self::update_force() || mod_rs_needs_sync {
                 changed = true;
                 Self::update_mod_rs(&mod_dir, translated)?;
-                if is_updated {
-                    // 保存file的JSON状态
+                if is_updated || Self::update_force() {
+                    // 保存 file 的 JSON 状态，并重导出 C 代码
                     file.save_json()?;
                     let code = file.export_c_code(&c_root)?;
                     let c_file = file.path().with_extension("c");
@@ -1164,7 +1164,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
-                    .parse_str(&format!(r#"#[export_name = "{link_name}"]"#))
+                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
                     .unwrap(),
             );
         }
@@ -1244,7 +1244,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
             is_changed = true;
             main_item.attrs.extend(
                 syn::Attribute::parse_outer
-                    .parse_str(&format!(r#"#[export_name = "{link_name}"]"#))
+                    .parse_str(&format!(r#"#[unsafe(export_name = "{link_name}")]"#))
                     .unwrap(),
             );
         }

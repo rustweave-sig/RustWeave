@@ -2,3 +2,5 @@
 ./hybrid-build/*.so
 
 **/Cargo.lock
+**/target/
+**/__pycache__/

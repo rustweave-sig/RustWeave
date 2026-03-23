@@ -5,13 +5,17 @@
 - P1:
   - `XXH-BUILD-001`
   - `XXH-VERIFY-001`
+  - `XXH-VERIFY-002`
   - `XXH-SKIP-001`
   - `XXH-FIX-001`
   - `XXH-FIX-002`
+  - `XXH-UX-001`
 - P2:
   - `XXH-ENV-001`
   - `XXH-DEP-002`
   - `XXH-RECOVER-001`
+  - `XXH-TOOL-001`
+  - `XXH-FEATURE-001`
 - P3:
   - `XXH-BUILD-002`
   - `XXH-CONFIG-001`
@@ -149,6 +153,78 @@
 - 希望达到的效果：工具应自动识别部分初始化状态，并能引导或自动执行干净的 reinit
 - 可选实现思路：在跳过 init 前，验证空 `rs` 占位文件是否真实存在
 
+## XXH-FEATURE-001
+
+- 编号：`XXH-FEATURE-001`
+- 层级：feature 生命周期 / 工作区恢复 / 坏文件污染
+- 现象：
+  - `feature reinit` 的设计是“保留已存在的非空 Rust 文件”
+  - 当工作区里已经存在历史坏的非空 Rust 文件时，这些文件会持续污染后续 `feature verify`
+  - 在 `xxHash` 上，`fun_XSUM_benchHash.rs` 就属于这类污染源
+- 复现方式：
+  - 对带历史坏文件的工作区直接执行：
+    - `c2rust-xw feature reinit --feature default`
+    - `c2rust-xw feature verify --feature default`
+  - 会反复撞回旧坏文件，而不是重新生成干净结果
+- 对照验证：
+  - 若先把前沿坏文件清空，再执行 `reinit + verify`
+  - 当前 `xxHash` 探针副本可以直接通过：
+    - Rust build
+    - hybrid build
+    - `make test_sanity`
+- 当前落地进展：
+  - 已新增 `c2rust-xw feature scrub --feature <name>`
+  - 当前版本会：
+    - 先跑一次 Rust build
+    - 复用真实工作流一致的构建前提（含 `RUSTC_BOOTSTRAP=1`）
+    - 收集编译器已明确报错的 `fun_*.rs` / `var_*.rs`
+    - 只清空这些坏文件
+    - 再同步 `code_analyse --update`
+    - 循环推进，直到：
+      - 构建转为 clean
+      - 进入非可清理阻塞
+      - 或达到轮次上限
+  - 在 `xxHash-scrubprobe-20260319` 上，已验证它能清掉首个污染文件：
+    - `fun_XSUM_benchHash.rs`
+  - 清理后，验证前沿已推进到：
+    - `fun_XSUM_benchFiles.rs`
+    - `fun_XSUM_autox86.rs`
+  - 进一步修正后已确认：
+    - 先前出现的 `rust/src/lib.rs` / `#![feature(linkage)]` 阻塞是 `scrub` 自身未带 `RUSTC_BOOTSTRAP=1` 造成的误判
+    - 对齐真实工作流构建前提后，该误判消失
+  - 当前在同一探针副本上已验证：
+    - `feature scrub --feature default`
+    - `feature verify --feature default`
+    可以重新回到通过状态
+- 影响：
+  - 这类污染会让用户误以为“当前 reinit/verify 链路无法打通”
+  - 实际上问题更具体，是“历史坏文件未被 feature 生命周期工具识别和清理”
+- 希望达到的效果：
+  - `feature` 能显式区分：
+    - 用户有效成果
+    - 历史坏产物
+  - 让 reinit / doctor / scrub 能对坏文件进行可控恢复，而不是只能依赖手工清空
+
+## XXH-TOOL-001
+
+- 编号：`XXH-TOOL-001`
+- 层级：产品基线一致性 / 文档与当前能力对齐
+- 现象：
+  - xxHash 历史文档中多处记录了 `translate --file` 与 `translate --max-files` 已可用
+  - 但当前迁移后的实际开发基线与已安装 `.local-dev` 工具中，这两个参数都不存在
+- 复现命令：
+  - `c2rust-xw translate --help`
+  - `c2rust-translate translate --help`
+- 影响：
+  - 当前无法按文档描述重放单文件质量探针
+  - 质量复盘与问题定位只能退回到整 feature 或手工工作区方式
+  - 容易造成“文档上已落地、当前代码里却不可用”的误判
+- 当前判断：
+  - 这更像是历史实验结论未并入当前主开发线，而不是用户使用错误
+- 希望达到的效果：
+  - 当前分支、安装产物与案例文档三者的能力边界一致
+  - 对于尚未并入当前线的能力，文档应明确标注“历史分支结论”而非“当前可用能力”
+
 ## XXH-BUILD-001
 
 - 编号：`XXH-BUILD-001`
@@ -181,6 +257,74 @@
 - 现阶段绕过方式：本次非交互 run 中无自动修复
 - 希望达到的效果：常见 FFI 安全包装应能自动处理，或至少在第一次修复尝试中完成
 - 可选实现思路：在需要时，为导入的 extern 调用自动补 `unsafe`
+
+## XXH-VERIFY-002
+
+- 编号：`XXH-VERIFY-002`
+- 层级：初始化验证 / 初始翻译产物正确性 / C 字符串字面量 lowering
+- 现象：
+  - 在当前迁移后环境中，`c2rust-xw feature verify --feature default` 已能稳定跑到真实初始化验证阶段
+  - 当前首个稳定失败文件变为：
+    - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs`
+  - 典型非法输出包括：
+    - `b""\0".as_ptr()`
+    - 含 `\r`、`\n` 的格式串在字节串中被错误转义后直接触发 Rust 语法错误
+- 复现命令：
+  - `c2rust-xw feature verify --feature default`
+- 复现证据：
+  - 当前错误定位到：
+    - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs:23`
+    - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs:34`
+    - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs:60`
+    - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs:79`
+    - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs:91`
+  - 对应 C 源为：
+    - `cli/xsum_bench.c`
+- 结构性原因：
+  - 当前翻译链路长期鼓励生成 `b"...\0".as_ptr() as *const c_char` 这一模式
+  - 但在包含空字符串参数、控制字符和格式串组合时，模型会把引号和转义序列拼坏
+  - 这不是 hybrid 问题，也不是修复循环问题，而是“首轮产物就不可编译”的 lowering 问题
+- 影响：
+  - `feature verify` 虽然已可用，但当前对该案例仍只能暴露失败，不能证明初始化基线通过
+  - `fun_XSUM_benchHash.rs` 作为 benchmark 路径较早节点，会污染后续对 `benchMem` 等更深层闭包的质量判断
+- 希望达到的效果：
+  - 对 C 字符串字面量，尤其是：
+    - 空字符串 `""`
+    - 含 `\r`、`\n`
+    - printf 风格格式串
+    提供稳定、可编译的 Rust lowering
+  - 首轮翻译结果不应在这类基础字面量上直接产生 Rust 语法错误
+- 可选实现思路：
+  - 为 C 字符串字面量增加专门的生成规范或后处理规范
+  - 对 `b"...\0"` 输出增加一次语法级校验与标准化
+  - 在提示词和 few-shot 中加入包含空字符串与控制字符的案例
+  - 状态补充：
+    - 在隔离副本中仅修正 `b""\0"` 这一处后，初始化验证已不再卡在该语法错误
+    - 说明这个问题是当前首个硬阻塞，但它同时也遮蔽了下一层真实错误族
+
+## XXH-VERIFY-003
+
+- 编号：`XXH-VERIFY-003`
+- 层级：初始化验证 / 首轮翻译产物正确性 / 基础 Rust 代码生成
+- 现象：
+  - 在隔离副本中仅修正 `fun_XSUM_benchHash.rs` 的空字符串畸形后，构建继续暴露出下一层错误：
+    - `__PRETTY_FUNCTION__` 未定义
+    - `as` 类型转换后直接链式调用方法，缺少括号
+    - 整数与浮点数混算生成 `1 * some_f64`
+    - 导入的 unsafe extern 函数未包裹 `unsafe`
+- 复现证据：
+  - `fun_XSUM_benchHash.rs`
+  - `fun_XSUM_benchFiles.rs`
+  - `fun_XSUM_autox86.rs`
+- 影响：
+  - 这说明当前首轮翻译结果在基础 Rust 语法与 FFI 约束层仍不稳定
+  - 即使解除了字符串字面量问题，也还不能把当前工作区视为“可进入更深层闭包评估”
+- 希望达到的效果：
+  - 首轮翻译应至少稳定满足：
+    - 编译器内置宏的可替代 lowering
+    - cast 后调用的合法括号结构
+    - 整数/浮点混算的显式类型转换
+    - unsafe extern 调用的最小 unsafe 包裹
 
 ## XXH-UX-001
 

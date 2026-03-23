@@ -76,7 +76,6 @@ fn main() {
 
 fn run() -> Result<(), ConfigError> {
     let cli = Cli::parse();
-    let config = Config::load()?;
 
     match cli.command {
         Commands::Config(args) => {
@@ -115,6 +114,8 @@ fn run() -> Result<(), ConfigError> {
                     "--feature can only be used with --make".to_string(),
                 ));
             }
+
+            let config = Config::load()?;
 
             // Determine the section
             let section = if args.global {

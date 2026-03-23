@@ -23,6 +23,10 @@
 - `c2rust-xw env set model ...`
 - `c2rust-xw env set base_url ...`
 - `c2rust-xw env set api_key ...`
+- `c2rust-xw feature status --feature default`
+- `c2rust-xw feature check --feature default`
+- `c2rust-xw feature doctor --feature default`
+- `c2rust-xw feature scrub --feature default`
 
 ## CLI 翻译尝试
 
@@ -35,7 +39,7 @@
 
 ## Fix-Loop 前沿观察模式
 
-该模式现在只用于观察，不再作为主线推荐路径。
+该模式现在只用于历史实验复盘，不再作为主线推荐路径。
 
 当当前目标是下列内容时，可使用该模式：
 
@@ -43,7 +47,7 @@
 - 避免 secret-wrapper 探针继续推进到 `hybrid-build-failed`
 - 先聚焦 Rust 侧自动修复行为
 
-建议的单目标修复预算：
+以下命令属于历史实验记录，不应再直接视为当前主线可重放能力：
 
 1. `src/mod_cli_xsum_bench/fun_XSUM_benchMem.rs`
    - `c2rust-xw translate --feature default --allow-all --max-fix-attempts 5 --file src/mod_cli_xsum_bench/fun_XSUM_benchMem.rs --show-full-output`
@@ -78,7 +82,15 @@
 解释：
 
 - `feature reinit` 提供干净的派生工作区
-- `feature check` 校验环境和配置是否就绪
+- `feature check` 校验环境和配置是否就绪，并输出：
+  - `translate_blockers`
+  - `verify_blockers`
+  - `test_blockers`
+  - `next_action`
+- `feature doctor` 在同一组键值之外，还会补充：
+  - `doctor_translate`
+  - `doctor_verify`
+  - `doctor_test`
 - `feature verify` 负责项目级初始化验证
 - `translate` 只负责实际翻译探针
 
@@ -91,9 +103,10 @@
 1. 准备一个共享的隔离项目副本
 2. `c2rust-xw feature reinit --feature default`
 3. `c2rust-xw feature check --feature default`
-4. `c2rust-xw feature verify --feature default --show-full-output`
-5. 在同一 shared workspace 中按依赖顺序翻译闭包成员
-6. 每次扩展后记录：
+4. `c2rust-xw feature doctor --feature default`
+5. `c2rust-xw feature verify --feature default --show-full-output`
+6. 在同一 shared workspace 中按依赖顺序翻译闭包成员
+7. 每次扩展后记录：
    - 新增的非空 Rust 文件
    - 剩余空 stub
    - 每个目标的最终阶段
@@ -172,11 +185,12 @@
 
 1. `feature reinit`
 2. `feature check`
-3. `feature verify`
-4. translate the closure members in dependency order:
+3. `feature doctor`
+4. `feature verify`
+5. translate the closure members in dependency order:
    - helpers and wrappers first
    - exported entry points last
-5. run a hybrid build after the exported entry points are in place
+6. run a hybrid build after the exported entry points are in place
 
 第一轮成功判据：
 

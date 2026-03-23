@@ -6,17 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use toml::value::Table;
 
-const MODEL_ENV_MAPPINGS: [(&str, &str); 8] = [
-    ("model", "C2RUST_MODEL"),
-    ("base_url", "C2RUST_BASE_URL"),
-    ("api_key", "C2RUST_API_KEY"),
-    ("temperature", "C2RUST_TEMPERATURE"),
-    ("top_p", "C2RUST_TOP_P"),
-    ("seed", "C2RUST_SEED"),
-    ("max_retries", "C2RUST_MAX_RETRIES"),
-    ("timeout", "C2RUST_TIMEOUT"),
-];
-
 /// Typed error returned when the translate script exits with a non-zero code.
 ///
 /// This is the only "expected" translation failure (the script ran but could not
@@ -39,6 +28,17 @@ impl std::fmt::Display for TranslationScriptFailedError {
 }
 
 impl std::error::Error for TranslationScriptFailedError {}
+
+const MODEL_ENV_MAPPINGS: [(&str, &str); 8] = [
+    ("model", "C2RUST_MODEL"),
+    ("base_url", "C2RUST_BASE_URL"),
+    ("api_key", "C2RUST_API_KEY"),
+    ("temperature", "C2RUST_TEMPERATURE"),
+    ("top_p", "C2RUST_TOP_P"),
+    ("seed", "C2RUST_SEED"),
+    ("max_retries", "C2RUST_MAX_RETRIES"),
+    ("timeout", "C2RUST_TIMEOUT"),
+];
 
 /// 从环境变量获取翻译脚本目录
 ///
@@ -69,6 +69,18 @@ fn get_translate_script_dir() -> Result<PathBuf> {
 fn get_translate_script_full_path() -> Result<PathBuf> {
     let translate_script_dir = get_translate_script_dir()?;
     Ok(translate_script_dir.join("translate_and_fix.py"))
+}
+
+fn find_python_interpreter() -> Result<&'static str> {
+    for candidate in ["python3", "python"] {
+        if Command::new(candidate).arg("--version").output().is_ok() {
+            return Ok(candidate);
+        }
+    }
+
+    anyhow::bail!(
+        "Neither `python3` nor `python` is available in PATH. Please install Python 3 or expose one of these commands."
+    )
 }
 
 /// 通过搜索 .c2rust 目录获取 config.toml 路径
@@ -156,18 +168,32 @@ fn load_user_model_config(user_env_config_path: &Path) -> Result<Option<Table>> 
     }
 }
 
+fn merge_model_tables(base: Option<Table>, override_table: Option<Table>) -> Option<Table> {
+    match (base, override_table) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(override_table)) => Some(override_table),
+        (Some(mut base), Some(override_table)) => {
+            for (key, value) in override_table {
+                base.insert(key, value);
+            }
+            Some(base)
+        }
+    }
+}
+
 fn create_runtime_config(project_config_path: &Path) -> Result<tempfile::NamedTempFile> {
     let mut project_table = load_toml_table(project_config_path)?;
     let legacy_project_model = project_table
         .remove("model")
         .and_then(|value| value.as_table().cloned());
     let user_env_config_path = get_user_env_config_path()?;
-    let runtime_model = load_user_model_config(&user_env_config_path)?.or(legacy_project_model);
+    let user_env_model = load_user_model_config(&user_env_config_path)?;
+    let runtime_model = merge_model_tables(legacy_project_model, user_env_model);
 
     let Some(model_table) = runtime_model else {
         anyhow::bail!(
-            "No model configuration found. Please configure it with `c2rust-xw env set ...`, \
-or provide C2RUST_MODEL/C2RUST_BASE_URL/C2RUST_API_KEY in the environment."
+            "No model configuration found. Please configure it with `c2rust-xw env set ...`, or provide C2RUST_MODEL/C2RUST_BASE_URL/C2RUST_API_KEY in the environment."
         );
     };
 
@@ -357,13 +383,16 @@ pub fn translate_c_to_rust(
     // 对于 var 和 fn 类型，从对应的声明文件中读取 rusttype
     let rusttype = read_rusttype_from_decl_file(rs_file);
 
+    let python = find_python_interpreter()?;
+
     println!("│ {}", "Executing translation command:".bright_blue());
     if let Some(ref rt) = rusttype {
         // Display rusttype with escaped newlines to preserve box formatting
         let rt_display = rt.replace('\n', "\\n");
         println!(
-            "│ {} python {} --config {} --type {} --c_code {} --output {} --rusttype {}",
+            "│ {} {} {} --config {} --type {} --c_code {} --output {} --rusttype {}",
             "→".bright_blue(),
+            python.bright_blue(),
             script_str.dimmed(),
             config_str.dimmed(),
             file_type.bright_yellow(),
@@ -373,8 +402,9 @@ pub fn translate_c_to_rust(
         );
     } else {
         println!(
-            "│ {} python {} --config {} --type {} --c_code {} --output {}",
+            "│ {} {} {} --config {} --type {} --c_code {} --output {}",
             "→".bright_blue(),
+            python.bright_blue(),
             script_str.dimmed(),
             config_str.dimmed(),
             file_type.bright_yellow(),
@@ -400,7 +430,7 @@ pub fn translate_c_to_rust(
         args.push(rt.as_str());
     }
 
-    let status = Command::new("python")
+    let status = Command::new(python)
         .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -540,10 +570,13 @@ pub fn fix_translation_error(
         None
     };
 
+    let python = find_python_interpreter()?;
+
     println!("│ {}", "Executing error fix command:".yellow());
     if suggestion_exists {
-        println!("│ {} python {} --config {} --type syntax_fix --c_code {} --rust_code {} --output {} --error {} --suggestion {}",
+        println!("│ {} {} {} --config {} --type syntax_fix --c_code {} --rust_code {} --output {} --error {} --suggestion {}",
             "→".yellow(),
+            python.yellow(),
             script_str.dimmed(),
             config_str.dimmed(),
             c_file_str.bright_yellow(),
@@ -552,8 +585,9 @@ pub fn fix_translation_error(
             error_file_str.dimmed(),
             suggestion_str.unwrap().bright_cyan());
     } else {
-        println!("│ {} python {} --config {} --type syntax_fix --c_code {} --rust_code {} --output {} --error {}",
+        println!("│ {} {} {} --config {} --type syntax_fix --c_code {} --rust_code {} --output {} --error {}",
             "→".yellow(),
+            python.yellow(),
             script_str.dimmed(),
             config_str.dimmed(),
             c_file_str.bright_yellow(),
@@ -573,7 +607,7 @@ pub fn fix_translation_error(
         suggestion_str,
     );
 
-    let status = Command::new("python")
+    let status = Command::new(python)
         .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -712,6 +746,25 @@ mod tests {
 
         let path = result.unwrap();
         assert_eq!(path, PathBuf::from("/path/to/scripts/translate_and_fix.py"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_find_python_interpreter_prefers_python3() {
+        let path_guard = EnvVarGuard::new("PATH");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let python3_path = temp_dir.path().join("python3");
+        std::fs::write(&python3_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&python3_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&python3_path, perms).unwrap();
+        }
+        path_guard.set(temp_dir.path().to_str().unwrap());
+
+        assert_eq!(find_python_interpreter().unwrap(), "python3");
     }
 
     #[test]
@@ -863,6 +916,46 @@ mod tests {
 
         assert_eq!(model.get("model").unwrap().as_str(), Some("legacy"));
         assert_eq!(model.get("api_key").unwrap().as_str(), Some("legacy-key"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_runtime_config_merges_partial_user_env_with_legacy_project_model() {
+        let home_guard = EnvVarGuard::new("HOME");
+        let xdg_guard = EnvVarGuard::new("XDG_CONFIG_HOME");
+        let env_file_guard = EnvVarGuard::new("C2RUST_XW_ENV_FILE");
+        let model_guard = EnvVarGuard::new("C2RUST_MODEL");
+        let api_key_guard = EnvVarGuard::new("C2RUST_API_KEY");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_config = temp_dir.path().join("project.toml");
+        std::fs::write(
+            &project_config,
+            "[model]\nmodel = \"legacy-model\"\napi_key = \"legacy-key\"\nbase_url = \"https://legacy.invalid/v1\"\ntimeout = 100\n\n[feature.default]\n\"build.cmd\" = \"make\"\n",
+        )
+        .unwrap();
+
+        let user_env = temp_dir.path().join("env.toml");
+        std::fs::write(&user_env, "[model]\napi_key = \"user-key\"\n").unwrap();
+
+        home_guard.set(temp_dir.path().to_str().unwrap());
+        xdg_guard.remove();
+        env_file_guard.set(user_env.to_str().unwrap());
+        model_guard.remove();
+        api_key_guard.remove();
+
+        let runtime_config = create_runtime_config(&project_config).unwrap();
+        let runtime_toml = std::fs::read_to_string(runtime_config.path()).unwrap();
+        let parsed: toml::Value = toml::from_str(&runtime_toml).unwrap();
+        let model = parsed.get("model").unwrap().as_table().unwrap();
+
+        assert_eq!(model.get("model").unwrap().as_str(), Some("legacy-model"));
+        assert_eq!(
+            model.get("base_url").unwrap().as_str(),
+            Some("https://legacy.invalid/v1")
+        );
+        assert_eq!(model.get("api_key").unwrap().as_str(), Some("user-key"));
+        assert_eq!(model.get("timeout").unwrap().as_integer(), Some(100));
     }
 
     #[test]

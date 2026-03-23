@@ -2,6 +2,31 @@
 
 ## 1. 一页摘要
 
+- 补充到 `2026-03-19` 的最新状态：
+  - 迁移后机器上的 `feature check/verify` 链路已重新打通
+  - 非 TTY 场景不再因交互提示直接崩溃
+  - `feature check` 在 `xxHash` 上已从 `blocked` 降为 `degraded`
+  - `feature check` 已可直接暴露恢复诊断：
+    - `scrub_probe = recoverable_with_scrub`
+    - `scrub_candidate = .../fun_XSUM_benchHash.rs`
+    - `translate_blockers = none`
+    - `verify_blockers = none`
+    - `test_blockers = ...`
+    - `next_action = c2rust-xw feature scrub --feature default`
+  - 当前主工作区的真实问题不是“verify 永久打不通”
+  - 而是历史坏的非空 Rust 文件会继续污染后续 `verify`
+  - 对应恢复入口 `feature scrub` 已落地
+  - 在 `xxHash-scrubprobe-20260319` 上已验证：
+    - `feature scrub` 后可恢复到 `status = clean`
+    - 随后 `feature verify` 重新完整通过
+  - `fun_XSUM_benchHash.rs` 仍是当前首个污染前沿
+  - 其首类翻译错误仍是字符串字面量 lowering 问题
+  - 先前的 `lib.rs / #![feature(linkage)]` 阻塞已确认是 `scrub` 构建前提不一致导致的误判，现已修正
+  - 新增问题编号：
+    - `XXH-FEATURE-001`
+    - `XXH-VERIFY-002`
+    - `XXH-UX-001`
+
 - `xxHash` 已可作为 `c2rust-xw` 的 `hybrid-pass` 工程样例。
 - 但它还不能作为 benchmark 路径已经 Rust-closed 的质量样例。
 - 当前 `xxhsum` 最小候选集合为 `23` 个节点：
@@ -96,9 +121,11 @@
    - `c2rust-xw feature check --feature default`
    - `c2rust-xw feature verify --feature default --show-full-output`
 
-3. 单文件与有界探针
+3. 历史上的单文件与有界探针
+   - 历史实验中曾使用：
    - `--max-files 1`
    - `--file <relative-rs-path>`
+   - 但当前主线代码与本机 `.local-dev` 安装产物不应再表述为已包含这两个能力
 
 4. 小闭包与 shared closure 验证
    - Tier-1：`XSUM_autox86`
@@ -112,11 +139,16 @@
 当前产品侧已验证的关键修复包括：
 
 - `feature` 接管工作区准备与项目级校验
-- `translate --file` 的 fix-scope 限定
-- `translate --file` 的 validation-scope freeze
+- `feature scrub` 提供污染工作区恢复入口
 - stale registry / stale archive 修复
 - 非 TTY 成功后提示默认 `Accept`
 - skip-and-report 统一记录阶段、TTY 状态和错误摘要
+
+补充说明：
+
+- 历史实验中曾验证过 `translate --file` 的 fix-scope 限定
+- 历史实验中曾验证过 `translate --file` 的 validation-scope freeze
+- 但这些结论当前只能视为历史实验结论，不应表述为当前主线已可直接重放的能力
 
 ## 5. 为 CLI 配置的大模型
 
@@ -150,6 +182,7 @@
 
 - `xxHash` 已经证明 CLI 可以在真实项目上完成：
   - feature 工作区准备
+  - 污染工作区恢复
   - 代码分析同步
   - hybrid link
   - 基础 sanity test
@@ -158,6 +191,10 @@
   - Rust build 通过
   - hybrid build 通过
   - `make test_sanity` 通过
+- 在 `testing/projects/xxHash-scrubprobe-20260319` 上，已验证：
+  - `feature check` 可提前识别 `recoverable_with_scrub`
+  - `feature scrub` 后工作区恢复到 `status = clean`
+  - 随后 `feature verify` 再次完整通过
 
 ### 6.2 还没有证明的能力
 
@@ -174,7 +211,14 @@
 因此现阶段必须区分：
 
 - `hybrid-pass`
+- `scrub-recoverable`
 - `rust-closure-pass`
+
+其中：
+
+- `hybrid-pass` 表示当前样例已能完成 Rust build、hybrid build 和基础测试
+- `scrub-recoverable` 表示当前污染工作区可通过标准恢复入口重新回到可验证状态
+- `rust-closure-pass` 才表示目标闭包已经主要由非空 Rust 单元闭合，不再大量依赖空 stub 和 C fallback
 
 前者已经成立，后者还没有。
 

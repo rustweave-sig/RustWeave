@@ -3,12 +3,14 @@
 ## 一句话结论
 
 - `xxHash` 已经可以作为一个可靠的 `hybrid-pass` 工程样例。
+- `xxHash` 现在也可以作为一个 `scrub-recoverable` 恢复样例。
 - 但它还不能被表述为“benchmark 子路径已经 Rust-closed”的质量样例。
 
 ## 这次验证真正证明了什么
 
 - CLI 已经能在真实项目上完成：
   - feature 工作区准备
+  - 污染工作区恢复
   - 代码分析同步
   - hybrid link
   - 基础 sanity test
@@ -16,6 +18,15 @@
   - Rust build 通过
   - hybrid build 通过
   - `make test_sanity` 通过
+- 在 `testing/projects/xxHash-scrubprobe-20260319` 上，已验证：
+  - `feature check` 可提前给出 `scrub_probe = recoverable_with_scrub`
+  - 同时会输出：
+    - `translate_blockers`
+    - `verify_blockers`
+    - `test_blockers`
+    - `next_action`
+  - `feature scrub` 后工作区恢复到 `status = clean`
+  - 随后 `feature verify` 再次完整通过
 
 ## 这次验证没有证明什么
 
@@ -35,8 +46,19 @@
   - `fun_XSUM_strcatDup.rs`
   - `var_g_hashesToBench.rs`
   - 多个 `fun_localXXH*.rs`
+- 这次验证也没有证明历史文档里提到的 `translate --file/--max-files` 已在当前主线可用。
+- 相关单文件探针结论目前只能作为历史实验参考，不能当作当前基线能力说明。
 
 ## 最新前沿修正
+
+- 当前主工作区首先暴露的不是新的 hybrid 非闭包问题。
+- 更准确的说法是：
+  - 历史坏的非空 Rust 文件会污染后续 `feature verify`
+  - 当前首个污染前沿落在 `fun_XSUM_benchHash.rs`
+  - `feature scrub` 已提供标准恢复入口
+- 先前一度出现的 `lib.rs / #![feature(linkage)]` 阻塞是误判：
+  - 根因是早期 `scrub` 探测没有带上真实工作流里的 `RUSTC_BOOTSTRAP=1`
+  - 对齐构建前提后，该误判已消失
 
 - 之前容易把剩余问题概括成“3 个节点都卡在 build-fix-loop”。
 - 现在更准确的表述是：
@@ -63,6 +85,7 @@
    - 现在容易把 `hybrid-pass` 误读成“Rust 翻译质量已达标”
    - 建议区分：
    - `hybrid-pass`
+   - `scrub-recoverable`
    - `rust-closure-pass`
 
 2. 生成代码仍携带本机绝对路径

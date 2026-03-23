@@ -137,8 +137,11 @@
 本次没有直接追求“全项目一次翻完”，而是采用工程上更可控的方式：
 
 1. 先做有界探针
+   - 历史实验中曾使用：
    - `--max-files 1`
    - `--file <relative-rs-path>`
+   - 这些能力应只视为历史实验记录
+   - 当前主线代码与当前本机安装产物不应直接表述为已包含这两个能力
 
 2. 再做 feature 边界验证
    - `feature reinit`
@@ -152,6 +155,7 @@
 典型命令包括：
 
 - 单文件探针：
+  - 以下命令属于历史实验记录，不应直接视为当前主线已可重放能力：
   - `c2rust-xw translate --feature default --allow-all --max-fix-attempts 1 --file src/mod_cli_xsum_bench/fun_XSUM_clockSpan.rs --show-full-output`
 - feature 边界验证：
   - `c2rust-xw feature reinit --feature default`
@@ -163,6 +167,48 @@
   - `testing/scripts/hybrid-batch-probe ...`
 
 ### 3.4 当前转换结果
+
+补充到 `2026-03-19` 的最新口径：
+
+- 在迁移后的 Ubuntu 机器上，`feature` 生命周期链路已重新打通：
+  - `feature check` 可稳定执行
+  - `feature verify` 可稳定执行
+  - 非 TTY 场景不再因交互提示直接崩溃
+- 当前主工作区 `testing/projects/xxHash` 的 `feature check` 状态为：
+  - `degraded`
+  - 当前阶段化输出已能区分：
+    - `translate_blockers = none`
+    - `verify_blockers = none`
+    - `test_blockers = ...`
+  - 当前常规 warning 仍包括：`translation_stats_missing`
+  - 同时已能额外暴露恢复诊断：
+    - `scrub_probe = recoverable_with_scrub`
+    - `scrub_candidate = .../fun_XSUM_benchHash.rs`
+    - `next_action = c2rust-xw feature scrub --feature default`
+- 这说明当前主工作区并不是“验证链路彻底打不通”，而是：
+  - 历史坏的非空 Rust 文件仍在污染后续 `feature verify`
+  - 当前污染前沿首先落在 `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs`
+- 该前沿暴露出的首类真实翻译错误仍然成立：
+  - 空字符串 `""` 被错误生成为 `b""\0"`
+  - 含 `\r`、`\n` 的格式串在 Rust 字节串中被错误转义
+- 但更准确的产品结论已经从“verify 卡在 benchHash”前移为：
+  - `feature reinit` 不会自动清除历史坏的非空 Rust 文件
+  - 因而需要一个显式恢复入口，把污染工作区重新带回可验证状态
+- 当前这条恢复链路已经落地为：
+  - `c2rust-xw feature scrub --feature default`
+  - 它会在与真实工作流一致的 Rust 构建前提下运行（含 `RUSTC_BOOTSTRAP=1`）
+  - 多轮清理编译器已明确报错的 `fun_*.rs` / `var_*.rs`
+  - 并执行 `code_analyse --update` 重新同步工作区状态
+- 在隔离探针副本 `testing/projects/xxHash-scrubprobe-20260319` 上，已经验证：
+  - `feature scrub` 可将污染工作区恢复到 `status = clean`
+  - 随后 `feature verify` 可重新完整通过
+  - Rust build 通过
+  - hybrid build 通过
+  - `make test_sanity` 通过
+- 先前一度出现的 `rust/src/lib.rs` / `#![feature(linkage)]` 阻塞已确认是误判：
+  - 原因不是新的源码 blocker
+  - 而是早期 `scrub` 探测时没有复用真实工作流里的 `RUSTC_BOOTSTRAP=1`
+  - 对齐构建前提后，该误判已消失
 
 从工程验证角度：
 
@@ -194,7 +240,9 @@
 因此当前最准确的描述是：
 
 - `xxHash` 已可作为“hybrid 集成验证样例”
+- `xxHash` 也已可作为“污染工作区可恢复性”验证样例
 - 但还不能直接表述为“完整 Rust 化质量样例”
+- 历史上围绕 `translate --file/--max-files` 得出的局部结论，不应再直接当作当前主线能力说明
 
 补充到 `2026-03-13` 的最新口径：
 

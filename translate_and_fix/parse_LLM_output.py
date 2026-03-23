@@ -1,5 +1,32 @@
 import re
 
+
+def normalize_common_byte_string_literals(text):
+    """
+    修正常见的 C 字符串字面量翻译畸形。
+
+    当前已知高频问题：
+    - 空字符串 "" 被错误翻译为 b""\\0"
+    其本意应为带 NUL 终止符的空字节串 b"\\0"
+    """
+    return text.replace('b""\\0"', 'b"\\0"')
+
+
+def normalize_pretty_function_identifier(text):
+    """
+    将未解析的 __PRETTY_FUNCTION__ 归一化为当前函数名对应的 C 风格字符串常量。
+
+    当前 translate_and_fix 的典型输入/输出是单文件单函数，因此这里取首个函数名。
+    若未找到函数名，则保留原文本不改写。
+    """
+    match = re.search(r'\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', text)
+    if not match:
+        return text
+
+    fn_name = match.group(1)
+    replacement = f'b"{fn_name}\\\\0".as_ptr() as *const ::core::ffi::c_char'
+    return re.sub(r'\b__PRETTY_FUNCTION__\b', replacement, text)
+
 def filter_model_response(response):
     """
     过滤大模型回复中开头的额外内容，保留符合prompt要求的输出格式，并移除'Rust翻译结果:'前缀
@@ -115,11 +142,23 @@ def filter_model_response(response):
     except Exception as e:
         raise RuntimeError(f"ERROR - 过滤大模型输出-删除代码块标记符出错: {e}") from e
 
-    # 替换 #[no_mangle] 为 #[unsafe(no_mangle)]
+    # 规范化 Rust 2024 下需要 unsafe 包裹的属性
     try:
         final_response = final_response.replace("#[no_mangle]", "#[unsafe(no_mangle)]")
+        final_response = re.sub(
+            r'#\[\s*export_name\s*=\s*([^\]]+)\]',
+            r'#[unsafe(export_name = \1)]',
+            final_response,
+        )
     except Exception as e:
-        raise RuntimeError(f"ERROR - 过滤大模型输出-替换no_mangle为unsafe(no_mangle)出错: {e}") from e
+        raise RuntimeError(f"ERROR - 过滤大模型输出-规范化unsafe属性出错: {e}") from e
+
+    # 修正常见的字节串翻译畸形，避免基础字符串 lowering 直接产出不可编译代码
+    try:
+        final_response = normalize_common_byte_string_literals(final_response)
+        final_response = normalize_pretty_function_identifier(final_response)
+    except Exception as e:
+        raise RuntimeError(f"ERROR - 过滤大模型输出-修正常见字节串字面量出错: {e}") from e
 
     # use super::* 处理（全局查找，不限于开头）
     try:

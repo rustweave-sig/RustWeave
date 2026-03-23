@@ -8,6 +8,7 @@ This tool integrates c2rust subcommands into a single CLI interface:
 
 - **init** - Initialize a c2rust project structure
 - **env** - Manage user-level model and secret configuration
+- **feature** - Inspect, diagnose, verify, and recover feature workspaces
 - **build** - Execute C project build commands
 - **test** - Execute C project test commands
 - **clean** - Clean build artifacts
@@ -99,6 +100,11 @@ c2rust-xw build --no-interactive -- cmake --build .
 - `--no-interactive` - Run in non-interactive mode
 - `-- <build_cmd>` - Build command to execute (required)
 
+When executed inside a project workspace that contains `.c2rust/`, `build` now runs a lightweight preflight before invoking the underlying tool. It currently blocks early on:
+
+- incomplete feature build config
+- missing `libhook` / `C2RUST_HOOK_LIB`
+
 #### 4. Test
 
 Execute test commands for your C project:
@@ -111,6 +117,8 @@ c2rust-xw test --feature <name> -- ctest
 **Options:**
 - `--feature <name>` - Specify a feature name
 - `-- <test_cmd>` - Test command to execute (required)
+
+When executed inside a project workspace that contains `.c2rust/`, `test` now performs a lightweight preflight and blocks early if the feature-level test config is incomplete.
 
 #### 5. Clean
 
@@ -145,7 +153,55 @@ c2rust-xw translate --show-full-output
 
 `translate` reads project build/test/clean settings from `<project>/.c2rust/config.toml`, and reads model configuration from the user-level env layer (`c2rust-xw env ...`) or from `C2RUST_MODEL` / `C2RUST_BASE_URL` / `C2RUST_API_KEY`.
 
-#### 7. Merge
+When executed inside a project workspace that contains `.c2rust/`, `translate` now reuses the same feature preflight view as `feature check/doctor`. It blocks early on issues such as:
+
+- missing model config
+- missing `bindgen`
+- missing `python3` / `python`
+- missing translate script directory
+- incomplete feature build/clean config
+
+If the current directory is not a c2rust project root, the CLI keeps the previous behavior and does not force this preflight.
+
+#### 7. Feature
+
+Inspect and manage feature workspaces:
+
+```bash
+c2rust-xw feature status --feature default
+c2rust-xw feature check --feature default
+c2rust-xw feature doctor --feature default
+c2rust-xw feature verify --feature default --show-full-output
+c2rust-xw feature scrub --feature default
+```
+
+`feature status/check/doctor` now expose a staged readiness view:
+
+- `translate_blockers`
+- `verify_blockers`
+- `test_blockers`
+- `next_action`
+
+They also print human-readable summaries such as:
+
+- `translate_summary`
+- `verify_summary`
+- `test_summary`
+
+`feature doctor` adds a compact diagnosis layer:
+
+- `doctor_translate`
+- `doctor_verify`
+- `doctor_test`
+
+Current behavior by command:
+
+- `feature check` returns blocked/degraded/ready with machine-readable keys and next action hints
+- `feature doctor` returns the same staged data plus a more compact diagnosis summary
+- `feature verify` now runs a preflight before invoking translate-side verify
+- `feature scrub` clears compiler-confirmed broken `fun_*.rs` / `var_*.rs` files and re-syncs workspace state
+
+#### 8. Merge
 
 Merge translated Rust modules (executed after translate):
 
