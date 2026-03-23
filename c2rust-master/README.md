@@ -4,9 +4,10 @@ A unified command-line tool for C to Rust translation and build management.
 
 ## Overview
 
-This tool integrates six c2rust subcommands into a single CLI interface:
+This tool integrates c2rust subcommands into a single CLI interface:
 
 - **init** - Initialize a c2rust project structure
+- **env** - Manage user-level model and secret configuration
 - **build** - Execute C project build commands
 - **test** - Execute C project test commands
 - **clean** - Clean build artifacts
@@ -69,7 +70,21 @@ Initialize a `.c2rust` directory structure:
 c2rust-xw init
 ```
 
-#### 2. Build
+#### 2. Env
+
+Manage user-level environment configuration. These settings are stored outside the project and are intended for model endpoints, API keys, and other machine-local values.
+
+```bash
+c2rust-xw env set model qwen3-max
+c2rust-xw env set base_url https://dashscope.aliyuncs.com/compatible-mode/v1
+c2rust-xw env set api_key your-api-key
+c2rust-xw env list
+c2rust-xw env export
+```
+
+By default, the config file is stored at `~/.config/c2rust-xw/env.toml` on Linux/WSL. You can override this path with `C2RUST_XW_ENV_FILE`.
+
+#### 3. Build
 
 Execute build commands for your C project:
 
@@ -84,7 +99,7 @@ c2rust-xw build --no-interactive -- cmake --build .
 - `--no-interactive` - Run in non-interactive mode
 - `-- <build_cmd>` - Build command to execute (required)
 
-#### 3. Test
+#### 4. Test
 
 Execute test commands for your C project:
 
@@ -97,7 +112,7 @@ c2rust-xw test --feature <name> -- ctest
 - `--feature <name>` - Specify a feature name
 - `-- <test_cmd>` - Test command to execute (required)
 
-#### 4. Clean
+#### 5. Clean
 
 Execute clean commands to remove build artifacts:
 
@@ -110,7 +125,7 @@ c2rust-xw clean --feature <name> -- rm -rf build/
 - `--feature <name>` - Specify a feature name
 - `-- <clean_cmd>` - Clean command to execute (required)
 
-#### 5. Translate
+#### 6. Translate
 
 Translate C code to Rust:
 
@@ -128,7 +143,9 @@ c2rust-xw translate --show-full-output
 - `--max-fix-attempts <n>` - Maximum number of fix attempts (optional, uses translator's default if omitted)
 - `--show-full-output` - Show full output during translation
 
-#### 6. Merge
+`translate` reads project build/test/clean settings from `<project>/.c2rust/config.toml`, and reads model configuration from the user-level env layer (`c2rust-xw env ...`) or from `C2RUST_MODEL` / `C2RUST_BASE_URL` / `C2RUST_API_KEY`.
+
+#### 7. Merge
 
 Merge translated Rust modules (executed after translate):
 
@@ -149,19 +166,24 @@ c2rust-xw merge <additional_args>
 # 1. Initialize a c2rust project
 c2rust-xw init
 
-# 2. Build your C project
+# 2. Configure user-level model env
+c2rust-xw env set model qwen3-max
+c2rust-xw env set base_url https://dashscope.aliyuncs.com/compatible-mode/v1
+c2rust-xw env set api_key your-api-key
+
+# 3. Build your C project
 c2rust-xw build -- make
 
-# 3. Run tests
+# 4. Run tests
 c2rust-xw test -- make test
 
-# 4. Translate to Rust
+# 5. Translate to Rust
 c2rust-xw translate
 
-# 5. Merge translated modules
+# 6. Merge translated modules
 c2rust-xw merge
 
-# 6. Clean up
+# 7. Clean up
 c2rust-xw clean -- make clean
 ```
 

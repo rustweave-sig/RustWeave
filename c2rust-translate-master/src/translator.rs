@@ -4,6 +4,18 @@ use colored::Colorize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use toml::value::Table;
+
+const MODEL_ENV_MAPPINGS: [(&str, &str); 8] = [
+    ("model", "C2RUST_MODEL"),
+    ("base_url", "C2RUST_BASE_URL"),
+    ("api_key", "C2RUST_API_KEY"),
+    ("temperature", "C2RUST_TEMPERATURE"),
+    ("top_p", "C2RUST_TOP_P"),
+    ("seed", "C2RUST_SEED"),
+    ("max_retries", "C2RUST_MAX_RETRIES"),
+    ("timeout", "C2RUST_TIMEOUT"),
+];
 
 /// Typed error returned when the translate script exits with a non-zero code.
 ///
@@ -60,9 +72,115 @@ fn get_translate_script_full_path() -> Result<PathBuf> {
 }
 
 /// 通过搜索 .c2rust 目录获取 config.toml 路径
-fn get_config_path() -> Result<PathBuf> {
+fn get_project_config_path() -> Result<PathBuf> {
     let project_root = util::find_project_root()?;
     Ok(project_root.join(".c2rust/config.toml"))
+}
+
+fn get_user_env_config_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("C2RUST_XW_ENV_FILE") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    if let Ok(xdg_config_home) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = xdg_config_home.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed).join("c2rust-xw").join("env.toml"));
+        }
+    }
+
+    let home = std::env::var("HOME")
+        .context("HOME is not set; cannot resolve the user-level c2rust-xw env config")?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("c2rust-xw")
+        .join("env.toml"))
+}
+
+fn parse_env_override_value(key: &str, raw: String) -> toml::Value {
+    match key {
+        "temperature" | "top_p" => raw
+            .parse::<f64>()
+            .map(toml::Value::Float)
+            .unwrap_or_else(|_| toml::Value::String(raw)),
+        "seed" | "max_retries" | "timeout" => raw
+            .parse::<i64>()
+            .map(toml::Value::Integer)
+            .unwrap_or_else(|_| toml::Value::String(raw)),
+        _ => toml::Value::String(raw),
+    }
+}
+
+fn load_toml_table(path: &Path) -> Result<Table> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read TOML file: {}", path.display()))?;
+    let value: toml::Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse TOML file: {}", path.display()))?;
+    value
+        .as_table()
+        .cloned()
+        .with_context(|| format!("TOML root is not a table: {}", path.display()))
+}
+
+fn load_user_model_config(user_env_config_path: &Path) -> Result<Option<Table>> {
+    let mut model = if user_env_config_path.exists() {
+        let table = load_toml_table(user_env_config_path)?;
+        table
+            .get("model")
+            .and_then(|value| value.as_table())
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Table::new()
+    };
+
+    for (key, env_key) in MODEL_ENV_MAPPINGS {
+        if let Ok(raw) = std::env::var(env_key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                model.insert(
+                    key.to_string(),
+                    parse_env_override_value(key, trimmed.to_string()),
+                );
+            }
+        }
+    }
+
+    if model.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(model))
+    }
+}
+
+fn create_runtime_config(project_config_path: &Path) -> Result<tempfile::NamedTempFile> {
+    let mut project_table = load_toml_table(project_config_path)?;
+    let legacy_project_model = project_table
+        .remove("model")
+        .and_then(|value| value.as_table().cloned());
+    let user_env_config_path = get_user_env_config_path()?;
+    let runtime_model = load_user_model_config(&user_env_config_path)?.or(legacy_project_model);
+
+    let Some(model_table) = runtime_model else {
+        anyhow::bail!(
+            "No model configuration found. Please configure it with `c2rust-xw env set ...`, \
+or provide C2RUST_MODEL/C2RUST_BASE_URL/C2RUST_API_KEY in the environment."
+        );
+    };
+
+    project_table.insert("model".to_string(), toml::Value::Table(model_table));
+    let runtime_toml =
+        toml::to_string_pretty(&project_table).context("Failed to serialize runtime config")?;
+
+    let mut temp_file =
+        tempfile::NamedTempFile::new().context("Failed to create runtime config file")?;
+    temp_file
+        .write_all(runtime_toml.as_bytes())
+        .context("Failed to write runtime config file")?;
+    Ok(temp_file)
 }
 
 /// 构造与给定 rs 文件对应的声明文件路径
@@ -201,7 +319,8 @@ pub fn translate_c_to_rust(
     util::validate_feature_name(feature)?;
 
     let project_root = util::find_project_root()?;
-    let config_path = get_config_path()?;
+    let project_config_path = get_project_config_path()?;
+    let runtime_config = create_runtime_config(&project_config_path)?;
     let work_dir = project_root.join(".c2rust").join(feature).join("rust");
 
     if !work_dir.exists() {
@@ -224,9 +343,10 @@ pub fn translate_c_to_rust(
         .to_str()
         .with_context(|| format!("Non-UTF8 path: {}", script_path.display()))?;
 
-    let config_str = config_path
+    let config_str = runtime_config
+        .path()
         .to_str()
-        .with_context(|| format!("Non-UTF8 path: {}", config_path.display()))?;
+        .with_context(|| format!("Non-UTF8 path: {}", runtime_config.path().display()))?;
     let c_file_str = c_file
         .to_str()
         .with_context(|| format!("Non-UTF8 path: {}", c_file.display()))?;
@@ -354,7 +474,8 @@ pub fn fix_translation_error(
     util::validate_feature_name(feature)?;
 
     let project_root = util::find_project_root()?;
-    let config_path = get_config_path()?;
+    let project_config_path = get_project_config_path()?;
+    let runtime_config = create_runtime_config(&project_config_path)?;
     let work_dir = project_root.join(".c2rust").join(feature).join("rust");
 
     if !work_dir.exists() {
@@ -394,9 +515,10 @@ pub fn fix_translation_error(
     let script_str = script_path
         .to_str()
         .with_context(|| format!("Non-UTF8 path: {}", script_path.display()))?;
-    let config_str = config_path
+    let config_str = runtime_config
+        .path()
         .to_str()
-        .with_context(|| format!("Non-UTF8 path: {}", config_path.display()))?;
+        .with_context(|| format!("Non-UTF8 path: {}", runtime_config.path().display()))?;
     let error_file_str = temp_file
         .path()
         .to_str()
@@ -667,6 +789,80 @@ mod tests {
         assert_eq!(args_with_suggestion.len(), 15);
         assert_eq!(args_with_suggestion[13], "--suggestion");
         assert_eq!(args_with_suggestion[14], suggestion);
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_runtime_config_prefers_user_env_model() {
+        let home_guard = EnvVarGuard::new("HOME");
+        let xdg_guard = EnvVarGuard::new("XDG_CONFIG_HOME");
+        let env_file_guard = EnvVarGuard::new("C2RUST_XW_ENV_FILE");
+        let api_key_guard = EnvVarGuard::new("C2RUST_API_KEY");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_config = temp_dir.path().join("project.toml");
+        std::fs::write(
+            &project_config,
+            "[global]\ncompiler = [\"gcc\"]\n\n[feature.default]\n\"build.cmd\" = \"make\"\n",
+        )
+        .unwrap();
+
+        let user_env = temp_dir.path().join("env.toml");
+        std::fs::write(
+            &user_env,
+            "[model]\nmodel = \"qwen\"\nbase_url = \"https://example.invalid/v1\"\napi_key = \"from-file\"\n",
+        )
+        .unwrap();
+
+        home_guard.set(temp_dir.path().to_str().unwrap());
+        xdg_guard.remove();
+        env_file_guard.set(user_env.to_str().unwrap());
+        api_key_guard.set("from-env");
+
+        let runtime_config = create_runtime_config(&project_config).unwrap();
+        let runtime_toml = std::fs::read_to_string(runtime_config.path()).unwrap();
+        let parsed: toml::Value = toml::from_str(&runtime_toml).unwrap();
+        let model = parsed.get("model").unwrap().as_table().unwrap();
+
+        assert_eq!(model.get("model").unwrap().as_str(), Some("qwen"));
+        assert_eq!(
+            model.get("base_url").unwrap().as_str(),
+            Some("https://example.invalid/v1")
+        );
+        assert_eq!(model.get("api_key").unwrap().as_str(), Some("from-env"));
+        assert!(parsed.get("feature").is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_runtime_config_falls_back_to_legacy_project_model() {
+        let home_guard = EnvVarGuard::new("HOME");
+        let xdg_guard = EnvVarGuard::new("XDG_CONFIG_HOME");
+        let env_file_guard = EnvVarGuard::new("C2RUST_XW_ENV_FILE");
+        let model_guard = EnvVarGuard::new("C2RUST_MODEL");
+        let api_key_guard = EnvVarGuard::new("C2RUST_API_KEY");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_config = temp_dir.path().join("project.toml");
+        std::fs::write(
+            &project_config,
+            "[model]\nmodel = \"legacy\"\napi_key = \"legacy-key\"\nbase_url = \"https://legacy.invalid/v1\"\n\n[feature.default]\n\"build.cmd\" = \"make\"\n",
+        )
+        .unwrap();
+
+        home_guard.set(temp_dir.path().to_str().unwrap());
+        xdg_guard.remove();
+        env_file_guard.set(temp_dir.path().join("missing-env.toml").to_str().unwrap());
+        model_guard.remove();
+        api_key_guard.remove();
+
+        let runtime_config = create_runtime_config(&project_config).unwrap();
+        let runtime_toml = std::fs::read_to_string(runtime_config.path()).unwrap();
+        let parsed: toml::Value = toml::from_str(&runtime_toml).unwrap();
+        let model = parsed.get("model").unwrap().as_table().unwrap();
+
+        assert_eq!(model.get("model").unwrap().as_str(), Some("legacy"));
+        assert_eq!(model.get("api_key").unwrap().as_str(), Some("legacy-key"));
     }
 
     #[test]

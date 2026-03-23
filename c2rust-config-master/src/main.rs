@@ -80,19 +80,32 @@ fn run() -> Result<(), ConfigError> {
 
     match cli.command {
         Commands::Config(args) => {
+            if args.model {
+                return Err(ConfigError::InvalidOperation(
+                    "Project config no longer manages model secrets. Please use `c2rust-xw env ...` for user-level model configuration.".to_string(),
+                ));
+            }
+
             // Validate exactly one mode is selected
-            let mode_count = [args.global, args.model, args.make].iter().filter(|&&x| x).count();
+            let mode_count = [args.global, args.model, args.make]
+                .iter()
+                .filter(|&&x| x)
+                .count();
             if mode_count != 1 {
                 return Err(ConfigError::InvalidOperation(
-                    "Exactly one of --global, --model, or --make must be specified".to_string(),
+                    "Exactly one of --global or --make must be specified. Model configuration has moved to `c2rust-xw env`.".to_string(),
                 ));
             }
 
             // Validate exactly one operation is selected
-            let op_count = [args.set, args.unset, args.add, args.del, args.list].iter().filter(|&&x| x).count();
+            let op_count = [args.set, args.unset, args.add, args.del, args.list]
+                .iter()
+                .filter(|&&x| x)
+                .count();
             if op_count != 1 {
                 return Err(ConfigError::InvalidOperation(
-                    "Exactly one of --set, --unset, --add, --del, or --list must be specified".to_string(),
+                    "Exactly one of --set, --unset, --add, --del, or --list must be specified"
+                        .to_string(),
                 ));
             }
 
@@ -109,7 +122,10 @@ fn run() -> Result<(), ConfigError> {
             } else if args.model {
                 "model".to_string()
             } else {
-                let feature_name = args.feature.unwrap_or_else(|| "default".to_string()).to_lowercase();
+                let feature_name = args
+                    .feature
+                    .unwrap_or_else(|| "default".to_string())
+                    .to_lowercase();
                 format!("feature.{}", feature_name)
             };
 
@@ -135,11 +151,14 @@ fn run() -> Result<(), ConfigError> {
                 })?,
             };
 
-            if matches!(operation, Operation::Set | Operation::Add | Operation::Del) && args.values.is_empty() {
+            if matches!(operation, Operation::Set | Operation::Add | Operation::Del)
+                && args.values.is_empty()
+            {
                 let op_name = format!("{:?}", operation).to_lowercase();
-                return Err(ConfigError::InvalidOperation(
-                    format!("--{} requires at least one value", op_name),
-                ));
+                return Err(ConfigError::InvalidOperation(format!(
+                    "--{} requires at least one value",
+                    op_name
+                )));
             }
 
             operations::execute(config, operation, &section, &key, args.values)?;

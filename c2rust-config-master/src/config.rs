@@ -25,13 +25,13 @@ impl Config {
     fn find_c2rust_dir() -> Result<PathBuf> {
         let search_start = std::env::current_dir()?;
         let mut current = search_start.clone();
-        
+
         loop {
             let c2rust_path = current.join(".c2rust");
             if c2rust_path.exists() && c2rust_path.is_dir() {
                 return Ok(c2rust_path);
             }
-            
+
             // Try to move to parent directory
             match current.parent() {
                 Some(parent) => current = parent.to_path_buf(),
@@ -53,7 +53,11 @@ impl Config {
     /// Into:
     ///   "build.options.debug" = true
     fn flatten_table(table: &mut HashMap<String, toml::Value>) {
-        fn flatten_value(prefix: &str, value: &toml::Value, result: &mut HashMap<String, toml::Value>) {
+        fn flatten_value(
+            prefix: &str,
+            value: &toml::Value,
+            result: &mut HashMap<String, toml::Value>,
+        ) {
             if let Some(nested_table) = value.as_table() {
                 // Recursively flatten nested tables
                 for (nested_key, nested_value) in nested_table {
@@ -99,8 +103,8 @@ impl Config {
         let content = match fs::read_to_string(&config_path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Auto-create config.toml with default sections including feature.default
-                let default_content = "[global]\n\n[model]\n\n[feature.default]\n";
+                // Auto-create project config.toml with project-scoped sections only
+                let default_content = "[global]\n\n[feature.default]\n";
                 fs::write(&config_path, default_content)?;
                 default_content.to_owned()
             }
@@ -108,14 +112,14 @@ impl Config {
         };
 
         let mut data: ConfigFile = toml::from_str(&content)?;
-        
+
         // Flatten nested structures in all sections
         Self::flatten_table(&mut data.global);
         Self::flatten_table(&mut data.model);
         for (_, feature_table) in data.features.iter_mut() {
             Self::flatten_table(feature_table);
         }
-        
+
         Ok(Config { config_path, data })
     }
 
@@ -127,7 +131,11 @@ impl Config {
     }
 
     /// Get the table for a specific section
-    fn get_table_mut(&mut self, section: &str, create: bool) -> Result<&mut HashMap<String, toml::Value>> {
+    fn get_table_mut(
+        &mut self,
+        section: &str,
+        create: bool,
+    ) -> Result<&mut HashMap<String, toml::Value>> {
         if section == "global" {
             return Ok(&mut self.data.global);
         } else if section == "model" {
@@ -137,11 +145,16 @@ impl Config {
                 if !create {
                     return Err(ConfigError::FeatureNotFound(section.to_string()));
                 }
-                self.data.features.insert(feature_name.to_string(), HashMap::new());
+                self.data
+                    .features
+                    .insert(feature_name.to_string(), HashMap::new());
             }
             return Ok(self.data.features.get_mut(feature_name).unwrap());
         }
-        Err(ConfigError::InvalidOperation(format!("Invalid section: {}", section)))
+        Err(ConfigError::InvalidOperation(format!(
+            "Invalid section: {}",
+            section
+        )))
     }
 
     /// Get the table for reading
@@ -151,18 +164,28 @@ impl Config {
         } else if section == "model" {
             return Ok(&self.data.model);
         } else if let Some(feature_name) = section.strip_prefix("feature.") {
-            return self.data.features
+            return self
+                .data
+                .features
                 .get(feature_name)
                 .ok_or_else(|| ConfigError::FeatureNotFound(section.to_string()));
         }
-        Err(ConfigError::InvalidOperation(format!("Invalid section: {}", section)))
+        Err(ConfigError::InvalidOperation(format!(
+            "Invalid section: {}",
+            section
+        )))
     }
 
     /// Convert a TOML value to a list of strings
     fn value_to_strings(value: &toml::Value) -> Vec<String> {
         if let Some(array) = value.as_array() {
-            array.iter()
-                .map(|item| item.as_str().map(String::from).unwrap_or_else(|| item.to_string()))
+            array
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| item.to_string())
+                })
                 .collect()
         } else if let Some(s) = value.as_str() {
             vec![s.to_string()]
@@ -174,8 +197,9 @@ impl Config {
     /// List all keys and values in a section
     pub fn list_all(&self, section: &str) -> Result<Vec<(String, Vec<String>)>> {
         let table = self.get_table(section)?;
-        
-        Ok(table.iter()
+
+        Ok(table
+            .iter()
             .filter_map(|(key, value)| {
                 let values = Self::value_to_strings(value);
                 if values.is_empty() {
@@ -190,7 +214,8 @@ impl Config {
     /// Get values for a specific key in a section
     pub fn list(&self, section: &str, key: &str) -> Result<Vec<String>> {
         let table = self.get_table(section)?;
-        let value = table.get(key)
+        let value = table
+            .get(key)
             .ok_or_else(|| ConfigError::KeyNotFound(key.to_string()))?;
         Ok(Self::value_to_strings(value))
     }
@@ -202,9 +227,7 @@ impl Config {
         let value = if values.len() == 1 {
             toml::Value::String(values[0].clone())
         } else {
-            let array: Vec<toml::Value> = values.into_iter()
-                .map(toml::Value::String)
-                .collect();
+            let array: Vec<toml::Value> = values.into_iter().map(toml::Value::String).collect();
             toml::Value::Array(array)
         };
 
@@ -223,24 +246,27 @@ impl Config {
     pub fn add(&mut self, section: &str, key: &str, values: Vec<String>) -> Result<()> {
         let table = self.get_table_mut(section, true)?;
 
-        let current = table.entry(key.to_string()).or_insert_with(|| toml::Value::Array(vec![]));
-        
+        let current = table
+            .entry(key.to_string())
+            .or_insert_with(|| toml::Value::Array(vec![]));
+
         // Convert string to array if needed
         if current.is_str() {
             let str_value = current.as_str().unwrap().to_string();
             *current = toml::Value::Array(vec![toml::Value::String(str_value)]);
         }
-        
-        let array = current.as_array_mut()
+
+        let array = current
+            .as_array_mut()
             .ok_or_else(|| ConfigError::InvalidOperation(format!("'{}' is not an array", key)))?;
 
         // Add values with deduplication
         for value in values {
             // Check if value already exists in array
-            let exists = array.iter().any(|v| {
-                v.as_str().map(|s| s == value).unwrap_or(false)
-            });
-            
+            let exists = array
+                .iter()
+                .any(|v| v.as_str().map(|s| s == value).unwrap_or(false));
+
             if !exists {
                 array.push(toml::Value::String(value));
             }
@@ -253,19 +279,17 @@ impl Config {
     pub fn del(&mut self, section: &str, key: &str, values: Vec<String>) -> Result<()> {
         let table = self.get_table_mut(section, false)?;
 
-        let current = table.get_mut(key)
+        let current = table
+            .get_mut(key)
             .ok_or_else(|| ConfigError::KeyNotFound(key.to_string()))?;
 
-        let array = current.as_array_mut()
+        let array = current
+            .as_array_mut()
             .ok_or_else(|| ConfigError::InvalidOperation(format!("'{}' is not an array", key)))?;
 
         // Use HashSet for O(n+m) performance instead of O(n*m)
         let values_set: std::collections::HashSet<_> = values.iter().map(|s| s.as_str()).collect();
-        array.retain(|v| {
-            v.as_str()
-                .map(|s| !values_set.contains(s))
-                .unwrap_or(true)
-        });
+        array.retain(|v| v.as_str().map(|s| !values_set.contains(s)).unwrap_or(true));
 
         Ok(())
     }
