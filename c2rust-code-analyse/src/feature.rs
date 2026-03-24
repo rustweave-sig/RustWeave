@@ -216,9 +216,10 @@ impl Feature {
                     continue;
                 }
 
-                let need_validate = Self::needs_validation(&rust_file, loaded_from_json)?;
+                let (need_validate, rust_len) = Self::needs_validation(&rust_file, loaded_from_json)?;
 
-                let not_empty = if need_validate {
+                // 时间戳相同的情况下也需要保证文件大小和json文件中记录状态的一致性.
+                let not_empty = if need_validate || ((rust_len != 0) != node.kind.has_committed()) {
                     let result = Self::validate_file(
                         &rust_file,
                         &name,
@@ -843,25 +844,27 @@ r#"// 对应__attribute__((weak))弱链接符号.
         )
     }
 
-    fn needs_validation(rust_file: &Path, loaded_from_json: bool) -> Result<bool> {
+    // 返回值: (是否需要校验, rust文件大小), 文件大小只有在无需校验的时候有效.
+    fn needs_validation(rust_file: &Path, loaded_from_json: bool) -> Result<(bool, u64)> {
         // 如果不是从 JSON 文件加载，强制校验
         if !loaded_from_json || Self::update_force() {
-            return Ok(true);
+            return Ok((true, 0));
         }
 
         let c_file = rust_file.with_extension("c");
 
-        let rust_mtime = fs::metadata(rust_file)
-            .log_err(&format!("metadata {}", rust_file.display()))?
+        if !c_file.exists() {
+            return Ok((true, 0));
+        }
+
+        let rust_meta = fs::metadata(rust_file)
+            .log_err(&format!("metadata {}", rust_file.display()))?;
+        let rust_mtime = rust_meta
             .modified()
             .log_err("get modified time")?
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .log_err("duration since")?
             .as_secs();
-
-        if !c_file.exists() {
-            return Ok(true);
-        }
 
         let c_mtime = fs::metadata(&c_file)
             .log_err(&format!("metadata {}", c_file.display()))?
@@ -871,11 +874,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
             .log_err("duration since")?
             .as_secs();
 
-        if rust_mtime == c_mtime {
-            return Ok(false);
-        }
-
-        Ok(true)
+        Ok((rust_mtime != c_mtime, rust_meta.len()))
     }
 
     fn update_c_file_mtime(rust_file: &Path) -> Result<()> {
