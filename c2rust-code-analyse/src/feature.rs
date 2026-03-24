@@ -861,7 +861,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
             + &rel_path
                 .display()
                 .to_string()
-                .replace(|c| !matches!(c, 'a'..'z' | 'A'..'Z' | '0'..'9' | '_'), "_"))
+                .replace(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'), "_"))
     }
 
     fn get_mod_rel_path(prefix: &Path, file: &File) -> Result<PathBuf> {
