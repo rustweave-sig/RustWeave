@@ -1321,7 +1321,9 @@ r#"// 对应__attribute__((weak))弱链接符号.
     }
 
     fn collect_item_names_from_mod(mod_rs: &Path) -> Result<HashSet<String>> {
-        let content = fs::read_to_string(mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
+        // 已经翻译的函数不在mod.rs中，只有从mod.normalized中读取才能保证无遗漏.
+        let mod_rs = mod_rs.with_extension("normalized");
+        let content = fs::read_to_string(&mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let mod_ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
 
         struct Visitor(HashSet<String>);
