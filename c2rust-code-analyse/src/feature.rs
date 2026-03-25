@@ -216,10 +216,9 @@ impl Feature {
                     continue;
                 }
 
-                let (need_validate, rust_len) = Self::needs_validation(&rust_file, loaded_from_json)?;
+                let need_validate = Self::needs_validation(&rust_file, loaded_from_json, node.kind.has_committed())?;
 
-                // 时间戳相同的情况下也需要保证文件大小和json文件中记录状态的一致性.
-                let not_empty = if need_validate || ((rust_len != 0) != node.kind.has_committed()) {
+                let not_empty = if need_validate {
                     let result = Self::validate_file(
                         &rust_file,
                         &name,
@@ -844,17 +843,16 @@ r#"// 对应__attribute__((weak))弱链接符号.
         )
     }
 
-    // 返回值: (是否需要校验, rust文件大小), 文件大小只有在无需校验的时候有效.
-    fn needs_validation(rust_file: &Path, loaded_from_json: bool) -> Result<(bool, u64)> {
+    fn needs_validation(rust_file: &Path, loaded_from_json: bool, has_committed: bool) -> Result<bool> {
         // 如果不是从 JSON 文件加载，强制校验
         if !loaded_from_json || Self::update_force() {
-            return Ok((true, 0));
+            return Ok(true);
         }
 
         let c_file = rust_file.with_extension("c");
 
         if !c_file.exists() {
-            return Ok((true, 0));
+            return Ok(true);
         }
 
         let rust_meta = fs::metadata(rust_file)
@@ -874,7 +872,11 @@ r#"// 对应__attribute__((weak))弱链接符号.
             .log_err("duration since")?
             .as_secs();
 
-        Ok((rust_mtime != c_mtime, rust_meta.len()))
+        // 时间戳相同的情况下也需要保证文件大小和json文件中状态取值的一致性.
+        if rust_mtime == c_mtime && (rust_meta.len() > 0) == has_committed {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn update_c_file_mtime(rust_file: &Path) -> Result<()> {
