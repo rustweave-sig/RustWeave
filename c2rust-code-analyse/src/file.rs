@@ -102,6 +102,13 @@ fn remove_unused_attrs(code: &mut String) {
         off += m.start();
         code.replace_range(off..off + m.len(), "");
     }
+    // __gnu_inline__ 在某些场景（尤其是声明）会被编译器忽略，从而触发 -Werror=attributes
+    let mut off = 0;
+    let re = regex::Regex::new(r"__attribute__\s*\(\s*\(\s*[^)]*__gnu_inline__[^)]*\)\s*\)").unwrap();
+    while let Some(m) = re.find(&code[off..]) {
+        off += m.start();
+        code.replace_range(off..off + m.len(), "");
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -211,7 +218,7 @@ impl Kind {
             return Ok(code);
         }
 
-        if !self.is_static() {
+        if !self.is_static() && !self.is_inline() {
             return Ok(code);
         }
 
@@ -224,6 +231,8 @@ impl Kind {
         code.replace_range(beg..end, global_name);
 
         // 构建工具可能控制缺省可见性，这里需要显示增加
+        // 但必须先清理掉原本的 hidden/default 等，避免冲突
+        strip_visibility_attrs(&mut code)?;
         code.insert_str(0, "__attribute__((visibility(\"default\"))) ");
 
         let re = regex::Regex::new(r"^static\s|\sstatic\s").map_err(|_| Error::inval())?;
@@ -247,7 +256,7 @@ impl Kind {
     }
 
     fn rename_macro(&self) -> Option<String> {
-        if !self.is_static() {
+        if !self.is_static() && !self.is_inline() {
             return None;
         }
         let Some(global_name) = self.global_name() else {
@@ -377,6 +386,39 @@ fn name_range(loc: &SourceLocation, range: &SourceRange) -> (usize, usize) {
     };
     let offset = name_loc.offset - beg_loc.offset;
     (offset, offset + name_loc.tok_len)
+}
+
+fn strip_visibility_attrs(code: &mut String) -> Result<()> {
+    // 删除 __attribute__((__visibility__("...")))
+    let re = regex::Regex::new(
+        r#"__attribute__\s*\(\s*\(\s*__visibility__\s*\(\s*"[^"]*"\s*\)\s*\)\s*\)\s*"#,
+    )
+    .map_err(|_| Error::inval())?;
+    while let Some(m) = re.find(code) {
+        code.replace_range(m.start()..m.end(), "");
+    }
+
+    // 删除 __attribute__((visibility("...")))
+    let re = regex::Regex::new(
+        r#"__attribute__\s*\(\s*\(\s*visibility\s*\(\s*"[^"]*"\s*\)\s*\)\s*\)\s*"#,
+    )
+    .map_err(|_| Error::inval())?;
+    while let Some(m) = re.find(code) {
+        code.replace_range(m.start()..m.end(), "");
+    }
+
+    Ok(())
+}
+
+fn ensure_extern_decl(code: &mut String) -> Result<()> {
+    let has_extern = regex::Regex::new(r"(^|[^\w])extern([^\w]|$)")
+        .map_err(|_| Error::inval())?
+        .is_match(code);
+
+    if !has_extern {
+        code.insert_str(0, "extern ");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -641,7 +683,7 @@ impl File {
     fn rename_static_symbols(node: &mut Node, md5: &str) -> bool {
         let mut has_static = false;
         for child in &mut node.inner {
-            if !child.kind.is_static() {
+            if !child.kind.is_static() && !child.kind.is_inline() {
                 continue;
             }
             let Some(name) = child.kind.name() else {
@@ -724,6 +766,38 @@ impl File {
         Ok(format!("{:x}", digest))
     }
 
+    // 同名 FunctionDecl：只要其中一个 inline=true，则同名全部 inline=true
+    fn normalize_inline_flags(node: &mut Node) {
+        use std::collections::HashMap;
+
+        // name(String) -> any_inline
+        let mut any_inline: HashMap<String, bool> = HashMap::new();
+
+        // first pass: collect whether any inline=true exists for each name
+        for child in &node.inner {
+            let Kind::FunctionDecl(ref f) = child.kind else {
+                continue;
+            };
+
+            // entry 默认 false；出现 true 就置 true（并保持 true）
+            let e = any_inline.entry(f.name.clone()).or_insert(false);
+            if f.inline {
+                *e = true;
+            }
+        }
+
+        // second pass: write back unified inline flag
+        for child in &mut node.inner {
+            let Kind::FunctionDecl(ref mut f) = child.kind else {
+                continue;
+            };
+
+            if any_inline.get(&f.name) == Some(&true) {
+                f.inline = true;
+            }
+        }
+    }
+
     fn init_line_info(node: &mut Node) {
         if node.inner.is_empty() {
             return;
@@ -780,6 +854,7 @@ impl File {
             }
         }
         node.inner.retain(|node| !node.kind.skip());
+        Self::normalize_inline_flags(node);
     }
 
     fn init_vars(node: &mut Node) {
@@ -866,7 +941,7 @@ impl File {
                         code.drain(pos..);
                         code.push(';');
                     }
-                    code.insert_str(0, "extern ");
+                    ensure_extern_decl(&mut code)?;
                 }
                 // 全局变量可能是static int g_i32[] = { ... }
                 // 数组大小只能从var.ty中提取.
@@ -874,7 +949,7 @@ impl File {
                     if let Some(pos) = code.find('=') {
                         code.drain(pos..);
                     }
-                    code.insert_str(0, "extern ");
+                    ensure_extern_decl(&mut code)?;
                     var.ty.fill_array_size(&mut code)?;
                 }
             }
