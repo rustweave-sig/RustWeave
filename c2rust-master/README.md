@@ -141,14 +141,15 @@ Translate C code to Rust:
 c2rust-xw translate
 c2rust-xw translate --feature <name>
 c2rust-xw translate --allow-all
-c2rust-xw translate --max-fix-attempts 20
+c2rust-xw translate --max-error-fix-attempts 20 --max-warning-fix-attempts 5
 c2rust-xw translate --show-full-output
 ```
 
 **Options:**
 - `--feature <name>` - Specify a feature name (optional)
 - `--allow-all` - Allow all unsafe operations
-- `--max-fix-attempts <n>` - Maximum number of fix attempts (optional, uses translator's default if omitted)
+- `--max-error-fix-attempts <n>` - Maximum number of build-error fix attempts (optional, default 10)
+- `--max-warning-fix-attempts <n>` - Maximum number of warning-fix attempts (optional, default 10; use 0 to skip warning fixes)
 - `--show-full-output` - Show full output during translation
 
 `translate` reads project build/test/clean settings from `<project>/.c2rust/config.toml`, and reads model configuration from the user-level env layer (`c2rust-xw env ...`) or from `C2RUST_MODEL` / `C2RUST_BASE_URL` / `C2RUST_API_KEY`.
@@ -250,7 +251,7 @@ c2rust-xw clean -- make clean
 c2rust-xw build --feature experimental -- make all
 
 # Translate with custom settings
-c2rust-xw translate --feature advanced --max-fix-attempts 20 --allow-all
+c2rust-xw translate --feature advanced --max-error-fix-attempts 20 --max-warning-fix-attempts 5 --allow-all
 
 # Merge with a specific feature
 c2rust-xw merge --feature advanced
