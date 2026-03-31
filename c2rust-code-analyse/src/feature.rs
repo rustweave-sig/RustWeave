@@ -1321,11 +1321,58 @@ r#"// 对应__attribute__((weak))弱链接符号.
             fs::read_to_string(decl_file).log_err(&format!("read {}", decl_file.display()))?;
         let mut item: syn::ForeignItemStatic = syn::parse_str(&content)
             .log_err(&format!("parse {} -> {content}", decl_file.display()))?;
+
+        if Self::should_preserve_static_array_type(static_item, &item.ty) {
+            return Ok(false);
+        }
+
         if !Self::syn_equal(&item.ty, &static_item.ty) {
             core::mem::swap(&mut item.ty, &mut static_item.ty);
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn should_preserve_static_array_type(
+        static_item: &syn::ItemStatic,
+        decl_ty: &syn::Type,
+    ) -> bool {
+        let syn::Type::Array(current_array) = &*static_item.ty else {
+            return false;
+        };
+        let syn::Type::Array(decl_array) = decl_ty else {
+            return false;
+        };
+
+        let Some(init_len) = Self::extract_expr_array_len(&static_item.expr) else {
+            return false;
+        };
+        let Some(current_len) = Self::extract_const_usize(&current_array.len) else {
+            return false;
+        };
+        let Some(decl_len) = Self::extract_const_usize(&decl_array.len) else {
+            return false;
+        };
+
+        current_len == init_len && decl_len != init_len
+    }
+
+    fn extract_expr_array_len(expr: &syn::Expr) -> Option<usize> {
+        match expr {
+            syn::Expr::Repeat(repeat) => Self::extract_const_usize(&repeat.len),
+            syn::Expr::Array(array) => Some(array.elems.len()),
+            _ => None,
+        }
+    }
+
+    fn extract_const_usize(expr: &syn::Expr) -> Option<usize> {
+        let syn::Expr::Lit(expr_lit) = expr else {
+            return None;
+        };
+        let syn::Lit::Int(lit_int) = &expr_lit.lit else {
+            return None;
+        };
+        lit_int.base10_parse::<usize>().ok()
     }
 
     fn validate_var(

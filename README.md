@@ -49,7 +49,30 @@ c2rust-xw clean -- make clean
    - `pip install openai httpx tomli`
    - `python3 -m venv /root/c2rust_venv`
    - `source /root/c2rust_venv/bin/activate`
-9. 合并代码
+   - 解释器选择顺序为：
+     - `C2RUST_HOME/bin/python`
+     - `python3`
+     - `python`
+   - 推荐在 `C2RUST_HOME/bin/python` 提供一个可直接运行翻译脚本的 Python 3 入口，避免不同系统下 `python` / `python3` 命名差异导致的行为不一致
+   - 若检测到已有翻译进度，`translate` 在选择“继续上次进度”时，只会根据“进入本次翻译命令前 `.c2rust` 是否已有未提交改动”决定是否先做快照提交；初始化验证阶段新产生的分析/构建副作用不会再单独触发这次 resume 快照
+9. 查看 feature 工作区诊断信息
+```shell
+c2rust-xw feature status --feature default
+c2rust-xw feature check --feature default
+c2rust-xw feature doctor --feature default
+```
+   - 以上命令支持 `--json`
+   - 例如：
+```shell
+c2rust-xw feature check --feature default --json
+```
+   - JSON 输出适合测试系统、自动化脚本或 CI 直接消费
+   - 当前会暴露：
+     - 总体状态与阻塞项
+     - `translate` / `verify` / `test` 相关 blocker
+     - `python_interpreter` 及其来源
+     - `translate_dir` / `hybrid_build_lib` 的实际解析路径及来源
+10. 合并代码
 ```shell
 c2rust-xw merge
 ```

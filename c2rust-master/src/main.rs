@@ -135,16 +135,22 @@ enum FeatureCommands {
     Status {
         #[arg(long, default_value = "default")]
         feature: String,
+        #[arg(long)]
+        json: bool,
     },
     /// 检查 feature 是否满足继续开发/翻译的前置条件
     Check {
         #[arg(long, default_value = "default")]
         feature: String,
+        #[arg(long)]
+        json: bool,
     },
     /// 等价于 check，更偏向人工诊断视角
     Doctor {
         #[arg(long, default_value = "default")]
         feature: String,
+        #[arg(long)]
+        json: bool,
     },
     /// 执行 feature 初始化校验，不进入翻译循环
     Verify {
@@ -166,7 +172,7 @@ struct UserEnvConfig {
     model: toml::map::Map<String, toml::Value>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 struct FeatureStatus {
     feature: String,
     project_root: PathBuf,
@@ -194,8 +200,14 @@ struct FeatureStatus {
     code_analyse_available: bool,
     c2rust_config_available: bool,
     translate_dir_ready: bool,
+    translate_dir_path: Option<PathBuf>,
+    translate_dir_source: Option<&'static str>,
     hybrid_build_lib_ready: bool,
+    hybrid_build_lib_path: Option<PathBuf>,
+    hybrid_build_lib_source: Option<&'static str>,
     python_available: bool,
+    python_interpreter: Option<String>,
+    python_interpreter_source: Option<&'static str>,
     bindgen_available: bool,
     scrub_probe_ran: bool,
     scrub_clean: bool,
@@ -205,13 +217,25 @@ struct FeatureStatus {
     scrub_blocked_files: Vec<PathBuf>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 struct FeaturePhaseReport {
     blocking: Vec<&'static str>,
     warnings: Vec<&'static str>,
     translate_blockers: Vec<&'static str>,
     verify_blockers: Vec<&'static str>,
     test_blockers: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeatureCommandOutput<'a> {
+    status: &'a FeatureStatus,
+    report: &'a FeaturePhaseReport,
+    overall_status: &'a str,
+    blocking_issues: Vec<&'a str>,
+    warnings: Vec<&'a str>,
+    doctor_translate: Option<&'a str>,
+    doctor_verify: Option<&'a str>,
+    doctor_test: Option<&'a str>,
 }
 
 const ENV_KEY_TO_VAR: [(&str, &str); 8] = [
@@ -313,10 +337,18 @@ fn has_non_empty_string_key(table: Option<&toml::value::Table>, key: &str) -> bo
         .unwrap_or(false)
 }
 
-fn detect_python_interpreter() -> Option<&'static str> {
+fn detect_python_interpreter_with_source() -> Option<(String, &'static str)> {
+    if let Ok(c2rust_home) = env::var("C2RUST_HOME") {
+        let candidate = PathBuf::from(c2rust_home).join("bin").join("python");
+        if candidate.is_file() && Command::new(&candidate).arg("--version").output().is_ok() {
+            return Some((candidate.to_string_lossy().into_owned(), "c2rust_home"));
+        }
+    }
+
     ["python3", "python"]
         .into_iter()
         .find(|candidate| Command::new(candidate).arg("--version").output().is_ok())
+        .map(|candidate| (candidate.to_string(), "path"))
 }
 
 fn preflight_hint(issue: &str) -> Option<&'static str> {
@@ -324,7 +356,9 @@ fn preflight_hint(issue: &str) -> Option<&'static str> {
         "translate_dir_missing" => Some(
             "set C2RUST_TRANSLATE_DIR or ensure $C2RUST_HOME/python/translate_and_fix exists",
         ),
-        "python_missing" => Some("install Python 3 and expose `python3` or `python` in PATH"),
+        "python_missing" => Some(
+            "install Python 3 and expose it as $C2RUST_HOME/bin/python, or ensure `python3` / `python` is available in PATH",
+        ),
         "bindgen_missing" => Some("install bindgen-cli and expose `bindgen` in PATH"),
         "model_config_missing" => Some(
             "run c2rust-xw env set model <name> && c2rust-xw env set base_url <url> && c2rust-xw env set api_key <key>",
@@ -411,17 +445,37 @@ fn load_feature_status(feature: &str) -> Result<FeatureStatus, String> {
     status.c2rust_home_ok = get_c2rust_home().is_ok();
     status.code_analyse_available = get_direct_bin_path("code_analyse").is_ok();
     status.c2rust_config_available = get_tool_path("config").is_ok();
-    status.translate_dir_ready = if env::var("C2RUST_TRANSLATE_DIR").is_ok() {
-        true
-    } else {
-        get_python_dir("translate_and_fix").is_ok()
-    };
-    status.hybrid_build_lib_ready = if env::var("C2RUST_HYBRID_BUILD_LIB").is_ok() {
-        true
-    } else {
-        get_lib_path(&get_lib_filename("libc2rust-hybrid-build")).is_ok()
-    };
-    status.python_available = detect_python_interpreter().is_some();
+    if let Ok(path) = env::var("C2RUST_TRANSLATE_DIR") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            status.translate_dir_ready = true;
+            status.translate_dir_path = Some(PathBuf::from(trimmed));
+            status.translate_dir_source = Some("env");
+        }
+    } else if let Ok(path) = get_python_dir("translate_and_fix") {
+        status.translate_dir_ready = true;
+        status.translate_dir_path = Some(path);
+        status.translate_dir_source = Some("c2rust_home");
+    }
+
+    if let Ok(path) = env::var("C2RUST_HYBRID_BUILD_LIB") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            status.hybrid_build_lib_ready = true;
+            status.hybrid_build_lib_path = Some(PathBuf::from(trimmed));
+            status.hybrid_build_lib_source = Some("env");
+        }
+    } else if let Ok(path) = get_lib_path(&get_lib_filename("libc2rust-hybrid-build")) {
+        status.hybrid_build_lib_ready = true;
+        status.hybrid_build_lib_path = Some(path);
+        status.hybrid_build_lib_source = Some("c2rust_home");
+    }
+    if let Some((path, source)) = detect_python_interpreter_with_source() {
+        status.python_available = true;
+        status.python_interpreter = Some(path);
+        status.python_interpreter_source = Some(source);
+    }
+    status.python_available = status.python_interpreter.is_some();
     status.bindgen_available = Command::new("bindgen").arg("--version").output().is_ok();
 
     if can_probe_feature_scrub(&status) {
@@ -499,8 +553,23 @@ fn print_feature_status(status: &FeatureStatus) {
         if status.python_available { "ok" } else { "missing" },
         if status.bindgen_available { "ok" } else { "missing" }
     );
-    if let Some(python) = detect_python_interpreter() {
+    if let Some(path) = &status.translate_dir_path {
+        println!("translate_dir_path = {}", path.display());
+    }
+    if let Some(source) = status.translate_dir_source {
+        println!("translate_dir_source = {}", source);
+    }
+    if let Some(path) = &status.hybrid_build_lib_path {
+        println!("hybrid_build_lib_path = {}", path.display());
+    }
+    if let Some(source) = status.hybrid_build_lib_source {
+        println!("hybrid_build_lib_source = {}", source);
+    }
+    if let Some(python) = &status.python_interpreter {
         println!("python_interpreter = {}", python);
+    }
+    if let Some(source) = status.python_interpreter_source {
+        println!("python_interpreter_source = {}", source);
     }
     let report = build_feature_phase_report(status);
     for issue in &report.translate_blockers {
@@ -737,86 +806,131 @@ fn print_doctor_summary(status: &FeatureStatus, report: &FeaturePhaseReport) {
     println!("doctor_test = {}", if report.test_blockers.is_empty() { "ready" } else { "incomplete" });
 }
 
-fn handle_feature_check(feature: &str) -> i32 {
-    let status = match load_feature_status(feature) {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!("{}", e);
-            return 1;
-        }
-    };
-
-    print_feature_status(&status);
-
-    let report = build_feature_phase_report(&status);
-
+fn overall_status(report: &FeaturePhaseReport) -> &'static str {
     if !report.blocking.is_empty() {
-        println!("status = blocked");
-        println!("blocking_issues = {}", report.blocking.join(","));
-        if !report.warnings.is_empty() {
-            println!("warnings = {}", report.warnings.join(","));
-        }
-        1
+        "blocked"
     } else if !report.warnings.is_empty() {
-        println!("status = degraded");
-        println!("warnings = {}", report.warnings.join(","));
-        0
+        "degraded"
     } else {
-        println!("status = ready");
-        0
+        "ready"
     }
 }
 
-fn handle_feature_status(feature: &str) -> i32 {
+fn doctor_translate_status(report: &FeaturePhaseReport) -> &'static str {
+    if report.translate_blockers.is_empty() { "ready" } else { "blocked" }
+}
+
+fn doctor_verify_status(status: &FeatureStatus, report: &FeaturePhaseReport) -> &'static str {
+    if status.scrub_recoverable {
+        "recoverable_with_scrub"
+    } else if report.verify_blockers.is_empty() {
+        "ready"
+    } else {
+        "blocked"
+    }
+}
+
+fn doctor_test_status(report: &FeaturePhaseReport) -> &'static str {
+    if report.test_blockers.is_empty() { "ready" } else { "incomplete" }
+}
+
+fn print_feature_summary(report: &FeaturePhaseReport) {
+    let overall = overall_status(report);
+    println!("status = {}", overall);
+    if !report.blocking.is_empty() {
+        println!("blocking_issues = {}", report.blocking.join(","));
+    }
+    if !report.warnings.is_empty() {
+        println!("warnings = {}", report.warnings.join(","));
+    }
+}
+
+fn emit_feature_json(status: &FeatureStatus, report: &FeaturePhaseReport, include_doctor: bool) -> i32 {
+    let output = FeatureCommandOutput {
+        status,
+        report,
+        overall_status: overall_status(report),
+        blocking_issues: report.blocking.clone(),
+        warnings: report.warnings.clone(),
+        doctor_translate: include_doctor.then(|| doctor_translate_status(report)),
+        doctor_verify: include_doctor.then(|| doctor_verify_status(status, report)),
+        doctor_test: include_doctor.then(|| doctor_test_status(report)),
+    };
+
+    match serde_json::to_string_pretty(&output) {
+        Ok(json) => {
+            println!("{}", json);
+            if output.overall_status == "blocked" { 1 } else { 0 }
+        }
+        Err(e) => {
+            eprintln!("Error: Failed to serialize feature status as JSON: {}", e);
+            1
+        }
+    }
+}
+
+fn load_status_and_report(feature: &str) -> Result<(FeatureStatus, FeaturePhaseReport), String> {
     let status = match load_feature_status(feature) {
         Ok(status) => status,
+        Err(e) => return Err(e),
+    };
+    let report = build_feature_phase_report(&status);
+    Ok((status, report))
+}
+
+fn handle_feature_check(feature: &str, json: bool) -> i32 {
+    let (status, report) = match load_status_and_report(feature) {
+        Ok(value) => value,
         Err(e) => {
             eprintln!("{}", e);
             return 1;
         }
     };
-    print_feature_status(&status);
-    let report = build_feature_phase_report(&status);
-    if !report.blocking.is_empty() {
-        println!("status = blocked");
-        println!("blocking_issues = {}", report.blocking.join(","));
-    } else if !report.warnings.is_empty() {
-        println!("status = degraded");
-        println!("warnings = {}", report.warnings.join(","));
-    } else {
-        println!("status = ready");
+
+    if json {
+        return emit_feature_json(&status, &report, false);
     }
+
+    print_feature_status(&status);
+    print_feature_summary(&report);
+    if overall_status(&report) == "blocked" { 1 } else { 0 }
+}
+
+fn handle_feature_status(feature: &str, json: bool) -> i32 {
+    let (status, report) = match load_status_and_report(feature) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+
+    if json {
+        return emit_feature_json(&status, &report, false);
+    }
+
+    print_feature_status(&status);
+    print_feature_summary(&report);
     0
 }
 
-fn handle_feature_doctor(feature: &str) -> i32 {
-    let status = match load_feature_status(feature) {
-        Ok(status) => status,
+fn handle_feature_doctor(feature: &str, json: bool) -> i32 {
+    let (status, report) = match load_status_and_report(feature) {
+        Ok(value) => value,
         Err(e) => {
             eprintln!("{}", e);
             return 1;
         }
     };
 
-    print_feature_status(&status);
-    let report = build_feature_phase_report(&status);
-    print_doctor_summary(&status, &report);
-
-    if !report.blocking.is_empty() {
-        println!("status = blocked");
-        println!("blocking_issues = {}", report.blocking.join(","));
-        if !report.warnings.is_empty() {
-            println!("warnings = {}", report.warnings.join(","));
-        }
-        1
-    } else if !report.warnings.is_empty() {
-        println!("status = degraded");
-        println!("warnings = {}", report.warnings.join(","));
-        0
-    } else {
-        println!("status = ready");
-        0
+    if json {
+        return emit_feature_json(&status, &report, true);
     }
+
+    print_feature_status(&status);
+    print_doctor_summary(&status, &report);
+    print_feature_summary(&report);
+    if overall_status(&report) == "blocked" { 1 } else { 0 }
 }
 
 fn handle_feature_reinit(feature: &str) -> i32 {
@@ -1685,9 +1799,9 @@ fn main() {
         Commands::Env { command } => handle_env_command(command),
         Commands::Feature { command } => match command {
             FeatureCommands::Reinit { feature } => handle_feature_reinit(&feature),
-            FeatureCommands::Status { feature } => handle_feature_status(&feature),
-            FeatureCommands::Check { feature } => handle_feature_check(&feature),
-            FeatureCommands::Doctor { feature } => handle_feature_doctor(&feature),
+            FeatureCommands::Status { feature, json } => handle_feature_status(&feature, json),
+            FeatureCommands::Check { feature, json } => handle_feature_check(&feature, json),
+            FeatureCommands::Doctor { feature, json } => handle_feature_doctor(&feature, json),
             FeatureCommands::Verify {
                 feature,
                 show_full_output,
@@ -1757,6 +1871,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_detect_python_interpreter_prefers_python3() {
+        let home_guard = EnvVarGuard::new("C2RUST_HOME");
         let path_guard = EnvVarGuard::new("PATH");
         let temp_dir = tempfile::tempdir().unwrap();
         let python3_path = temp_dir.path().join("python3");
@@ -1768,9 +1883,125 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&python3_path, perms).unwrap();
         }
+        home_guard.remove();
         path_guard.set(temp_dir.path().to_str().unwrap());
 
-        assert_eq!(detect_python_interpreter(), Some("python3"));
+        assert_eq!(
+            detect_python_interpreter_with_source()
+                .as_ref()
+                .map(|(path, _)| path.as_str()),
+            Some("python3")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_python_interpreter_prefers_c2rust_home_python() {
+        let home_guard = EnvVarGuard::new("C2RUST_HOME");
+        let path_guard = EnvVarGuard::new("PATH");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bin_dir = temp_dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let python_path = bin_dir.join("python");
+        std::fs::write(&python_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let python3_path = temp_dir.path().join("python3");
+        std::fs::write(&python3_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&python_path, &python3_path] {
+                let mut perms = std::fs::metadata(path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(path, perms).unwrap();
+            }
+        }
+
+        home_guard.set(temp_dir.path().to_str().unwrap());
+        path_guard.set(temp_dir.path().to_str().unwrap());
+
+        assert_eq!(
+            detect_python_interpreter_with_source()
+                .as_ref()
+                .map(|(path, _)| path.as_str()),
+            Some(python_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_python_interpreter_with_source_marks_c2rust_home() {
+        let home_guard = EnvVarGuard::new("C2RUST_HOME");
+        let path_guard = EnvVarGuard::new("PATH");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bin_dir = temp_dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let python_path = bin_dir.join("python");
+        std::fs::write(&python_path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&python_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&python_path, perms).unwrap();
+        }
+
+        home_guard.set(temp_dir.path().to_str().unwrap());
+        path_guard.set(temp_dir.path().to_str().unwrap());
+
+        let detected = detect_python_interpreter_with_source();
+        assert_eq!(
+            detected.as_ref().map(|(path, _)| path.as_str()),
+            Some(python_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(detected.as_ref().map(|(_, source)| *source), Some("c2rust_home"));
+    }
+
+    #[test]
+    fn test_emit_feature_json_includes_doctor_fields() {
+        let status = FeatureStatus {
+            feature: "default".to_string(),
+            project_root: PathBuf::from("/tmp/project"),
+            feature_root: PathBuf::from("/tmp/project/.c2rust/default"),
+            rust_dir: PathBuf::from("/tmp/project/.c2rust/default/rust"),
+            c_dir: PathBuf::from("/tmp/project/.c2rust/default/c"),
+            config_path: PathBuf::from("/tmp/project/.c2rust/config.toml"),
+            env_path: PathBuf::from("/tmp/env.toml"),
+            translate_dir_ready: true,
+            translate_dir_path: Some(PathBuf::from("/tmp/translate_and_fix")),
+            translate_dir_source: Some("c2rust_home"),
+            hybrid_build_lib_ready: true,
+            hybrid_build_lib_path: Some(PathBuf::from("/tmp/libc2rust-hybrid-build.so")),
+            hybrid_build_lib_source: Some("env"),
+            python_available: true,
+            python_interpreter: Some("/tmp/bin/python".to_string()),
+            python_interpreter_source: Some("c2rust_home"),
+            ..FeatureStatus::default()
+        };
+        let report = FeaturePhaseReport {
+            warnings: vec!["verify_will_skip_tests"],
+            test_blockers: vec!["test_config_incomplete"],
+            ..FeaturePhaseReport::default()
+        };
+
+        let output = FeatureCommandOutput {
+            status: &status,
+            report: &report,
+            overall_status: overall_status(&report),
+            blocking_issues: report.blocking.clone(),
+            warnings: report.warnings.clone(),
+            doctor_translate: Some(doctor_translate_status(&report)),
+            doctor_verify: Some(doctor_verify_status(&status, &report)),
+            doctor_test: Some(doctor_test_status(&report)),
+        };
+
+        let json = serde_json::to_string_pretty(&output).unwrap();
+        assert!(json.contains("\"overall_status\": \"degraded\""));
+        assert!(json.contains("\"doctor_translate\": \"ready\""));
+        assert!(json.contains("\"doctor_verify\": \"ready\""));
+        assert!(json.contains("\"doctor_test\": \"incomplete\""));
+        assert!(json.contains("\"translate_dir_source\": \"c2rust_home\""));
+        assert!(json.contains("\"hybrid_build_lib_source\": \"env\""));
+        assert!(json.contains("\"python_interpreter_source\": \"c2rust_home\""));
     }
 
     #[test]

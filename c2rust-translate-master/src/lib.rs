@@ -73,6 +73,24 @@ pub fn translate_feature(
     // Step 1: Initialize feature directory
     step_1_initialize(feature)?;
 
+    // Capture whether the dedicated `.c2rust` repo was already dirty before any
+    // verification side effects run. Resume snapshotting should reflect unfinished
+    // user progress, not fresh analysis/build artifacts produced by step 2.
+    let preexisting_resume_snapshot_needed = match git::git_has_uncommitted_changes() {
+        Ok(is_dirty) => is_dirty,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!(
+                    "⚠ Warning: failed to inspect .c2rust working tree before verification: {}",
+                    e
+                )
+                .yellow()
+            );
+            false
+        }
+    };
+
     // Check test configuration before initial verification (step 2 also uses test-related commands)
     let skip_test = check_test_configuration(feature)?;
 
@@ -80,7 +98,8 @@ pub fn translate_feature(
     step_2_initial_verification(feature, show_full_output, skip_test)?;
 
     // Step 2.5: Check and load previous translation stats
-    let mut stats = step_2_5_load_or_create_stats(feature)?;
+    let mut stats =
+        step_2_5_load_or_create_stats(feature, preexisting_resume_snapshot_needed)?;
 
     // Step 3 & 4: Select files and initialize progress
     let (rust_dir, mut progress_state) = step_3_4_select_files_and_init_progress(feature, &stats)?;
@@ -189,7 +208,10 @@ fn check_test_configuration(feature: &str) -> Result<bool> {
 }
 
 /// Step 2.5: Check for existing stats file and load or create stats
-fn step_2_5_load_or_create_stats(feature: &str) -> Result<util::TranslationStats> {
+fn step_2_5_load_or_create_stats(
+    feature: &str,
+    preexisting_resume_snapshot_needed: bool,
+) -> Result<util::TranslationStats> {
     match util::TranslationStats::load_from_file(feature)? {
         Some(existing_stats) => {
             println!(
@@ -210,12 +232,21 @@ fn step_2_5_load_or_create_stats(feature: &str) -> Result<util::TranslationStats
 
             let choice = interaction::prompt_continue_or_restart()?;
 
-            match choice {
-                interaction::ContinueChoice::Continue => {
+            match compute_resume_action(choice, feature, preexisting_resume_snapshot_needed) {
+                ResumeAction::Continue { snapshot_message } => {
+                    if let Some(snapshot_message) = snapshot_message {
+                        if git_commit_or_warn(&snapshot_message, feature) {
+                            println!(
+                                "{}",
+                                "✓ Snapshotted uncommitted translation progress before resume."
+                                    .bright_green()
+                            );
+                        }
+                    }
                     println!("{}", "✓ Continuing previous progress...".bright_green());
                     Ok(existing_stats)
                 }
-                interaction::ContinueChoice::Restart => {
+                ResumeAction::Restart => {
                     println!(
                         "{}",
                         "✓ Starting fresh translation session...".bright_cyan()
@@ -229,6 +260,29 @@ fn step_2_5_load_or_create_stats(feature: &str) -> Result<util::TranslationStats
             println!("{}", "Starting new translation session...".bright_cyan());
             Ok(util::TranslationStats::new())
         }
+    }
+}
+
+enum ResumeAction {
+    Continue { snapshot_message: Option<String> },
+    Restart,
+}
+
+fn compute_resume_action(
+    choice: interaction::ContinueChoice,
+    feature: &str,
+    preexisting_resume_snapshot_needed: bool,
+) -> ResumeAction {
+    match choice {
+        interaction::ContinueChoice::Continue => ResumeAction::Continue {
+            snapshot_message: preexisting_resume_snapshot_needed.then(|| {
+                format!(
+                    "Snapshot unfinished translation progress before resume (feature: {})",
+                    feature
+                )
+            }),
+        },
+        interaction::ContinueChoice::Restart => ResumeAction::Restart,
     }
 }
 
@@ -1804,6 +1858,41 @@ mod tests {
     fn test_should_continue_on_test_error_disabled_with_false() {
         let _guard = EnvGuard::set("C2RUST_TEST_CONTINUE_ON_ERROR", "false");
         assert!(!should_continue_on_test_error());
+    }
+
+    #[test]
+    fn test_compute_resume_action_skips_snapshot_when_preexisting_tree_is_clean() {
+        let action = compute_resume_action(
+            interaction::ContinueChoice::Continue,
+            "default",
+            false,
+        );
+
+        match action {
+            ResumeAction::Continue { snapshot_message } => {
+                assert!(snapshot_message.is_none());
+            }
+            ResumeAction::Restart => panic!("expected continue action"),
+        }
+    }
+
+    #[test]
+    fn test_compute_resume_action_requests_snapshot_when_preexisting_tree_is_dirty() {
+        let action = compute_resume_action(
+            interaction::ContinueChoice::Continue,
+            "default",
+            true,
+        );
+
+        match action {
+            ResumeAction::Continue { snapshot_message } => {
+                assert_eq!(
+                    snapshot_message.as_deref(),
+                    Some("Snapshot unfinished translation progress before resume (feature: default)")
+                );
+            }
+            ResumeAction::Restart => panic!("expected continue action"),
+        }
     }
 
     // ========================================================================
