@@ -6,7 +6,7 @@ use std::env;
 use std::process::Command;
 use std::time::Instant;
 
-/// 统一的 cargo check 函数
+/// 统一的 cargo build 函数
 ///
 /// # 参数
 /// - `feature`: 特性名称
@@ -14,10 +14,10 @@ use std::time::Instant;
 /// - `_show_full_output`: 保留参数，暂未实现，传入值不影响当前输出行为
 ///
 /// # 返回
-/// - `Ok(None)`: 检查成功且无警告（或警告被抑制）
-/// - `Ok(Some(warnings))`: 检查成功但有警告
-/// - `Err`: 检查失败
-pub fn cargo_check(
+/// - `Ok(None)`: 构建成功且无警告（或警告被抑制）
+/// - `Ok(Some(warnings))`: 构建成功但有警告
+/// - `Err`: 构建失败
+pub fn cargo_build(
     feature: &str,
     suppress_warnings: bool,
     _show_full_output: bool,
@@ -30,7 +30,7 @@ pub fn cargo_check(
     let start_time = Instant::now();
 
     let mut cmd = Command::new("cargo");
-    cmd.arg("check").current_dir(&build_dir);
+    cmd.arg("build").current_dir(&build_dir);
     // Required because translated Rust code may use unstable (nightly-only) features.
     cmd.env("RUSTC_BOOTSTRAP", "1");
 
@@ -38,18 +38,18 @@ pub fn cargo_check(
         cmd.env("RUSTFLAGS", "-A warnings");
     }
 
-    let output = cmd.output().context("Failed to execute cargo check")?;
+    let output = cmd.output().context("Failed to execute cargo build")?;
     let duration = start_time.elapsed();
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if !output.status.success() {
-        anyhow::bail!("Check error: {}", stderr);
+        anyhow::bail!("Build error: {}", stderr);
     }
 
     println!(
         "  {} (took {:.2}s)",
-        "Check completed".bright_green(),
+        "Build completed".bright_green(),
         duration.as_secs_f64()
     );
 
@@ -64,27 +64,6 @@ pub fn cargo_check(
     }
 
     Ok(None)
-}
-
-/// 内部辅助函数：执行 cargo build 以生成构建产物（如静态库）
-///
-/// 该函数用于需要真正构建产物（而非仅做类型检查）的场景，例如混合链接前的静态库构建。
-fn cargo_build_internal(feature: &str) -> Result<()> {
-    util::validate_feature_name(feature)?;
-    let project_root = util::find_project_root()?;
-    let build_dir = project_root.join(".c2rust").join(feature).join("rust");
-    let output = Command::new("cargo")
-        .arg("build")
-        .current_dir(&build_dir)
-        .env("RUSTC_BOOTSTRAP", "1")
-        .env("RUSTFLAGS", "-A warnings")
-        .output()
-        .context("Failed to execute cargo build")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        anyhow::bail!("Build error: {}", stderr);
-    }
-    Ok(())
 }
 
 /// 从 c2rust-config 获取特定的配置值
@@ -390,6 +369,17 @@ pub fn c2rust_clean(feature: &str) -> Result<()> {
     execute_command_in_dir_with_type(&clean_cmd, "clean.dir", feature, false, "clean")
 }
 
+/// 为给定特性运行清理命令（不更新代码分析）
+///
+/// 在 clean/build/test 序列中使用，此时代码分析已在序列开始时统一更新一次。
+pub(crate) fn c2rust_clean_no_analysis(feature: &str) -> Result<()> {
+    util::validate_feature_name(feature)?;
+
+    let clean_cmd = get_config_value("clean.cmd", feature)?;
+
+    execute_command_in_dir_with_type(&clean_cmd, "clean.dir", feature, false, "clean")
+}
+
 /// 为给定特性运行构建命令
 /// 如果设置了 C2RUST_HYBRID_BUILD_LIB，则自动检测并设置 LD_PRELOAD
 pub fn c2rust_build(feature: &str) -> Result<()> {
@@ -400,7 +390,22 @@ pub fn c2rust_build(feature: &str) -> Result<()> {
     println!("{}", "✓ Code analysis updated".bright_green());
 
     println!("{}", "Rebuilding Rust static library for hybrid link...".bright_blue());
-    cargo_build_internal(feature)?;
+    cargo_build(feature, true, false)?;
+    println!("{}", "✓ Rust static library refreshed".bright_green());
+
+    let build_cmd = get_config_value("build.cmd", feature)?;
+
+    execute_command_in_dir_with_type(&build_cmd, "build.dir", feature, true, "build")
+}
+
+/// 为给定特性运行构建命令（不更新代码分析）
+///
+/// 在 clean/build/test 序列中使用，此时代码分析已在序列开始时统一更新一次。
+pub(crate) fn c2rust_build_no_analysis(feature: &str) -> Result<()> {
+    util::validate_feature_name(feature)?;
+
+    println!("{}", "Rebuilding Rust static library for hybrid link...".bright_blue());
+    cargo_build(feature, true, false)?;
     println!("{}", "✓ Rust static library refreshed".bright_green());
 
     let build_cmd = get_config_value("build.cmd", feature)?;
@@ -415,6 +420,17 @@ pub fn c2rust_test(feature: &str) -> Result<()> {
     println!("{}", "Updating code analysis...".bright_blue());
     analyzer::update_code_analysis(feature)?;
     println!("{}", "✓ Code analysis updated".bright_green());
+
+    let test_cmd = get_config_value("test.cmd", feature)?;
+
+    execute_command_in_dir_with_type(&test_cmd, "test.dir", feature, false, "test")
+}
+
+/// 为给定特性运行测试命令（不更新代码分析）
+///
+/// 在 clean/build/test 序列中使用，此时代码分析已在序列开始时统一更新一次。
+pub(crate) fn c2rust_test_no_analysis(feature: &str) -> Result<()> {
+    util::validate_feature_name(feature)?;
 
     let test_cmd = get_config_value("test.cmd", feature)?;
 
@@ -454,12 +470,17 @@ pub fn run_hybrid_build_interactive(
         anyhow::bail!("c2rust-config not found, cannot run hybrid build tests");
     }
 
+    // 在整个序列开始前统一更新一次代码分析，避免 clean/build/test 各自重复更新
+    println!("│ {}", "Updating code analysis...".bright_blue());
+    analyzer::update_code_analysis(feature)?;
+    println!("│ {}", "✓ Code analysis updated".bright_green());
+
     // 执行命令
     println!("│ {}", "Running hybrid build tests...".bright_blue().bold());
-    c2rust_clean(feature)?;
+    c2rust_clean_no_analysis(feature)?;
 
     // 通过交互式错误处理进行构建
-    match c2rust_build(feature) {
+    match c2rust_build_no_analysis(feature) {
         Ok(_) => {
             // 构建成功，继续测试
         }
@@ -490,7 +511,7 @@ pub fn run_hybrid_build_interactive(
     }
 
     // 通过交互式错误处理进行测试
-    match c2rust_test(feature) {
+    match c2rust_test_no_analysis(feature) {
         Ok(_) => {
             println!("│ {}", "✓ Hybrid build tests passed".bright_green().bold());
             Ok(())
@@ -747,7 +768,7 @@ pub(crate) fn handle_build_failure_interactive(
                                                 .bold()
                                         );
 
-                                        // 执行完整构建流程（包含 cargo_check）
+                                        // 执行完整构建流程（包含 cargo_build）
                                         match run_full_build_and_test_interactive(
                                             feature, file_type, rs_file, skip_test,
                                         ) {
@@ -1251,7 +1272,7 @@ pub(crate) fn handle_test_failure_interactive(
 }
 
 /// 执行完整的构建和测试流程
-/// 顺序：update_code_analysis → cargo_check → c2rust_clean → c2rust_build → c2rust_test
+/// 顺序：update_code_analysis → cargo_build → c2rust_clean → c2rust_build → c2rust_test
 /// 这是主流程中的标准验证流程
 pub fn run_full_build_and_test(feature: &str) -> Result<()> {
     // This entry point always runs tests; skip_test=false.
@@ -1259,7 +1280,7 @@ pub fn run_full_build_and_test(feature: &str) -> Result<()> {
 }
 
 /// 执行完整的构建和测试流程
-/// 顺序：update_code_analysis → cargo_check → c2rust_clean → c2rust_build → c2rust_test
+/// 顺序：update_code_analysis → cargo_build → c2rust_clean → c2rust_build → c2rust_test
 ///
 /// 任何步骤失败时直接返回错误，并打印详细的错误信息。
 /// 调用方负责处理错误并提供交互式修复选项（如需要）。
@@ -1278,31 +1299,31 @@ pub fn run_full_build_and_test_interactive(
         "Running full build and test flow...".bright_blue().bold()
     );
 
-    // 1. 更新代码分析，然后检查 Rust 代码
+    // 1. 更新代码分析，然后构建 Rust 代码（快速失败检查：Rust 代码无法编译则提前返回）
     println!(
         "│ {}",
-        "→ Step 1/4: Updating code analysis and checking Rust code (cargo check)...".bright_blue()
+        "→ Step 1/4: Updating code analysis and building Rust code (cargo build)...".bright_blue()
     );
     println!("│ {}", "Updating code analysis...".bright_blue());
     analyzer::update_code_analysis(feature)?;
     println!("│ {}", "✓ Code analysis updated".bright_green());
-    match cargo_check(feature, true, false) {
+    match cargo_build(feature, true, false) {
         Ok(_) => {
-            println!("│ {}", "  ✓ Rust check successful".bright_green());
+            println!("│ {}", "  ✓ Rust build successful".bright_green());
         }
         Err(e) => {
-            println!("│ {}", "  ✗ Rust check failed".red());
+            println!("│ {}", "  ✗ Rust build failed".red());
             println!("│");
             println!("│ {}", "Error details:".red().bold());
             println!("│ {}", format!("{:#}", e).red());
             println!("│");
-            return Err(e).context("Rust check failed in full build flow");
+            return Err(e).context("Rust build failed in full build flow");
         }
     }
 
-    // 2. 清理混合构建环境
+    // 2. 清理混合构建环境（代码分析已在步骤 1 更新，此处跳过）
     println!("│ {}", "→ Step 2/4: Cleaning hybrid build...".bright_blue());
-    match c2rust_clean(feature) {
+    match c2rust_clean_no_analysis(feature) {
         Ok(_) => {
             println!("│ {}", "  ✓ Clean successful".bright_green());
         }
@@ -1316,12 +1337,12 @@ pub fn run_full_build_and_test_interactive(
         }
     }
 
-    // 3. 混合构建（不调用交互式处理器以避免递归）
+    // 3. 混合构建（代码分析已在步骤 1 更新，此处跳过；不调用交互式处理器以避免递归）
     println!(
         "│ {}",
         "→ Step 3/4: Running hybrid build (C + Rust)...".bright_blue()
     );
-    match c2rust_build(feature) {
+    match c2rust_build_no_analysis(feature) {
         Ok(_) => {
             println!("│ {}", "  ✓ Hybrid build successful".bright_green());
         }
@@ -1335,7 +1356,7 @@ pub fn run_full_build_and_test_interactive(
         }
     }
 
-    // 4. 运行测试（不调用交互式处理器以避免递归）
+    // 4. 运行测试（代码分析已在步骤 1 更新，此处跳过；不调用交互式处理器以避免递归）
     if skip_test {
         println!(
             "│ {}",
@@ -1343,7 +1364,7 @@ pub fn run_full_build_and_test_interactive(
         );
     } else {
         println!("│ {}", "→ Step 4/4: Running tests...".bright_blue());
-        match c2rust_test(feature) {
+        match c2rust_test_no_analysis(feature) {
             Ok(_) => {
                 println!("│ {}", "  ✓ All tests passed".bright_green().bold());
             }
