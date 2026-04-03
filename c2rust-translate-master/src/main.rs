@@ -35,8 +35,8 @@ enum Commands {
         #[arg(long)]
         allow_all: bool,
 
-        /// 构建错误的最大修复尝试次数（必须 > 0，默认为 10）
-        #[arg(long, default_value = "10", value_parser = parse_positive_usize)]
+        /// 构建错误的最大修复尝试次数（必须 > 0，默认为 5）
+        #[arg(long, default_value = "5", value_parser = parse_positive_usize)]
         max_error_fix_attempts: usize,
 
         /// 构建告警的最大修复尝试次数（必须 >= 0，0 表示跳过告警修复，默认为 10）
