@@ -82,7 +82,10 @@ enum Commands {
         allow_all: bool,
 
         #[arg(long)]
-        max_fix_attempts: Option<usize>,
+        max_error_fix_attempts: Option<usize>,
+
+        #[arg(long)]
+        max_warning_fix_attempts: Option<usize>,
 
         #[arg(long)]
         show_full_output: bool,
@@ -1735,7 +1738,8 @@ fn main() {
         Commands::Translate {
             feature,
             allow_all,
-            max_fix_attempts,
+            max_error_fix_attempts,
+            max_warning_fix_attempts,
             show_full_output,
         } => {
             let feature_name = feature.clone().unwrap_or_else(|| "default".to_string());
@@ -1753,8 +1757,13 @@ fn main() {
                 args.push("--allow-all".to_string());
             }
 
-            if let Some(attempts) = max_fix_attempts {
-                args.push("--max-fix-attempts".to_string());
+            if let Some(attempts) = max_error_fix_attempts {
+                args.push("--max-error-fix-attempts".to_string());
+                args.push(attempts.to_string());
+            }
+
+            if let Some(attempts) = max_warning_fix_attempts {
+                args.push("--max-warning-fix-attempts".to_string());
                 args.push(attempts.to_string());
             }
 

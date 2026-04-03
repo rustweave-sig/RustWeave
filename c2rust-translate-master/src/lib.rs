@@ -56,7 +56,8 @@ fn maybe_run_periodic_git_gc(progress_state: &util::ProgressState) {
 /// # Arguments
 /// * `feature` - Feature name (must not contain path separators)
 /// * `allow_all` - If true, auto-process all files without prompting
-/// * `max_fix_attempts` - Maximum number of error fix attempts per file
+/// * `max_error_fix_attempts` - Maximum number of build-error fix attempts per file
+/// * `max_warning_fix_attempts` - Maximum number of warning-fix attempts per file
 /// * `show_full_output` - If true, show complete code/error output without truncation
 ///
 /// # Returns
@@ -65,7 +66,8 @@ fn maybe_run_periodic_git_gc(progress_state: &util::ProgressState) {
 pub fn translate_feature(
     feature: &str,
     allow_all: bool,
-    max_fix_attempts: usize,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
     show_full_output: bool,
 ) -> Result<()> {
     print_workflow_header(feature);
@@ -110,7 +112,8 @@ pub fn translate_feature(
         &rust_dir,
         &mut progress_state,
         allow_all,
-        max_fix_attempts,
+        max_error_fix_attempts,
+        max_warning_fix_attempts,
         show_full_output,
         &mut stats,
         skip_test,
@@ -342,7 +345,8 @@ fn step_5_execute_translation_loop(
     rust_dir: &Path,
     progress_state: &mut util::ProgressState,
     allow_all: bool,
-    max_fix_attempts: usize,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
     show_full_output: bool,
     stats: &mut util::TranslationStats,
     skip_test: bool,
@@ -404,7 +408,8 @@ fn step_5_execute_translation_loop(
             &selected_indices,
             rust_dir,
             progress_state,
-            max_fix_attempts,
+            max_error_fix_attempts,
+            max_warning_fix_attempts,
             show_full_output,
             stats,
             skip_test,
@@ -417,7 +422,8 @@ fn step_5_execute_translation_loop(
         feature,
         rust_dir,
         progress_state,
-        max_fix_attempts,
+        max_error_fix_attempts,
+        max_warning_fix_attempts,
         show_full_output,
         stats,
         skip_test,
@@ -443,7 +449,8 @@ fn handle_skipped_files_loop(
     feature: &str,
     rust_dir: &Path,
     progress_state: &mut util::ProgressState,
-    max_fix_attempts: usize,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
     show_full_output: bool,
     stats: &mut util::TranslationStats,
     skip_test: bool,
@@ -477,7 +484,8 @@ fn handle_skipped_files_loop(
                         &file_name,
                         pos,
                         total,
-                        max_fix_attempts,
+                        max_error_fix_attempts,
+                        max_warning_fix_attempts,
                         show_full_output,
                         stats,
                         skip_test,
@@ -661,7 +669,8 @@ fn process_selected_files(
     selected_indices: &[usize],
     rust_dir: &Path,
     progress_state: &mut util::ProgressState,
-    max_fix_attempts: usize,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
     show_full_output: bool,
     stats: &mut util::TranslationStats,
     skip_test: bool,
@@ -694,7 +703,8 @@ fn process_selected_files(
             file_name,
             current_position,
             total_count,
-            max_fix_attempts,
+            max_error_fix_attempts,
+            max_warning_fix_attempts,
             show_full_output,
             stats,
             skip_test,
@@ -766,7 +776,8 @@ fn print_file_processing_header(current_position: usize, total_count: usize, fil
 /// * `file_name` - Display name of the file
 /// * `current_position` - Current file position in the overall workflow
 /// * `total_count` - Total number of files to process
-/// * `max_fix_attempts` - Maximum error fix attempts per translation
+/// * `max_error_fix_attempts` - Maximum number of build-error fix attempts per translation
+/// * `max_warning_fix_attempts` - Maximum number of warning-fix attempts per translation
 /// * `show_full_output` - Whether to show full output
 ///
 /// # Returns
@@ -779,7 +790,8 @@ fn process_rs_file(
     file_name: &str,
     current_position: usize,
     total_count: usize,
-    max_fix_attempts: usize,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
     show_full_output: bool,
     stats: &mut util::TranslationStats,
     skip_test: bool,
@@ -860,7 +872,7 @@ fn process_rs_file(
             &format_progress,
             is_last_attempt,
             attempt_number,
-            max_fix_attempts,
+            max_error_fix_attempts,
             show_full_output,
             skip_test,
         );
@@ -887,8 +899,8 @@ fn process_rs_file(
 
         if build_successful {
             // Phase 2: Fix warnings after all errors are resolved
-            // (skipped when C2RUST_PROCESS_WARNINGS=0 or =false)
-            if should_process_warnings() {
+            // (skipped when C2RUST_PROCESS_WARNINGS=0/false or max_warning_fix_attempts=0)
+            if should_process_warnings() && max_warning_fix_attempts > 0 {
                 println!("│");
                 println!(
                     "│ {}",
@@ -902,7 +914,7 @@ fn process_rs_file(
                     rs_file,
                     file_name,
                     &format_progress,
-                    max_fix_attempts,
+                    max_warning_fix_attempts,
                     show_full_output,
                 )
                 .unwrap_or_else(|e| {
@@ -915,9 +927,14 @@ fn process_rs_file(
                 total_fix_attempts += warning_fix_attempts;
             } else {
                 println!("│");
+                let reason = if !should_process_warnings() {
+                    "C2RUST_PROCESS_WARNINGS=0/false"
+                } else {
+                    "max_warning_fix_attempts=0"
+                };
                 println!(
                     "│ {}",
-                    "Phase 2: Warning processing skipped (C2RUST_PROCESS_WARNINGS=0/false)."
+                    format!("Phase 2: Warning processing skipped ({}).", reason)
                         .bright_yellow()
                 );
             }
