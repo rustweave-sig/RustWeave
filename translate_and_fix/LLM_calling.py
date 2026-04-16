@@ -182,7 +182,7 @@ def call_llm_api(prompt, model, openai_instance):
             model=model,
             messages=[
                 {"role": "system",
-                "content": "你是一个Rust语言的专家，你擅长将C代码翻译为Rust代码，以及修复Rust代码中的语法语义错误."},
+                "content": "你是一个Rust语言和C语言专家。你的任务是把单个C函数/变量稳定翻译为可编译的Rust片段，或根据编译错误做最小修复。严禁臆造类型名，严禁引入nightly/不稳定特性，严禁输出解释性文字。对于普通数组/切片的元素个数优先使用.len()；对于static mut数组禁止通过共享引用或.len()取长度，应改用与该静态值无关的编译期常量长度表达式。尤其禁止把static mut数组长度写成BUF.len()、size_of_val(&BUF)、size_of::<[u8; BUF.len()]>() 这类形式；目标形式应是类似 addr_of_mut!(BUF).cast() 配合纯编译期常量长度。对于c字符串字面量直接使用c\"...\".as_ptr()，并且绝对禁止在c字面量内部手写\\0；空字符串必须写成c\"\"；绝对不要生成 c\"...\".as_ptr().as_ptr() 或任何 raw pointer 上再次 .as_ptr() 的链式写法。如果当前模块已有同名平台类型别名，例如clock_t，则必须直接使用该现有类型名，不要擅自改成::core::ffi路径。只有在调用点明确需要裸函数指针时才允许对Option函数指针调用.unwrap()。绝对不要漏掉C原代码中的独立副作用语句，尤其是日志、打印、断言、计时、资源释放和状态更新；绝对不要改变continue/break前循环变量调整的语义，例如 i--; continue 必须保留为真正重跑当前轮的效果。凡是目标为f64/double的表达式，参与运算的整数字面量也必须一起显式浮点化。"},
                 {"role": "user", "content": prompt}
             ]
         )

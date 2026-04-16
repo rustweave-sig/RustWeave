@@ -78,6 +78,18 @@ fn has_interactive_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+fn default_compile_success_choice_without_tty(context: &str) -> CompileSuccessChoice {
+    println!(
+        "│ {}",
+        format!(
+            "No TTY detected; {} by default because compilation already succeeded.",
+            context
+        )
+        .yellow()
+    );
+    CompileSuccessChoice::Accept
+}
+
 /// 统一的失败场景提示函数
 ///
 /// 在失败时提示并返回 ManualFix/Skip/Exit（上下文仅用于展示提示信息）
@@ -358,6 +370,12 @@ pub fn prompt_compile_success_choice() -> Result<CompileSuccessChoice> {
         "Exit (abort the translation process)",
     ];
 
+    if !has_interactive_terminal() {
+        return Ok(default_compile_success_choice_without_tty(
+            "accepting this translation",
+        ));
+    }
+
     let choice = Select::new("What would you like to do?", options.clone())
         .with_vim_mode(true)
         .prompt()
@@ -402,6 +420,12 @@ pub fn prompt_build_success_tests_skipped_choice() -> Result<CompileSuccessChoic
         "Exit (abort the translation process)",
     ];
 
+    if !has_interactive_terminal() {
+        return Ok(default_compile_success_choice_without_tty(
+            "accepting this translation with skipped tests",
+        ));
+    }
+
     let choice = Select::new("What would you like to do?", options.clone())
         .with_vim_mode(true)
         .prompt()
@@ -445,6 +469,12 @@ pub fn prompt_build_success_tests_deferred_choice() -> Result<CompileSuccessChoi
         "Manual fix (edit the file with VIM, then run full build & tests)",
         "Exit (abort the translation process)",
     ];
+
+    if !has_interactive_terminal() {
+        return Ok(default_compile_success_choice_without_tty(
+            "accepting this translation with deferred tests",
+        ));
+    }
 
     let choice = Select::new("What would you like to do?", options.clone())
         .with_vim_mode(true)
@@ -521,6 +551,14 @@ pub fn prompt_compile_failure_choice() -> Result<FailureChoice> {
         "Exit (abort the translation process)",
     ];
 
+    if !has_interactive_terminal() {
+        println!(
+            "│ {}",
+            "No TTY detected; defaulting to Skip and continuing.".yellow()
+        );
+        return Ok(FailureChoice::Skip);
+    }
+
     let choice = Select::new("Select an option:", options.clone())
         .with_vim_mode(true)
         .prompt()
@@ -556,6 +594,14 @@ pub fn prompt_build_failure_choice() -> Result<FailureChoice> {
         "Manual fix (edit the file with VIM)",
         "Exit (abort the translation process)",
     ];
+
+    if !has_interactive_terminal() {
+        println!(
+            "│ {}",
+            "No TTY detected; defaulting to Skip and continuing.".yellow()
+        );
+        return Ok(FailureChoice::Skip);
+    }
 
     let choice = Select::new("Select an option:", options.clone())
         .with_vim_mode(true)
@@ -623,6 +669,14 @@ pub fn prompt_continue_or_restart() -> Result<ContinueChoice> {
         "Continue previous progress (resume from where you left off)",
         "Start fresh (clear all progress)",
     ];
+
+    if !has_interactive_terminal() {
+        println!(
+            "{}",
+            "No TTY detected; continuing previous progress by default.".yellow()
+        );
+        return Ok(ContinueChoice::Continue);
+    }
 
     let choice = Select::new("What would you like to do?", options.clone())
         .with_vim_mode(true)
@@ -731,6 +785,14 @@ mod tests {
         assert_eq!(ContinueChoice::Continue, ContinueChoice::Continue);
         assert_eq!(ContinueChoice::Restart, ContinueChoice::Restart);
         assert_ne!(ContinueChoice::Continue, ContinueChoice::Restart);
+    }
+
+    #[test]
+    fn test_default_compile_success_choice_without_tty() {
+        assert_eq!(
+            default_compile_success_choice_without_tty("accepting this translation"),
+            CompileSuccessChoice::Accept
+        );
     }
 
     #[test]

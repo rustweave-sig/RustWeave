@@ -1,0 +1,21 @@
+{
+  "feature": "default",
+  "overall_status": "degraded",
+  "blocking_issues": [],
+  "warnings": [
+    "translation_stats_missing",
+    "recoverable_with_scrub"
+  ],
+  "translate_blockers": [],
+  "verify_blockers": [],
+  "test_blockers": [],
+  "python_interpreter": "/home/server/C2RustXW-workspace-wsl/tools/.local-dev/bin/python",
+  "python_interpreter_source": "c2rust_home",
+  "translate_dir_path": "/home/server/C2RustXW-workspace-wsl/tools/.local-dev/python/translate_and_fix",
+  "translate_dir_source": "env",
+  "hybrid_build_lib_path": "/home/server/C2RustXW-workspace-wsl/tools/.local-dev/lib/libc2rust-hybrid-build.so",
+  "hybrid_build_lib_source": "env",
+  "doctor_translate": "ready",
+  "doctor_verify": "recoverable_with_scrub",
+  "doctor_test": "ready"
+}

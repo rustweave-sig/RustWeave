@@ -541,10 +541,16 @@ pub fn save_selected_files(
         fs::create_dir_all(parent)?;
     }
 
-    // Convert paths to strings for serialization
+    // Store project-root-relative paths so the metadata survives workspace
+    // relocation across machines/users instead of hard-coding absolute paths.
     let file_strings: Vec<String> = selected_files
         .iter()
-        .map(|p| p.display().to_string())
+        .map(|p| {
+            p.strip_prefix(project_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
 
     let json = serde_json::to_string_pretty(&file_strings)?;
@@ -854,11 +860,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let project_root = temp_dir.path();
         let feature = "test_feature";
+        let c_dir = project_root.join(".c2rust").join(feature).join("c");
+        fs::create_dir_all(&c_dir).unwrap();
 
         let files = vec![
-            PathBuf::from("/path/to/file1.c.c2rust"),
-            PathBuf::from("/path/to/file2.c.c2rust"),
+            c_dir.join("file1.c.c2rust"),
+            c_dir.join("nested").join("file2.c.c2rust"),
         ];
+        fs::create_dir_all(files[1].parent().unwrap()).unwrap();
 
         save_selected_files(&files, feature, project_root).unwrap();
 
@@ -873,8 +882,8 @@ mod tests {
         let loaded: Vec<String> = serde_json::from_str(&content).unwrap();
 
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0], "/path/to/file1.c.c2rust");
-        assert_eq!(loaded[1], "/path/to/file2.c.c2rust");
+        assert_eq!(loaded[0], ".c2rust/test_feature/c/file1.c.c2rust");
+        assert_eq!(loaded[1], ".c2rust/test_feature/c/nested/file2.c.c2rust");
     }
 
     #[test]

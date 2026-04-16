@@ -154,6 +154,12 @@ c2rust-xw translate --show-full-output
 
 `translate` reads project build/test/clean settings from `<project>/.c2rust/config.toml`, and reads model configuration from the user-level env layer (`c2rust-xw env ...`) or from `C2RUST_MODEL` / `C2RUST_BASE_URL` / `C2RUST_API_KEY`.
 
+`translate` also supports:
+
+- `--file <relative-rs-path>`
+
+This limits the run to a single Rust target under `.c2rust/<feature>/rust/`. It is intended as a developer-facing probe for targeted debugging, fix-loop observation, and translation quality evaluation rather than as the default user workflow.
+
 When executed inside a project workspace that contains `.c2rust/`, `translate` now reuses the same feature preflight view as `feature check/doctor`. It blocks early on issues such as:
 
 - missing model config
@@ -201,6 +207,12 @@ Current behavior by command:
 - `feature doctor` returns the same staged data plus a more compact diagnosis summary
 - `feature verify` now runs a preflight before invoking translate-side verify
 - `feature scrub` clears compiler-confirmed broken `fun_*.rs` / `var_*.rs` files and re-syncs workspace state
+
+Warning severity notes:
+
+- `translation_stats_missing` remains visible in `warnings`
+- but it no longer downgrades `overall_status` by itself
+- this lets a clean-and-runnable workspace stay `ready` even before any translation stats file has been produced
 
 #### 8. Merge
 

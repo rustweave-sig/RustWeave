@@ -35,6 +35,10 @@ enum Commands {
         #[arg(long)]
         allow_all: bool,
 
+        /// 仅处理指定的 Rust 目标文件（相对 `.c2rust/<feature>/rust` 的路径）
+        #[arg(long)]
+        file: Option<String>,
+
         /// 构建错误的最大修复尝试次数（必须 > 0，默认为 5）
         #[arg(long, default_value = "5", value_parser = parse_positive_usize)]
         max_error_fix_attempts: usize,
@@ -67,12 +71,14 @@ fn main() {
         Commands::Translate {
             feature,
             allow_all,
+            file,
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,
         } => c2rust_translate::translate_feature(
             &feature,
             allow_all,
+            file.as_deref(),
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,

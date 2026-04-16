@@ -111,6 +111,15 @@ fn remove_unused_attrs(code: &mut String) {
     }
 }
 
+fn localize_extern_inline_definition(code: &mut String) -> Result<bool> {
+    let re = regex::Regex::new(r"^extern\s+").map_err(|_| Error::inval())?;
+    if let Some(m) = re.find(code) {
+        code.replace_range(m.start()..m.end(), "static ");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum Kind {
     EnumDecl(EnumDecl),
@@ -233,8 +242,14 @@ impl Kind {
         }
 
         let Some(global_name) = self.global_name() else {
-            eprintln!("empty global name: {}", code);
-            return Err(Error::general());
+            if self.is_inline() && self.is_extern_fn() {
+                localize_extern_inline_definition(&mut code)?;
+            }
+            eprintln!(
+                "missing global name for static/inline item; preserving original exported C body: {}",
+                code
+            );
+            return Ok(code);
         };
 
         let (beg, end) = name_range(self.loc().unwrap(), self.range().unwrap());
@@ -270,7 +285,6 @@ impl Kind {
             return None;
         }
         let Some(global_name) = self.global_name() else {
-            eprintln!("empty global name: {:?}", self.name());
             return None;
         };
         let name = self.name()?;
@@ -297,6 +311,13 @@ impl Kind {
             _ => return false,
         };
         matches!(storage_class.as_deref(), Some("static"))
+    }
+
+    pub fn is_extern_fn(&self) -> bool {
+        let Kind::FunctionDecl(ref item) = self else {
+            return false;
+        };
+        matches!(item.storage_class.as_deref(), Some("extern"))
     }
 
     pub fn global_name(&self) -> Option<&str> {
@@ -1264,6 +1285,148 @@ mod tests {
         );
         assert!(node.inner[2].kind.global_name().is_none());
     }
+
+    #[test]
+    fn test_static_inline_without_global_name_preserves_body() {
+        let source = "static inline int intrinsic_like(void) { return 1; }\n";
+        let kind = Kind::FunctionDecl(FunctionDecl {
+            name: "intrinsic_like".to_string(),
+            loc: SourceLocation {
+                spelling_loc: None,
+                expansion_loc: Some(BareSourceLocation {
+                    presumed_file: None,
+                    presumed_line: None,
+                    included_from: None,
+                    is_macro_arg_expansion: false,
+                    file: "test.c".into(),
+                    line: 1,
+                    col: 19,
+                    tok_len: "intrinsic_like".len(),
+                    offset: 18,
+                }),
+            },
+            range: SourceRange {
+                begin: SourceLocation {
+                    spelling_loc: None,
+                    expansion_loc: Some(BareSourceLocation {
+                        presumed_file: None,
+                        presumed_line: None,
+                        included_from: None,
+                        is_macro_arg_expansion: false,
+                        file: "test.c".into(),
+                        line: 1,
+                        col: 1,
+                        tok_len: "static".len(),
+                        offset: 0,
+                    }),
+                },
+                end: SourceLocation {
+                    spelling_loc: None,
+                    expansion_loc: Some(BareSourceLocation {
+                        presumed_file: None,
+                        presumed_line: None,
+                        included_from: None,
+                        is_macro_arg_expansion: false,
+                        file: "test.c".into(),
+                        line: 1,
+                        col: source.trim_end().len(),
+                        tok_len: 1,
+                        offset: source.trim_end().len() - 1,
+                    }),
+                },
+            },
+            is_definition: true,
+            is_implicit: false,
+            inline: true,
+            ty: MyClangType {
+                qual_type: "int ()".to_string(),
+                desugared_qual_type: None,
+            },
+            storage_class: Some("static".to_string()),
+            git_commit: false,
+            global_name: None,
+            skip: false,
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("test.c"), source).unwrap();
+
+        let code = kind.c_code(root.path()).unwrap();
+        assert_eq!(code, source.trim_end());
+    }
+
+    #[test]
+    fn test_extern_inline_without_global_name_is_localized() {
+        let source =
+            "extern __inline int intrinsic_like(void) __attribute__((__gnu_inline__, __always_inline__)) { return 1; }\n";
+        let kind = Kind::FunctionDecl(FunctionDecl {
+            name: "intrinsic_like".to_string(),
+            loc: SourceLocation {
+                spelling_loc: None,
+                expansion_loc: Some(BareSourceLocation {
+                    presumed_file: None,
+                    presumed_line: None,
+                    included_from: None,
+                    is_macro_arg_expansion: false,
+                    file: "test.c".into(),
+                    line: 1,
+                    col: 21,
+                    tok_len: "intrinsic_like".len(),
+                    offset: 20,
+                }),
+            },
+            range: SourceRange {
+                begin: SourceLocation {
+                    spelling_loc: None,
+                    expansion_loc: Some(BareSourceLocation {
+                        presumed_file: None,
+                        presumed_line: None,
+                        included_from: None,
+                        is_macro_arg_expansion: false,
+                        file: "test.c".into(),
+                        line: 1,
+                        col: 1,
+                        tok_len: "extern".len(),
+                        offset: 0,
+                    }),
+                },
+                end: SourceLocation {
+                    spelling_loc: None,
+                    expansion_loc: Some(BareSourceLocation {
+                        presumed_file: None,
+                        presumed_line: None,
+                        included_from: None,
+                        is_macro_arg_expansion: false,
+                        file: "test.c".into(),
+                        line: 1,
+                        col: source.trim_end().len(),
+                        tok_len: 1,
+                        offset: source.trim_end().len() - 1,
+                    }),
+                },
+            },
+            is_definition: true,
+            is_implicit: false,
+            inline: true,
+            ty: MyClangType {
+                qual_type: "int ()".to_string(),
+                desugared_qual_type: None,
+            },
+            storage_class: Some("extern".to_string()),
+            git_commit: false,
+            global_name: None,
+            skip: false,
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("test.c"), source).unwrap();
+
+        let code = kind.c_code(root.path()).unwrap();
+        assert!(code.starts_with("static __inline int intrinsic_like"));
+        assert!(code.contains("__gnu_inline__"));
+        assert!(!code.starts_with("extern "));
+    }
+
 
     #[test]
     fn test_ignore_fn() {

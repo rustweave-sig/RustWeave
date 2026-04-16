@@ -1,5 +1,320 @@
 # 测试摘要
 
+## 截至 2026-04-15 的状态更新
+
+- 已在新的隔离副本 `testing/projects/xxHash-autox86-quality-20260415` 上对 `autox86` 最小样例做了一次完整回归：
+  - `feature check` 通过
+  - `translate --file src/mod_cli_xsum_arch/fun_XSUM_autox86.rs` 通过
+  - `translate --file src/mod_cli_xsum_bench/fun_XSUM_benchInternal.rs` 通过
+  - `./xxhsum -V` 通过
+  - `./xxhsum /tmp/xxh_autox86_smoke.txt` 通过
+  - `./xxhsum -b -i1 -B64` 通过
+- 同一隔离副本上，现已把第三个函数级质量样例 `src/mod_cli_xsum_bench/fun_XSUM_benchMem.rs` 打通：
+  - 先执行 `feature scrub --feature default`
+  - 再执行 `translate --file src/mod_cli_xsum_bench/fun_XSUM_benchMem.rs --max-error-fix-attempts 5`
+  - 最新结果：
+    - 首轮翻译直接生成 `::core::ptr::addr_of_mut!(g_benchSecretBuf).cast(), 136usize`
+    - 不再生成 `g_benchSecretBuf.len()`
+    - 不再生成 `size_of_val(&g_benchSecretBuf)`
+    - 不再生成 `size_of::<[u8; g_benchSecretBuf.len()]>()`
+    - `cargo check` 一次通过
+    - hybrid `make xxhsum` 通过
+    - `make test_sanity` 通过
+- 这说明当前 prompt 主线已经不只是“修掉伪类型/循环变量类型”：
+  - 对 `static mut` 数组长度的泛化约束也已开始稳定生效
+  - 至少在 `benchMem` 这一类 `sizeof(static_mut_array)` 场景下，模型已经能首轮落到“裸指针 + 编译期常量长度”的目标形式
+- 在同一 benchmark 闭包里，`src/mod_cli_xsum_bench/fun_XSUM_benchFiles.rs` 也已完成一次定点复跑：
+  - 首轮翻译即保住了 `int fileIdx` -> `c_int + while` 的结构
+  - 指针对齐表达式也保持为可编译的裸指针/整数算式
+  - 首轮前沿只剩两类边界性错误：
+    - `c"...".as_ptr().as_ptr()` 这类多余层级
+    - `__errno_location` 相关名称/解引用不匹配
+  - 在 2 轮 syntax-fix 后已收敛到：
+    - `cargo check` 通过
+    - hybrid `make xxhsum` 通过
+    - `make test_sanity` 通过
+- 这说明当前 prompt 改进的效果已经不仅限于 `sizeof(static_mut_array)`：
+  - 对 benchmark 闭包里的文件 I/O / 错误分支 / 对齐缓冲区这类较复杂外围逻辑，模型也能先给出较稳定骨架
+  - 当前剩余 fix 更多是 FFI 细节修补，而不是控制流或类型体系大面积跑偏
+- `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs` 的结果更接近当前自动链路的真实上限：
+  - 首轮翻译后，经过 2 轮 syntax-fix，可达到：
+    - `cargo check` 通过
+    - hybrid `make xxhsum` 通过
+    - `make test_sanity` 通过
+    - `./xxhsum -b -i1 -B64` 可运行
+  - 但人工审阅发现了 2 个不会被编译器或 `test_sanity` 捕获的语义缺陷：
+    - 丢失了循环体开头的进度输出 `XSUM_logVerbose(... ->\\r)`
+    - `iterationNb--; continue;` 被错误保留成了“减一后又加一”，破坏“重跑当前轮”的原始语义
+  - 这两个问题已在工作区样例中做最小人工修复，并再次验证 benchmark 主链路可运行
+- 因而当前对 `benchHash` 的准确结论不是“纯自动翻译成功”，而是：
+  - 自动链路已经能把它推到可编译、可混合构建、可运行
+  - 但若把它作为翻译质量样例，仍必须加入人工语义审阅环节
+- 随后已针对 `benchHash` 暴露出的两类语义问题补强 prompt：
+  - 禁止遗漏独立副作用语句，例如日志、打印、计时、资源释放、状态更新
+  - 禁止改写 `continue/break` 前对循环变量的显式调整语义
+- 用同一工作区对 `fun_XSUM_benchHash.rs` 做清空后首轮重翻译复验，新的首轮结果表明：
+  - 循环体开头的 `XSUM_logVerbose(... ->\\r)` 已不再丢失
+  - `iterationNb--; continue;` 已不再被错误改写为“减一后又加一”
+- 这说明当前 prompt 改进已经开始影响“语义级首轮输出”，而不只是编译错误修复。
+- 但这次复验的首轮仍保留了旧的编译层问题：
+  - `c"..."` 内手写 `\\0`
+  - `clock_t` 仍偶发挂到 `::core::ffi`
+  - 浮点乘整数字面量仍会出现局部类型不一致
+- 因此当前前沿可以拆成两层：
+  - 语义层：已有改善
+  - 编译层：仍需继续通过泛化 prompt 收敛字符串/类型细节
+- 随后又针对编译层补强了三类泛化约束：
+  - `c"..."` 字面量内绝对禁止手写 `\\0`，空字符串必须直接写成 `c""`
+  - 若当前模块已有 `clock_t` 这类平台类型别名，必须直接使用该现有类型名
+  - 任何目标为 `f64/double` 的表达式中，整数字面量也必须一起显式浮点化
+- 再次对 `fun_XSUM_benchHash.rs` 做清空后的首轮复验，结果进一步收敛为：
+  - `c"..."` 中的手写 `\\0` 已消失
+  - `clock_t` 已不再错误写成 `::core::ffi::clock_t`
+  - 浮点表达式已基本改成显式浮点/显式 `as f64`
+  - 首轮前沿收敛到单点：
+    - `c"XSUM_benchHash".as_ptr().as_ptr()`
+- 这说明当前 prompt 主线已经把 `benchHash` 的首轮问题从“多类混杂错误”压缩到了“单条字符串指针包装错误”。
+- 本轮同时还暴露了一个工具侧问题：
+  - `syntax_fixing.txt` 中未转义的 `{integer}` 触发了 Python `format()` 模板错误
+  - 该问题已修复为 `{{integer}}`
+- 在修复最后一条 `c"...".as_ptr().as_ptr()` 约束并修好 syntax-fix 模板后，`fun_XSUM_benchHash.rs` 已完成一次完整纯自动复跑：
+  - 单文件 `translate --file` 成功
+  - syntax-fix 正常工作，并在 1 轮 fix 后收敛
+  - `cargo check` 通过
+  - hybrid `make xxhsum` 通过
+  - `make test_sanity` 通过
+  - `./xxhsum -b -i1 -B64` 通过
+- 这意味着当前 benchmark 闭包的代表性样例已形成清晰分层：
+  - `benchMem`：纯自动通过
+  - `benchFiles`：纯自动通过
+  - `benchHash`：现已纯自动通过
+- 因而“下一个完整里程碑”可以定义为：
+  - 以 prompt 主线为核心，把 `benchHash` 从“首轮多类错误 + 人工语义修补”推进到“完整自动链路通过并落到真实 benchmark 输出”
+- 这次回归确认第二条翻译后规范化规则已在真实样例中生效：
+  - 原本的
+    - `b"...\0".as_ptr() as *const ::core::ffi::c_char`
+  - 已稳定落成
+    - `c"...".as_ptr()`
+- 当前已在以下两个真实函数样例中验证：
+  - `mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+  - `mod_cli_xsum_bench/fun_XSUM_benchInternal.rs`
+- 同时确认了一条新的 CLI 工程问题并已修复：
+  - 在无 TTY 场景下，单文件翻译即使已经“编译成功 + 测试通过 + 结果落盘”，末尾仍会在成功确认 prompt 处报：
+    - `Failed to get user selection: The input device is not a TTY`
+  - 根因是成功分支的三个 prompt 缺少非 TTY fallback
+  - 现已改为：
+    - 无 TTY 时默认执行 `Accept`
+    - 保证自动化链路不会在成功后再以错误码退出
+- 这意味着当前 `autox86` 样例除了证明“可运行”之外，还已经证明：
+  - 翻译后字符串字面量规范化可自动生效
+  - 非 TTY 自动化链路可以把成功结果稳定提交到 feature 工作区
+- 本轮还补齐了 `translation_stats.json` 的路径口径修复：
+  - 统计项现在统一使用 `src/...` 作为 file key
+  - 不再混用：
+    - `mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+    - `src/mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+  - 旧样例中的历史 key 会在加载时自动迁移并回写为 canonical `src/...` 形式
+- 这样做的原因是：
+  - `translate --file` 的用户输入口径本来就是 `src/...`
+  - 编译/诊断信息里的文件路径口径也是 `src/...`
+  - 因此 stats 若继续保留 `mod_...`，会造成：
+    - 定点重跑清历史不彻底
+    - 报表统计出现重复文件
+    - CLI 可见路径与统计路径脱节
+- 在 `testing/projects/xxHash-autox86-quality-20260402` 上继续推进 `autox86` 最小质量样例后，已确认上一阶段的真实主阻塞不是 `_mm_*` 缺声明，而是 hybrid 链接阶段的 `multiple definition`。
+- 具体现象是：
+  - `xxhash.o`
+  - `xxh_x86dispatch.o`
+  同时导出了大量 `_mm_*` 符号，例如：
+  - `_mm_loadu_si128`
+  - `_mm_mul_epu32`
+  - `_mm_slli_epi64`
+  - `_mm_srli_epi64`
+  - `_mm_xor_si128`
+- 根因已定位到 `code_analyse` 的导出策略：
+  - 系统头里的 `extern inline` intrinsic 包装在缺少 `global_name` 时被原样保留
+  - 它们随后进入每个 TU 的导出 C 文件，导致跨 TU 同名全局符号重复定义
+- 现已在 `c2rust-code-analyse/src/file.rs` 落地修复：
+  - 对“`inline` 且无 `global_name` 的 `extern` 函数定义”不再原样外导
+  - 改为局部化成 `static inline`
+  - 同时补充了对应单元测试，防止回归
+- 修复后重新执行：
+  - `code_analyse --feature default --update`
+  - hybrid `make xxhsum`
+  已确认：
+  - `_mm_*` 不再作为全局符号出现在 `xxhash.o` / `xxh_x86dispatch.o`
+  - `make xxhsum` 可成功走到最终 `LD xxhsum`
+  - 生成的 `xxhsum` 可执行文件已可直接运行
+- 最小运行验证结果：
+  - `./xxhsum --version` 成功
+  - `./xxhsum /tmp/xxh_autox86_smoke.txt` 成功输出哈希
+  - 同目录原生 `make xxhsum` 产物与 hybrid 产物对同一输入的输出一致
+- 当前这条样例的 Rust 侧覆盖应这样理解：
+  - `.c2rust/default/rust/src` 下共有 `901` 个 `.rs`
+  - 其中非空 `457` 个，空 stub `444` 个
+  - 但真正的非空函数实体文件只有 `2` 个：
+    - `mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+    - `mod_cli_xsum_bench/fun_XSUM_benchInternal.rs`
+  - 其余非空文件主要是：
+    - `decl_*.rs`
+    - `mod.rs`
+    - `lib.rs`
+- 因此当前更准确的表述不是“大量函数已经 Rust 翻译完成”，而是：
+  - 已形成一个最小可运行的 hybrid 质量样例
+  - 但函数级 Rust 覆盖仍然非常有限
+- 当前样例里的 `unsafe` 观测值也应分层理解：
+  - 以全部非空 `.rs` 计：
+    - 非空文件 `457`
+    - 含 `unsafe` 文件 `11`
+    - 文件占比约 `2.41%`
+    - 总行数 `20438`
+    - 含 `unsafe` 行 `1945`
+    - 行占比约 `9.52%`
+  - 以真正非空函数实体文件计：
+    - 非空函数文件 `2`
+    - 含 `unsafe` 文件 `2`
+    - 文件占比 `100%`
+    - `unsafe` 行占比约 `20.63%`
+- 这说明：
+  - 如果后续要汇报“unsafe 比例”，必须先声明口径
+  - 对当前这个最小样例，按“全部非空 `.rs`”统计会稀释函数实体里的真实 `unsafe` 密度
+- 本轮已补上两项元数据修复：
+  - `selected_files.json` 现在统一保存为相对 `project_root` 的路径，不再写入机器相关的绝对路径
+  - `translation_stats` 增加了基于当前 `rust/src` 实况的保守校准逻辑：
+    - 若存在非空 `fun_*.rs` / `var_*.rs`
+    - 但 stats 中尚无对应记录
+    - 则自动回填为基线完成记录
+- 在当前 `autox86` 样例上已验证：
+  - `selected_files.json` 已被重写为相对路径
+  - `translation_stats.json` 已从全零修正为：
+    - `total_files = 2`
+    - `success_first_try = 2`
+    - `file_attempts` 包含：
+      - `src/mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+      - `src/mod_cli_xsum_bench/fun_XSUM_benchInternal.rs`
+- 在 `testing/projects/xxHash-autox86-quality-20260415` 上进一步验证：
+  - targeted rerun 前，历史 `translation_stats.json` 中确实出现过：
+    - `mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+    - `mod_cli_xsum_bench/fun_XSUM_benchInternal.rs`
+    - `src/mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+  - 修复后再次加载 / 保存同一样例，stats 已自动收敛为单一路径口径：
+    - `src/mod_cli_xsum_bench/fun_XSUM_benchInternal.rs`
+  - 同时 `skipped_files` 也会统一写为：
+    - `src/mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+- 进一步的函数级质量验证也已完成：
+  - `XSUM_autox86`
+    - 已通过 `xxhsum -V` 进入真实 CLI 输出
+    - 当前可观察行为与 C 版本一致
+  - `XSUM_benchInternal`
+    - 已通过 `xxhsum -b -i1 -B64` 进入真实 benchmark 主链路
+    - hybrid 与 native 的首屏语义骨架归一化后完全一致
+    - 原始输出差异仅来自可执行文件名和性能数字波动
+- 在 `XSUM_benchInternal` 上还额外完成了一次最小人工质量收敛原型：
+  - 不改语义，只收束 `unsafe` 边界
+  - 收敛前函数体内 `unsafe` 为 `11` 处
+  - 收敛后函数体内 `unsafe` 为 `1` 处
+  - `cargo check` 与 `xxhsum -b -i1 -B64` 均继续通过
+- 这说明当前这类 benchmark 入口函数的 `unsafe` 密度中，有一部分是生成风格问题，而不是 ABI 不可避免成本
+- 该原型现在已经上升为工具规则：
+  - `c2rust-translate-master` 新增了一条保守的翻译后规范化逻辑
+  - 仅对带 `export_name` 的 `extern "C"` 导出函数生效
+  - 仅在存在多个 `unsafe` 表达式时触发
+  - 当前单测与构建均已通过
+- 对应函数级质量说明已归档到：
+  - `docs/cases/xxhash/artifacts/2026-04-15-autox86-function-quality.md`
+- 因而当前这条样例已经适合做：
+  - hybrid 可运行性验证
+  - 最小功能输出对照
+  - 函数级质量定点分析
+- 但仍不能把这份 stats 直接等价成“大闭包翻译完成度”：
+  - 它现在只忠实反映当前非空 `fun_/var_` 实体文件
+  - 不包含 `decl_*.rs` / `mod.rs` 之类的派生产物
+- 这说明当前 `autox86` 质量样例已经从：
+  - “单文件 Rust 可编译”
+  推进到：
+  - “带 hybrid 链接的最小可运行闭合样例”
+- 当前新的前沿不再是 `_mm_*` 重定义。
+  下一步更值得关注的是：
+  - 继续做 `xxhsum` 功能输出对照
+  - 评估这条最小样例中的真实 Rust 覆盖率与质量
+  - 再决定是否扩大到更复杂的 `bench` 闭包
+## 截至 2026-04-02 的状态更新
+
+- 已用新的 `feature_json_summary.py` 在 `testing/projects/xxHash-hybridset-v2-20260312` 上做了一次结构化采样：
+  - `feature status = ready`
+  - `feature check = ready`
+  - `feature doctor = ready`
+  - `doctor_translate = ready`
+  - `doctor_verify = ready`
+  - `doctor_test = ready`
+- 本次采样使用仓库内构建的 `c2rust-master/target/debug/c2rust-xw`，避免被 PATH 中旧安装版二进制污染。
+- 采样结果已归档到：
+  - `docs/cases/xxhash/artifacts/2026-04-02-hybridset-v2-feature-status.json`
+  - `docs/cases/xxhash/artifacts/2026-04-02-hybridset-v2-feature-check.json`
+  - `docs/cases/xxhash/artifacts/2026-04-02-hybridset-v2-feature-doctor.json`
+- 同日对当前主工作区 `testing/projects/xxHash` 做了同样采样，结果与 `hybridset-v2` 基线不同：
+  - `feature status = degraded`
+  - `feature check = degraded`
+  - `feature doctor = degraded`
+  - `doctor_translate = ready`
+  - `doctor_verify = recoverable_with_scrub`
+  - `doctor_test = ready`
+- 当前主工作区的退化原因已明确：
+  - `.c2rust/default/selected_files.json` 存在，但 `translation_stats.json` 缺失
+  - `scrub_probe = recoverable_with_scrub`
+  - `scrub_candidate = .c2rust/default/rust/src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs`
+  - 当前推荐下一步仍是 `c2rust-xw feature scrub --feature default`
+- 主工作区采样结果已归档到：
+  - `docs/cases/xxhash/artifacts/2026-04-02-main-workspace-feature-status.json`
+  - `docs/cases/xxhash/artifacts/2026-04-02-main-workspace-feature-check.json`
+  - `docs/cases/xxhash/artifacts/2026-04-02-main-workspace-feature-doctor.json`
+- 随后已在主工作区执行：
+  - `c2rust-xw feature scrub --feature default`
+- `scrub` 实际清掉了 3 个污染前沿：
+  - `fun_XSUM_autox86.rs`
+  - `fun_XSUM_benchFiles.rs`
+  - `fun_XSUM_benchHash.rs`
+- `scrub` 后再次采样，结果进一步收敛为：
+  - `scrub_probe = clean`
+  - `overall_status = ready`
+  - `doctor_translate = ready`
+  - `doctor_verify = ready`
+  - `doctor_test = ready`
+  - 唯一剩余 warning 是 `translation_stats_missing`
+- 这说明：
+  - `feature scrub` 已能把“Rust 前沿污染”从主工作区清掉
+  - `translation_stats_missing` 已降级为普通 warning
+  - 它会继续出现在诊断输出里，但不会再单独把 `overall_status` 拉低为 `degraded`
+- `scrub` 后采样结果已归档到：
+  - `docs/cases/xxhash/artifacts/2026-04-02-main-workspace-post-scrub-feature-status.json`
+  - `docs/cases/xxhash/artifacts/2026-04-02-main-workspace-post-scrub-check.json`
+  - `docs/cases/xxhash/artifacts/2026-04-02-main-workspace-post-scrub-doctor.json`
+- 同日对 `testing/projects/xxHash-autox86-quality-20260402` 做了新的 Tier-1 单文件质量探针：
+  - 先执行 `feature reinit / check / verify`
+  - 再执行 `translate --file src/mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+- 这次针对性排查后，质量线结论发生了两点关键变化：
+  - `code_analyse --reinit` 已能完整通过 `mod_xxh_x86dispatch`
+  - 之前污染单文件判断的 crate 级 `E0428`（`uint/ushort/ulong` 重复 typedef）已被清掉
+- 当前该探针工作区再跑 `RUSTC_BOOTSTRAP=1 cargo check -q` 时：
+  - 不再出现 `E0428`
+  - 剩余唯一编译错误收敛为 `fun_XSUM_autox86.rs` 本体的 `E0133`
+  - 具体表现为：`XXH_featureTest()` 调用仍未包裹 `unsafe`
+- 在该探针副本上做最小人工修复后：
+  - 仅将 `let vecVersion = XXH_featureTest();` 改为 `let vecVersion = unsafe { XXH_featureTest() };`
+  - `RUSTC_BOOTSTRAP=1 cargo check -q` 可立即通过
+- 这进一步说明：
+  - `XSUM_autox86` 已可作为稳定的函数级翻译质量样例
+  - 当前真实缺口是单点 `unsafe extern` 调用 lowering / fix 未自动完成
+  - 不需要再先处理 crate 级类型噪音或 `code_analyse` 前置阻塞
+- 这说明：
+  - `translate --file` 已经可以用于真正的函数级质量探针
+  - 当前 `autox86` 的质量评估已不再被全局 typedef 噪音污染
+  - 下一步质量改进可以直接聚焦函数本体翻译/修复，而不必先处理 crate 级假阳性
+- 本轮额外暴露并已处理的工程问题：
+  - `code_analyse` 在扫描 `xxh_x86dispatch` 生成的 `types.h` 时，会遇到 `_mm_empty` 等系统 intrinsic 的 `extern __inline` 声明缺少 `global_name`
+  - 现已改为：缺失 `global_name` 时保留原声明并继续，不再中断整个 `reinit`
+  - 同时抑制了这类 intrinsic 在 `rename_macro` 阶段的海量重复日志
+
 ## 截至 2026-03-19 的状态更新
 
 - 新机器迁移后，`c2rust-xw` 的本地开发环境已重新打通：
@@ -15,8 +330,10 @@
   - 非 TTY 场景不再因交互提示直接崩溃
   - 初始化验证失败时会默认 `Skip`，同时保留失败现场
 - 同时也确认了一个基线偏差：
-  - 当前这条开发线与当前本机安装产物里，并不包含文档里曾提到的 `translate --file/--max-files`
-  - 因此那些单文件探针结论目前只能视为历史实验记录，不能视为当前基线能力
+  - 早先一段时间里，当前这条开发线与当前本机安装产物并不包含文档里提到的 `translate --file/--max-files`
+  - 截至 `2026-04-02`，`translate --file` 已重新落地主线
+  - `--max-files` 仍未恢复
+  - 因此后续单文件探针应统一基于 `translate --file`
 - 当前最新首个真实初始化阻塞已前移到：
   - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs`
 - 该阻塞不是 hybrid build 问题，而是首轮翻译产物中的 C 字符串字面量 lowering 问题
@@ -96,8 +413,9 @@
   - `feature reinit/check/doctor/verify/scrub` 可用
   - 非 TTY 与 TTY 的 skip 记录可持久化
   - 当前基线应以 feature 生命周期命令为准
-  - 历史文档里提到的 `--max-files` 与 `--file` 单文件探针，不应再表述为当前主线已可用能力
-  - 相关 fix-scope / validation-scope 结论目前只能保留为历史实验记录
+  - `translate --file` 已重新恢复为当前主线可用能力
+  - `--max-files` 仍不能表述为当前主线可用能力
+  - 旧的 `--max-files` 相关结论仍只保留为历史实验记录
 - 在 `testing/projects/xxHash-hybridset-v2-20260312` 上已经验证：
   - Rust build 通过
   - hybrid build 通过

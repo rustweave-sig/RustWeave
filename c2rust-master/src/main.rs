@@ -88,6 +88,9 @@ enum Commands {
         max_warning_fix_attempts: Option<usize>,
 
         #[arg(long)]
+        file: Option<String>,
+
+        #[arg(long)]
         show_full_output: bool,
     },
 
@@ -812,7 +815,11 @@ fn print_doctor_summary(status: &FeatureStatus, report: &FeaturePhaseReport) {
 fn overall_status(report: &FeaturePhaseReport) -> &'static str {
     if !report.blocking.is_empty() {
         "blocked"
-    } else if !report.warnings.is_empty() {
+    } else if report
+        .warnings
+        .iter()
+        .any(|warning| *warning != "translation_stats_missing")
+    {
         "degraded"
     } else {
         "ready"
@@ -1740,6 +1747,7 @@ fn main() {
             allow_all,
             max_error_fix_attempts,
             max_warning_fix_attempts,
+            file,
             show_full_output,
         } => {
             let feature_name = feature.clone().unwrap_or_else(|| "default".to_string());
@@ -1755,6 +1763,11 @@ fn main() {
 
             if allow_all {
                 args.push("--allow-all".to_string());
+            }
+
+            if let Some(file) = file {
+                args.push("--file".to_string());
+                args.push(file);
             }
 
             if let Some(attempts) = max_error_fix_attempts {
@@ -2164,6 +2177,26 @@ mod tests {
         assert!(report.verify_blockers.is_empty());
         assert!(report.warnings.contains(&"recoverable_with_scrub"));
         assert!(report.warnings.contains(&"translation_stats_missing"));
+    }
+
+    #[test]
+    fn test_overall_status_keeps_translation_stats_missing_as_ready() {
+        let report = FeaturePhaseReport {
+            warnings: vec!["translation_stats_missing"],
+            ..FeaturePhaseReport::default()
+        };
+
+        assert_eq!(overall_status(&report), "ready");
+    }
+
+    #[test]
+    fn test_overall_status_keeps_other_warnings_as_degraded() {
+        let report = FeaturePhaseReport {
+            warnings: vec!["verify_will_skip_tests"],
+            ..FeaturePhaseReport::default()
+        };
+
+        assert_eq!(overall_status(&report), "degraded");
     }
 
     #[test]

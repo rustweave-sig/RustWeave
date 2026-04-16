@@ -1,0 +1,21 @@
+metric,value,notes
+workspace,testing/projects/xxHash-autox86-quality-20260402,current autox86 minimal runnable sample
+build_status,pass,hybrid make xxhsum passed
+runtime_smoke,pass,"./xxhsum --version and single-file hash both passed"
+native_hybrid_output_match,pass,hybrid and native xxhsum produced identical output for /tmp/xxh_autox86_smoke.txt
+total_rs_files,901,all .rs files under .c2rust/default/rust/src
+nonempty_rs_files,457,non-empty .rs files
+empty_stub_rs_files,444,zero-size .rs files
+nonempty_fun_files,2,only fun_XSUM_autox86.rs and fun_XSUM_benchInternal.rs are non-empty
+nonempty_var_files,0,all var_*.rs are empty in this sample
+nonempty_decl_files,446,all decl_*.rs are non-empty
+unsafe_files_all_nonempty,11,files containing the string unsafe among all non-empty .rs
+unsafe_file_ratio_all_nonempty,0.0241,11 / 457
+unsafe_lines_all_nonempty,1945,lines containing the string unsafe among all non-empty .rs
+unsafe_line_ratio_all_nonempty,0.0952,1945 / 20438
+unsafe_fun_files,2,all non-empty function entity files contain unsafe
+unsafe_fun_file_ratio,1.0000,2 / 2
+unsafe_fun_line_ratio,0.2063,13 / 63 lines in non-empty function entity files
+translation_stats_total_files,2,translation_stats.json reconciled with current non-empty fun_/var_ workspace files
+selected_files_count,8,selected_files.json currently lists 8 selected c2rust source files
+selected_files_path_stale,no,selected_files.json has been rewritten to project-root-relative paths

@@ -550,11 +550,11 @@ r#"// 对应__attribute__((weak))弱链接符号.
         // Collect idents already defined in cstddef to avoid duplicates from bindgen output.
         // Bindgen generates type aliases from C typedefs (e.g. typedef unsigned int uint;),
         // which would conflict with the canonical cstddef definitions.
-        let cstddef_names: HashSet<proc_macro2::Ident> = c_items
+        let cstddef_names: HashSet<String> = c_items
             .iter()
             .filter_map(|item| {
                 if let syn::Item::Type(t) = item {
-                    Some(t.ident.clone())
+                    Some(t.ident.to_string())
                 } else {
                     None
                 }
@@ -563,12 +563,25 @@ r#"// 对应__attribute__((weak))弱链接符号.
         let mut result = c_items;
         result.extend(items.into_iter().filter(|item| {
             if let syn::Item::Type(t) = item {
-                !cstddef_names.contains(&t.ident)
+                !cstddef_names.contains(&t.ident.to_string())
             } else {
                 true
             }
         }));
         result
+    }
+
+    fn dedup_type_aliases_preserve_first(items: Vec<syn::Item>) -> Vec<syn::Item> {
+        let mut seen = HashSet::new();
+        items.into_iter()
+            .filter(|item| {
+                if let syn::Item::Type(t) = item {
+                    seen.insert(t.ident.to_string())
+                } else {
+                    true
+                }
+            })
+            .collect()
     }
 
     fn create_file_directories(&self) -> Result<()> {
@@ -704,6 +717,7 @@ r#"// 对应__attribute__((weak))弱链接符号.
         let content = fs::read_to_string(&mod_rs).log_err(&format!("read {}", mod_rs.display()))?;
         let mut ast = syn::parse_file(&content).log_err(&format!("parse {}", mod_rs.display()))?;
         ast.items = Self::add_cstddef_items(ast.items);
+        ast.items = Self::dedup_type_aliases_preserve_first(ast.items);
         let use_super =
             syn::parse_str(&format!("#[allow(unused_imports)]\nuse super::*;")).unwrap();
         ast.items.insert(0, use_super);
@@ -1886,6 +1900,34 @@ pub struct MyStruct {
             }
         });
         assert!(has_my_struct);
+    }
+
+    #[test]
+    fn test_dedup_type_aliases_preserve_first() {
+        let items = syn::parse_file(
+            r#"
+type uint = c_uint;
+pub type uint = ::core::ffi::c_uint;
+type ulong = c_ulong;
+pub type ulong = ::core::ffi::c_ulong;
+pub struct KeepMe;
+"#,
+        )
+        .unwrap()
+        .items;
+
+        let result = Feature::dedup_type_aliases_preserve_first(items);
+        let rendered = prettyplease::unparse(&syn::File {
+            shebang: None,
+            attrs: vec![],
+            items: result,
+        });
+
+        assert_eq!(rendered.matches("type uint").count(), 1);
+        assert_eq!(rendered.matches("type ulong").count(), 1);
+        assert!(rendered.contains("struct KeepMe"));
+        assert!(!rendered.contains("pub type uint = ::core::ffi::c_uint;"));
+        assert!(!rendered.contains("pub type ulong = ::core::ffi::c_ulong;"));
     }
 
     #[test]

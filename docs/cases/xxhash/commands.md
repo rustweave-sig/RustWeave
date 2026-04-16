@@ -1,5 +1,24 @@
 # 命令记录
 
+## 2026-04-15 autox86 最小闭合链路
+
+- 强制刷新导出：
+  - `C2RUST_CODE_UPDATE_FORCE=1 code_analyse --feature default --update`
+- hybrid 最小验证：
+  - `LD_PRELOAD=/path/to/libc2rust-hybrid-build.so C2RUST_FEATURE_ROOT=/path/to/.c2rust/default C2RUST_PROJECT_ROOT=/path/to/project C2RUST_RUST_LIB=/path/to/.c2rust/default/rust/target/debug/librust.a C2RUST_LD_TARGET=xxhsum bash -lc 'make clean >/dev/null && make xxhsum'`
+- 最小运行验证：
+  - `./xxhsum --version`
+  - `printf 'abc\n' > /tmp/xxh_autox86_smoke.txt && ./xxhsum /tmp/xxh_autox86_smoke.txt`
+
+说明：
+
+- 这一轮验证对应的关键修复是：
+  - 把无 `global_name` 的 `extern inline` intrinsic 导出从“跨 TU 外导”改成“局部 `static inline`”
+- 修复前，hybrid 链接会卡在：
+  - `xxhash.o`
+  - `xxh_x86dispatch.o`
+  的 `_mm_*` `multiple definition`
+- 修复后，`xxhsum` 已可成功链接并执行
 ## 原生基线
 
 - `make clean`
@@ -26,12 +45,35 @@
 - `c2rust-xw feature status --feature default`
 - `c2rust-xw feature check --feature default`
 - `c2rust-xw feature doctor --feature default`
+- `python3 /path/to/C2RustXW-CLI/tools/feature_json_summary.py status default --bin /path/to/C2RustXW-CLI/c2rust-master/target/debug/c2rust-xw`
+- `python3 /path/to/C2RustXW-CLI/tools/feature_json_summary.py check default --bin /path/to/C2RustXW-CLI/c2rust-master/target/debug/c2rust-xw`
+- `python3 /path/to/C2RustXW-CLI/tools/feature_json_summary.py doctor default --bin /path/to/C2RustXW-CLI/c2rust-master/target/debug/c2rust-xw`
 - `c2rust-xw feature scrub --feature default`
+
+说明：
+
+- 上面三条 Python 命令用于把 `feature status/check/doctor --json` 压缩成更稳定的摘要 JSON，适合测试脚本、TTY 录屏对照和回归归档。
+- 若当前 PATH 中安装版 `c2rust-xw` 较旧，不支持 `--json`，应显式传入仓库内刚构建的 `target/debug/c2rust-xw`。
 
 ## CLI 翻译尝试
 
 - `c2rust-xw translate --show-full-output`
 - `c2rust-xw translate --allow-all --max-fix-attempts 1 --show-full-output`
+- `c2rust-xw translate --feature default --allow-all --max-fix-attempts 1 --file src/mod_cli_xsum_arch/fun_XSUM_autox86.rs --show-full-output`
+
+说明：
+
+- `translate --file` 当前已重新落地主线，可再次用于单文件质量探针。
+- 该能力定位为开发者/测试高级能力：
+  - 适合单目标调试
+  - 适合 fix-loop 观测
+  - 适合 Tier-1 / Tier-2 质量样例
+  - 不应替代整工作区翻译主路径
+- 配合当前主线 stats 规则，`--file` 参数应统一传入 `src/...` 路径：
+  - 例如：
+    - `src/mod_cli_xsum_arch/fun_XSUM_autox86.rs`
+  - 不应再把 stats / 报告口径记成裸的：
+    - `mod_cli_xsum_arch/fun_XSUM_autox86.rs`
 
 ## 回归命令集合
 
@@ -111,6 +153,13 @@
    - 剩余空 stub
    - 每个目标的最终阶段
    - 全局前沿文件
+8. 如需结构化采样，同步记录：
+   - `python3 /path/to/C2RustXW-CLI/tools/feature_json_summary.py check default --bin /path/to/C2RustXW-CLI/c2rust-master/target/debug/c2rust-xw`
+   - `python3 /path/to/C2RustXW-CLI/tools/feature_json_summary.py doctor default --bin /path/to/C2RustXW-CLI/c2rust-master/target/debug/c2rust-xw`
+9. 每次 targeted rerun 后，补看一次：
+   - `.c2rust/default/translation_stats.json`
+   - 确认 `file_attempts` / `skipped_files` / `translation_failed_files` 只包含 `src/...` 路径
+   - 若仍出现 `mod_...` 路径，应视为 stats canonicalization 回归
 
 当前解读：
 
