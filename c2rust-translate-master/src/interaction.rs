@@ -63,8 +63,9 @@ pub enum SkippedFilesChoice {
 /// 发现已有翻译进度时的用户选择
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ContinueChoice {
-    Continue, // 继续之前的进度
-    Restart,  // 开始新的翻译会话
+    Continue,        // 继续之前的进度
+    Restart,         // 开始新的翻译会话
+    FixSkippedFiles, // 修复上次运行中被跳过的文件
 }
 
 /// 测试配置缺失时的用户选择
@@ -663,12 +664,20 @@ pub fn prompt_skipped_files_choice(skipped_files: &[String]) -> Result<SkippedFi
     }
 }
 
-/// 询问用户是否继续之前的翻译进度或开始新的会话
-pub fn prompt_continue_or_restart() -> Result<ContinueChoice> {
-    let options = vec![
+fn build_resume_options(has_skipped_files: bool) -> Vec<&'static str> {
+    let mut options = vec![
         "Continue previous progress (resume from where you left off)",
         "Start fresh (clear all progress)",
     ];
+    if has_skipped_files {
+        options.push("Fix skipped files (attempt to translate skipped files from the previous run)");
+    }
+    options
+}
+
+/// 询问用户是否继续之前的翻译进度、重新开始，或修复之前跳过的文件
+pub fn prompt_continue_or_restart(has_skipped_files: bool) -> Result<ContinueChoice> {
+    let options = build_resume_options(has_skipped_files);
 
     if !has_interactive_terminal() {
         println!(
@@ -690,6 +699,7 @@ pub fn prompt_continue_or_restart() -> Result<ContinueChoice> {
     {
         0 => Ok(ContinueChoice::Continue),
         1 => Ok(ContinueChoice::Restart),
+        2 if has_skipped_files => Ok(ContinueChoice::FixSkippedFiles),
         _ => unreachable!(),
     }
 }
@@ -784,7 +794,33 @@ mod tests {
     fn test_continue_choice_variants() {
         assert_eq!(ContinueChoice::Continue, ContinueChoice::Continue);
         assert_eq!(ContinueChoice::Restart, ContinueChoice::Restart);
+        assert_eq!(ContinueChoice::FixSkippedFiles, ContinueChoice::FixSkippedFiles);
         assert_ne!(ContinueChoice::Continue, ContinueChoice::Restart);
+    }
+
+    #[test]
+    fn test_build_resume_options_without_skipped_files() {
+        let options = build_resume_options(false);
+        assert_eq!(
+            options,
+            vec![
+                "Continue previous progress (resume from where you left off)",
+                "Start fresh (clear all progress)",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_resume_options_with_skipped_files() {
+        let options = build_resume_options(true);
+        assert_eq!(
+            options,
+            vec![
+                "Continue previous progress (resume from where you left off)",
+                "Start fresh (clear all progress)",
+                "Fix skipped files (attempt to translate skipped files from the previous run)",
+            ]
+        );
     }
 
     #[test]
