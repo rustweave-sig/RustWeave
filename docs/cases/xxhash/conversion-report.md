@@ -168,6 +168,48 @@
 
 ### 3.4 当前转换结果
 
+补充到 `2026-05-08` 的最新口径：
+
+- 当前 `xxHash` 已新增“小文件 batch 翻译质量样例”。
+- 该样例不再只验证单个 `fun_*.rs`，而是验证：
+  - `code_analyse` 生成 `translation_plan.json`
+  - `translate` 按 plan 识别 batch candidate
+  - `translate --file` 自动扩展到 unit
+  - `translate --unit` 直接指定 unit
+  - batch 输出拆回多个 `fun_*.rs / var_*.rs`
+  - 随后继续走 Rust check 与 hybrid build
+- 已验证通过的 unit：
+  - `mod_cli_xsum_arch`：`17` 行，`2` 个 symbol
+  - `mod_cli_xsum_output`：`1` 行，`1` 个 symbol
+  - `mod_cli_xsum_os_specific`：`34` 行，`7` 个 symbol
+- `mod_cli_xsum_os_specific` 的最终复现命令：
+  - `C2RUST_HOME=/tmp/c2rust-home C2RUST_TRANSLATE_DIR=/home/server/C2RustXW-workspace-wsl/tools/.local-dev/python/translate_and_fix C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS=8 /tmp/c2rust-home/bin/c2rust-xw translate --feature default --allow-all --unit mod_cli_xsum_os_specific --show-full-output --max-error-fix-attempts 1 --max-warning-fix-attempts 1`
+- 最终日志：
+  - `/tmp/xxhash-batch-os-specific-xw-final.log`
+- 最终统计：
+  - `Attempting batch translation = 1`
+  - `Batch translation fallback = 0`
+  - `Check successful = 7`
+  - `Hybrid build tests passed = 7`
+  - `still has build errors = 0`
+  - `Skipping file = 0`
+- batch 输入完整性修正：
+  - 初版 batch 实现只把 group 内第一个目标的 sidecar `.c` 传给模型
+  - 现已改为聚合 group 内所有目标 sidecar `.c` 到 `rust/target/batch-translate/unit.c`
+  - 修复后用 `mod_cli_xsum_arch` 复跑确认：
+    - batch C preview 同时包含 `fun_XSUM_autox86.rs` 和 `var_g_xsumarch_avoid_empty_unit.rs`
+    - 2 个目标均通过 Rust check、warning check、hybrid build 和 `make test_sanity`
+    - 日志：`/tmp/xxhash-batch-arch-aggregated.log`
+- 这个结果的工程含义：
+  - 当前 batch 不是把最终产物改成“一个 C 文件对应一个 Rust 文件”
+  - 状态管理仍保持在 `fun_*.rs / var_*.rs` 粒度
+  - batch 只扩大模型输入上下文，用于提升小 helper / wrapper 的翻译质量
+  - 因而它与现有 `translation_stats`、`feature scrub`、hybrid build 兼容
+- 当前限制：
+  - `translation_plan.json` 的 unit 当前仍以现有 `mod_xxx` 为边界
+  - 已生成基于符号引用的轻量跨 unit 顺序，但尚未完成 include/macro/类型依赖/函数指针级的完整项目依赖图
+  - `mod_cli_xsum_bench` 约 `321` 行、`28` 个 symbol，暂不适合直接作为整 unit batch
+
 补充到 `2026-03-19` 的最新口径：
 
 - 在迁移后的 Ubuntu 机器上，`feature` 生命周期链路已重新打通：
@@ -651,3 +693,39 @@
 [issues.md](./issues.md)
 [meeting-outline.md](./meeting-outline.md)
 [fullminset-blocker-20260313.md](./fullminset-blocker-20260313.md)
+
+## 7. 2026-05-09 补充：小文件 batch 翻译质量探针
+
+本轮新增验证目标不是完整 `xxHash` 全量翻译，而是验证“文件/translation unit 依赖分析驱动的小文件 batch 翻译”是否能提升局部闭包质量。
+
+已落地能力：
+
+- `translate --unit <unit_id>`
+- `translate --file <path>` 命中 batch candidate 时自动扩展到 unit
+- 大 unit 内按 sidecar `.c` 行数和 symbol 数切子 batch
+- batch C 输入聚合所有目标 sidecar `.c`，不再只传第一个 C 片段
+- batch 输出仍写回原符号文件，状态管理仍以 `fun_*.rs / var_*.rs` 为单位
+
+`xxHash` 验证结果：
+
+- 小 unit：`mod_cli_xsum_arch` 聚合输入验证通过
+- 大 unit：`mod_cli_xsum_bench` 默认切成 `6` 个子 batch
+- 受控探针入口：`src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs`
+- 实际扩展目标数：`6`
+- 第三轮 prompt 修正后结果：
+  - Rust check 通过
+  - hybrid build 通过
+  - `make test_sanity` 通过
+  - `skipped_files = []`
+  - 该 `6` 个目标均不在 `translation_failed_files`
+- 关键日志：
+  - `/tmp/xxhash-batch-arch-aggregated.log`
+  - `/tmp/xxhash-bench-subbatch-findmaxmem-prompt3.log`
+  - `/tmp/xxhash-batch-pointer-prompt-20260509.log`
+
+新增发现：
+
+- batch 生成后逐符号 warning check 会把 sibling warning 归因到当前目标流程中。
+- 该问题已处理：batch 输出复用路径下 warning 修复只作用于当前目标文件。
+- 2026-05-09 复测还暴露并修正了一个泛化 prompt 问题：`void*` / `const void*` 的 `NULL` 初始化必须显式标注 Rust raw pointer 类型，否则会生成 `core::ptr::null_mut()` 导致 `E0282`。
+- 这使 batch 质量评估更清晰，但还没有解决完整 C 项目依赖图和结构化 batch stats 的问题。

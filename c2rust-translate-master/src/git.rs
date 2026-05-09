@@ -97,7 +97,10 @@ pub fn git_gc(aggressive: bool) {
     let project_root = match util::find_project_root() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Warning: git gc skipped, could not find project root: {}", e);
+            eprintln!(
+                "Warning: git gc skipped, could not find project root: {}",
+                e
+            );
             return;
         }
     };
@@ -153,7 +156,13 @@ pub fn git_expire_reflog() {
 
     match Command::new("git")
         .current_dir(&c2rust_dir)
-        .args(["reflog", "expire", "--expire=90.days.ago", "--expire-unreachable=90.days.ago", "--all"])
+        .args([
+            "reflog",
+            "expire",
+            "--expire=90.days.ago",
+            "--expire-unreachable=90.days.ago",
+            "--all",
+        ])
         .output()
     {
         Err(e) => {

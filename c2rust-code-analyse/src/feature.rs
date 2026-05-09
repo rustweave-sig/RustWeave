@@ -2,6 +2,7 @@ use crate::{get_root, File, Node, Result, ToError};
 use hierr::Error;
 use quote::{quote, ToTokens};
 use regex::Regex;
+use serde_derive::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::env::{remove_var, set_var, var};
 use std::ffi::OsStr;
@@ -25,6 +26,35 @@ pub struct Feature {
     pub name: String,
     pub files: Vec<File>,
     fast: bool,
+}
+
+#[derive(Serialize)]
+struct TranslationPlan {
+    version: u32,
+    generated_by: String,
+    feature: String,
+    unit_edges: Vec<[String; 2]>,
+    unit_scc_groups: Vec<Vec<String>>,
+    unit_order: Vec<String>,
+    units: Vec<TranslationUnitPlan>,
+}
+
+#[derive(Serialize)]
+struct TranslationUnitPlan {
+    unit_id: String,
+    source: String,
+    module: String,
+    line_count: usize,
+    symbols: Vec<String>,
+    edges: Vec<[String; 2]>,
+    scc_groups: Vec<Vec<String>>,
+    batch_candidate: bool,
+    batch_reason: String,
+}
+
+struct TranslationUnitAnalysis {
+    plan: TranslationUnitPlan,
+    symbol_entries: Vec<(String, String, String)>,
 }
 
 impl Feature {
@@ -300,7 +330,11 @@ impl Feature {
                     continue;
                 }
 
-                let need_validate = Self::needs_validation(&rust_file, loaded_from_json, node.kind.has_committed())?;
+                let need_validate = Self::needs_validation(
+                    &rust_file,
+                    loaded_from_json,
+                    node.kind.has_committed(),
+                )?;
 
                 let not_empty = if need_validate {
                     let result = Self::validate_file(
@@ -358,6 +392,7 @@ impl Feature {
         } else {
             println!("Feature '{}' already up to date", self.name);
         }
+        self.generate_translation_plan()?;
         Ok(())
     }
 
@@ -495,7 +530,7 @@ impl Feature {
     }
 
     pub fn lib_attrs() -> &'static str {
-r#"// 对应__attribute__((weak))弱链接符号.
+        r#"// 对应__attribute__((weak))弱链接符号.
 // 构建环境需要设置变量RUSTC_BOOTSTRAP=1
 #![feature(linkage)]
 #![allow(non_camel_case_types)]
@@ -573,7 +608,8 @@ r#"// 对应__attribute__((weak))弱链接符号.
 
     fn dedup_type_aliases_preserve_first(items: Vec<syn::Item>) -> Vec<syn::Item> {
         let mut seen = HashSet::new();
-        items.into_iter()
+        items
+            .into_iter()
             .filter(|item| {
                 if let syn::Item::Type(t) = item {
                     seen.insert(t.ident.to_string())
@@ -936,6 +972,518 @@ r#"// 对应__attribute__((weak))弱链接符号.
         }
         name
     }
+
+    fn translation_batch_max_c_lines() -> usize {
+        Self::translation_plan_env_usize("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", 100)
+    }
+
+    fn translation_batch_max_symbols() -> usize {
+        Self::translation_plan_env_usize("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS", 6)
+    }
+
+    fn translation_plan_env_usize(name: &str, default: usize) -> usize {
+        var(name)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn source_path_for_plan(&self, file: &File) -> String {
+        file.path()
+            .strip_prefix(self.root.join("c"))
+            .unwrap_or(file.path())
+            .display()
+            .to_string()
+    }
+
+    fn symbol_paths_for_plan(&self, file: &File, mod_name: &str) -> Result<Vec<String>> {
+        let mut symbols = Vec::new();
+        for node in file.iter() {
+            if !Self::is_node_definition(node) || node.kind.is_variadic() {
+                continue;
+            }
+            let prefixed_name = Self::prefixed_filename(node)?;
+            symbols.push(format!("src/{mod_name}/{prefixed_name}.rs"));
+        }
+        symbols.sort();
+        symbols.dedup();
+        Ok(symbols)
+    }
+
+    fn symbol_code_map_for_plan(
+        &self,
+        file: &File,
+        mod_name: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let c_root = self.root.join("c");
+        let mut entries = Vec::new();
+        for node in file.iter() {
+            if !Self::is_node_definition(node) || node.kind.is_variadic() {
+                continue;
+            }
+            let Some(name) = node.kind.name() else {
+                continue;
+            };
+            let prefixed_name = Self::prefixed_filename(node)?;
+            let symbol_path = format!("src/{mod_name}/{prefixed_name}.rs");
+            let c_code = Self::normalize_c_code(node, &c_root)?;
+            entries.push((Self::normalize_name(name).to_string(), symbol_path, c_code));
+        }
+        entries.sort_by(|left, right| left.1.cmp(&right.1));
+        entries.dedup_by(|left, right| left.1 == right.1);
+        Ok(entries)
+    }
+
+    fn unit_line_count_for_plan(&self, file: &File) -> usize {
+        let c_root = self.root.join("c");
+        file.iter()
+            .iter()
+            .filter(|node| Self::is_node_definition(node) && !node.kind.is_variadic())
+            .filter_map(|node| node.kind.c_code(&c_root).ok())
+            .map(|code| code.lines().count())
+            .sum()
+    }
+
+    fn batch_decision_reason(line_count: usize, symbol_count: usize) -> (bool, String) {
+        let max_lines = Self::translation_batch_max_c_lines();
+        let max_symbols = Self::translation_batch_max_symbols();
+        if symbol_count == 0 {
+            return (false, "unit has no translatable symbols".to_string());
+        }
+        if line_count > max_lines {
+            return (
+                false,
+                format!("line_count {line_count} exceeds threshold {max_lines}"),
+            );
+        }
+        if symbol_count > max_symbols {
+            return (
+                false,
+                format!("symbol_count {symbol_count} exceeds threshold {max_symbols}"),
+            );
+        }
+        (
+            true,
+            format!(
+                "eligible for batch translation: line_count {line_count} <= {max_lines}, symbol_count {symbol_count} <= {max_symbols}"
+            ),
+        )
+    }
+
+    fn build_unit_edges(symbol_entries: &[(String, String, String)]) -> Vec<[String; 2]> {
+        let mut edges = Vec::new();
+        let name_to_symbol: HashMap<&str, &str> = symbol_entries
+            .iter()
+            .map(|(name, symbol, _)| (name.as_str(), symbol.as_str()))
+            .collect();
+
+        for (from_name, from_symbol, from_code) in symbol_entries {
+            for referenced_name in Self::referenced_identifiers(from_code, from_name) {
+                let Some(to_symbol) = name_to_symbol.get(referenced_name.as_str()) else {
+                    continue;
+                };
+                if from_symbol == *to_symbol {
+                    continue;
+                }
+                edges.push([(*to_symbol).to_string(), from_symbol.clone()]);
+            }
+        }
+        edges.sort();
+        edges.dedup();
+        edges
+    }
+
+    fn referenced_identifiers(code: &str, current_name: &str) -> Vec<String> {
+        fn is_ident_start(byte: u8) -> bool {
+            byte == b'_' || byte.is_ascii_alphabetic()
+        }
+
+        fn is_ident_continue(byte: u8) -> bool {
+            is_ident_start(byte) || byte.is_ascii_digit()
+        }
+
+        let code = Self::code_without_comments_and_literals(code);
+        let bytes = code.as_bytes();
+        let mut refs = std::collections::BTreeSet::new();
+        let mut idx = 0;
+
+        while idx < bytes.len() {
+            if !is_ident_start(bytes[idx]) {
+                idx += 1;
+                continue;
+            }
+
+            let start = idx;
+            idx += 1;
+            while idx < bytes.len() && is_ident_continue(bytes[idx]) {
+                idx += 1;
+            }
+
+            let ident = &code[start..idx];
+            if ident != current_name {
+                refs.insert(ident.to_string());
+            }
+        }
+
+        refs.into_iter().collect()
+    }
+
+    fn code_without_comments_and_literals(code: &str) -> String {
+        #[derive(Clone, Copy)]
+        enum State {
+            Normal,
+            LineComment,
+            BlockComment,
+            StringLiteral,
+            CharLiteral,
+        }
+
+        fn push_space_preserving_newline(out: &mut Vec<u8>, byte: u8) {
+            if byte == b'\n' {
+                out.push(b'\n');
+            } else {
+                out.push(b' ');
+            }
+        }
+
+        let bytes = code.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut state = State::Normal;
+        let mut idx = 0;
+
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            match state {
+                State::Normal => {
+                    if byte == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'/' {
+                        out.extend_from_slice(b"  ");
+                        idx += 2;
+                        state = State::LineComment;
+                    } else if byte == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                        out.extend_from_slice(b"  ");
+                        idx += 2;
+                        state = State::BlockComment;
+                    } else if byte == b'"' {
+                        out.push(b' ');
+                        idx += 1;
+                        state = State::StringLiteral;
+                    } else if byte == b'\'' {
+                        out.push(b' ');
+                        idx += 1;
+                        state = State::CharLiteral;
+                    } else {
+                        out.push(byte);
+                        idx += 1;
+                    }
+                }
+                State::LineComment => {
+                    push_space_preserving_newline(&mut out, byte);
+                    idx += 1;
+                    if byte == b'\n' {
+                        state = State::Normal;
+                    }
+                }
+                State::BlockComment => {
+                    if byte == b'*' && idx + 1 < bytes.len() && bytes[idx + 1] == b'/' {
+                        out.extend_from_slice(b"  ");
+                        idx += 2;
+                        state = State::Normal;
+                    } else {
+                        push_space_preserving_newline(&mut out, byte);
+                        idx += 1;
+                    }
+                }
+                State::StringLiteral => {
+                    push_space_preserving_newline(&mut out, byte);
+                    idx += 1;
+                    if byte == b'\\' && idx < bytes.len() {
+                        push_space_preserving_newline(&mut out, bytes[idx]);
+                        idx += 1;
+                    } else if byte == b'"' {
+                        state = State::Normal;
+                    }
+                }
+                State::CharLiteral => {
+                    push_space_preserving_newline(&mut out, byte);
+                    idx += 1;
+                    if byte == b'\\' && idx < bytes.len() {
+                        push_space_preserving_newline(&mut out, bytes[idx]);
+                        idx += 1;
+                    } else if byte == b'\'' {
+                        state = State::Normal;
+                    }
+                }
+            }
+        }
+
+        String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+    }
+
+    #[cfg(test)]
+    fn code_references_symbol(code: &str, current_name: &str, target_name: &str) -> bool {
+        if current_name == target_name {
+            return false;
+        }
+        Self::referenced_identifiers(code, current_name)
+            .iter()
+            .any(|ident| ident == target_name)
+    }
+
+    fn topo_sort_with_cycles(symbols: &[String], edges: &[[String; 2]]) -> Vec<String> {
+        let index_map: HashMap<&str, usize> = symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, symbol)| (symbol.as_str(), idx))
+            .collect();
+        let mut indegree = vec![0usize; symbols.len()];
+        let mut outgoing = vec![Vec::<usize>::new(); symbols.len()];
+        for [from, to] in edges {
+            let (Some(&from_idx), Some(&to_idx)) =
+                (index_map.get(from.as_str()), index_map.get(to.as_str()))
+            else {
+                continue;
+            };
+            outgoing[from_idx].push(to_idx);
+            indegree[to_idx] += 1;
+        }
+
+        let mut ready: Vec<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, deg)| (*deg == 0).then_some(idx))
+            .collect();
+        ready.sort_by(|left, right| symbols[*left].cmp(&symbols[*right]));
+
+        let mut order = Vec::with_capacity(symbols.len());
+        while let Some(idx) = ready.first().copied() {
+            ready.remove(0);
+            order.push(idx);
+            for &next in &outgoing[idx] {
+                indegree[next] = indegree[next].saturating_sub(1);
+                if indegree[next] == 0 {
+                    ready.push(next);
+                }
+            }
+            ready.sort_by(|left, right| symbols[*left].cmp(&symbols[*right]));
+        }
+
+        if order.len() < symbols.len() {
+            let mut remaining: Vec<_> = (0..symbols.len())
+                .filter(|idx| !order.contains(idx))
+                .collect();
+            remaining.sort_by(|left, right| symbols[*left].cmp(&symbols[*right]));
+            order.extend(remaining);
+        }
+
+        order.into_iter().map(|idx| symbols[idx].clone()).collect()
+    }
+
+    fn scc_groups_for_symbols(symbols: &[String], edges: &[[String; 2]]) -> Vec<Vec<String>> {
+        let index_map: HashMap<&str, usize> = symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, symbol)| (symbol.as_str(), idx))
+            .collect();
+        let mut graph = vec![Vec::<usize>::new(); symbols.len()];
+        for [from, to] in edges {
+            let (Some(&from_idx), Some(&to_idx)) =
+                (index_map.get(from.as_str()), index_map.get(to.as_str()))
+            else {
+                continue;
+            };
+            graph[from_idx].push(to_idx);
+        }
+
+        struct Tarjan<'a> {
+            graph: &'a [Vec<usize>],
+            index: usize,
+            indices: Vec<Option<usize>>,
+            lowlink: Vec<usize>,
+            stack: Vec<usize>,
+            on_stack: Vec<bool>,
+            groups: Vec<Vec<usize>>,
+        }
+
+        impl<'a> Tarjan<'a> {
+            fn strong_connect(&mut self, v: usize) {
+                self.indices[v] = Some(self.index);
+                self.lowlink[v] = self.index;
+                self.index += 1;
+                self.stack.push(v);
+                self.on_stack[v] = true;
+
+                for &w in &self.graph[v] {
+                    if self.indices[w].is_none() {
+                        self.strong_connect(w);
+                        self.lowlink[v] = self.lowlink[v].min(self.lowlink[w]);
+                    } else if self.on_stack[w] {
+                        self.lowlink[v] = self.lowlink[v].min(self.indices[w].unwrap());
+                    }
+                }
+
+                if self.lowlink[v] == self.indices[v].unwrap() {
+                    let mut group = Vec::new();
+                    while let Some(w) = self.stack.pop() {
+                        self.on_stack[w] = false;
+                        group.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    self.groups.push(group);
+                }
+            }
+        }
+
+        let mut tarjan = Tarjan {
+            graph: &graph,
+            index: 0,
+            indices: vec![None; symbols.len()],
+            lowlink: vec![0; symbols.len()],
+            stack: Vec::new(),
+            on_stack: vec![false; symbols.len()],
+            groups: Vec::new(),
+        };
+
+        for idx in 0..symbols.len() {
+            if tarjan.indices[idx].is_none() {
+                tarjan.strong_connect(idx);
+            }
+        }
+
+        let order_index: HashMap<String, usize> = Self::topo_sort_with_cycles(symbols, edges)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, symbol)| (symbol, idx))
+            .collect();
+
+        let mut groups: Vec<Vec<String>> = tarjan
+            .groups
+            .into_iter()
+            .map(|mut group| {
+                group.sort_by(|left, right| symbols[*left].cmp(&symbols[*right]));
+                group.into_iter().map(|idx| symbols[idx].clone()).collect()
+            })
+            .collect();
+
+        groups.sort_by_key(|group| {
+            group
+                .iter()
+                .filter_map(|symbol| order_index.get(symbol).copied())
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        groups
+    }
+
+    fn build_translation_unit_analysis(&self, file: &File) -> Result<TranslationUnitAnalysis> {
+        let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
+        let symbol_entries = self.symbol_code_map_for_plan(file, &mod_name)?;
+        let symbols = self.symbol_paths_for_plan(file, &mod_name)?;
+        let line_count = self.unit_line_count_for_plan(file);
+        let edges = Self::build_unit_edges(&symbol_entries);
+        let symbols = Self::topo_sort_with_cycles(&symbols, &edges);
+        let scc_groups = Self::scc_groups_for_symbols(&symbols, &edges);
+        let (batch_candidate, batch_reason) =
+            Self::batch_decision_reason(line_count, symbols.len());
+        Ok(TranslationUnitAnalysis {
+            plan: TranslationUnitPlan {
+                unit_id: mod_name.clone(),
+                source: self.source_path_for_plan(file),
+                module: mod_name,
+                line_count,
+                symbols,
+                edges,
+                scc_groups,
+                batch_candidate,
+                batch_reason,
+            },
+            symbol_entries,
+        })
+    }
+
+    fn build_cross_unit_edges(analyses: &[TranslationUnitAnalysis]) -> Vec<[String; 2]> {
+        let mut edges = Vec::new();
+        let mut symbol_to_units: HashMap<&str, Vec<&str>> = HashMap::new();
+        for unit in analyses {
+            for (symbol_name, _, _) in &unit.symbol_entries {
+                symbol_to_units
+                    .entry(symbol_name.as_str())
+                    .or_default()
+                    .push(unit.plan.unit_id.as_str());
+            }
+        }
+
+        for from_unit in analyses {
+            let from_unit_id = from_unit.plan.unit_id.as_str();
+            for (from_name, _, from_code) in &from_unit.symbol_entries {
+                for referenced_name in Self::referenced_identifiers(from_code, from_name) {
+                    let Some(target_units) = symbol_to_units.get(referenced_name.as_str()) else {
+                        continue;
+                    };
+                    for target_unit in target_units {
+                        if *target_unit == from_unit_id {
+                            continue;
+                        }
+                        edges.push([(*target_unit).to_string(), from_unit.plan.unit_id.clone()]);
+                    }
+                }
+            }
+        }
+        edges.sort();
+        edges.dedup();
+        edges
+    }
+
+    fn topo_sort_units_with_cycles(unit_ids: &[String], edges: &[[String; 2]]) -> Vec<String> {
+        Self::topo_sort_with_cycles(unit_ids, edges)
+    }
+
+    fn unit_scc_groups(unit_ids: &[String], edges: &[[String; 2]]) -> Vec<Vec<String>> {
+        Self::scc_groups_for_symbols(unit_ids, edges)
+    }
+
+    fn generate_translation_plan(&self) -> Result<()> {
+        let mut analyses = Vec::with_capacity(self.files.len());
+        for file in &self.files {
+            analyses.push(self.build_translation_unit_analysis(file)?);
+        }
+        analyses.sort_by(|left, right| left.plan.unit_id.cmp(&right.plan.unit_id));
+        let units: Vec<TranslationUnitPlan> = analyses
+            .iter()
+            .map(|analysis| TranslationUnitPlan {
+                unit_id: analysis.plan.unit_id.clone(),
+                source: analysis.plan.source.clone(),
+                module: analysis.plan.module.clone(),
+                line_count: analysis.plan.line_count,
+                symbols: analysis.plan.symbols.clone(),
+                edges: analysis.plan.edges.clone(),
+                scc_groups: analysis.plan.scc_groups.clone(),
+                batch_candidate: analysis.plan.batch_candidate,
+                batch_reason: analysis.plan.batch_reason.clone(),
+            })
+            .collect();
+        let unit_ids: Vec<String> = units.iter().map(|unit| unit.unit_id.clone()).collect();
+        let unit_edges = Self::build_cross_unit_edges(&analyses);
+        let unit_order = Self::topo_sort_units_with_cycles(&unit_ids, &unit_edges);
+        let unit_scc_groups = Self::unit_scc_groups(&unit_ids, &unit_edges);
+        let plan = TranslationPlan {
+            version: 1,
+            generated_by: "code_analyse".to_string(),
+            feature: self.name.clone(),
+            unit_edges,
+            unit_scc_groups,
+            unit_order,
+            units,
+        };
+        let path = self.root.join("translation_plan.json");
+        let content = serde_json::to_string_pretty(&plan).map_err(|_| Error::nomem())?;
+        fs::write(&path, content.as_bytes()).log_err(&format!("write {}", path.display()))?;
+        println!("Generated translation plan: {}", path.display());
+        Ok(())
+    }
+
     fn normalize_type(ty: &mut syn::Type) {
         let syn::Type::Ptr(ref mut ptr) = ty else {
             return;
@@ -989,10 +1537,10 @@ r#"// 对应__attribute__((weak))弱链接符号.
     pub fn get_mod_name_for_file(prefix: &Path, file: &File) -> Result<String> {
         let rel_path = Self::get_mod_rel_path(prefix, file)?;
         Ok("mod_".to_string()
-            + &rel_path
-                .display()
-                .to_string()
-                .replace(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'), "_"))
+            + &rel_path.display().to_string().replace(
+                |c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'),
+                "_",
+            ))
     }
 
     fn get_mod_rel_path(prefix: &Path, file: &File) -> Result<PathBuf> {
@@ -1030,7 +1578,11 @@ r#"// 对应__attribute__((weak))弱链接符号.
         )
     }
 
-    fn needs_validation(rust_file: &Path, loaded_from_json: bool, has_committed: bool) -> Result<bool> {
+    fn needs_validation(
+        rust_file: &Path,
+        loaded_from_json: bool,
+        has_committed: bool,
+    ) -> Result<bool> {
         // 如果不是从 JSON 文件加载，强制校验
         if !loaded_from_json || Self::update_force() {
             return Ok(true);
@@ -1042,8 +1594,8 @@ r#"// 对应__attribute__((weak))弱链接符号.
             return Ok(true);
         }
 
-        let rust_meta = fs::metadata(rust_file)
-            .log_err(&format!("metadata {}", rust_file.display()))?;
+        let rust_meta =
+            fs::metadata(rust_file).log_err(&format!("metadata {}", rust_file.display()))?;
         let rust_mtime = rust_meta
             .modified()
             .log_err("get modified time")?
@@ -1593,7 +2145,13 @@ r#"// 对应__attribute__((weak))弱链接符号.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn process_state_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Write `content` to both `mod.rs` and `mod.normalized` in `mod_dir`,
     /// matching the production layout that `collect_item_names_from_mod` expects.
@@ -1633,6 +2191,204 @@ mod tests {
 
         let content_b = fs::read_to_string(&fun_foo_b_rs).unwrap();
         assert_eq!(content_b.trim(), "pub fn foo() -> i32 { 42 }");
+    }
+
+    #[test]
+    fn test_translation_plan_env_usize_uses_default_for_invalid_values() {
+        let _guard = process_state_lock().lock().unwrap();
+        remove_var("C2RUST_TRANSLATE_BATCH_MAX_C_LINES");
+        assert_eq!(Feature::translation_batch_max_c_lines(), 100);
+
+        set_var("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", "0");
+        assert_eq!(Feature::translation_batch_max_c_lines(), 100);
+
+        set_var("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", "abc");
+        assert_eq!(Feature::translation_batch_max_c_lines(), 100);
+
+        set_var("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", "88");
+        assert_eq!(Feature::translation_batch_max_c_lines(), 88);
+
+        remove_var("C2RUST_TRANSLATE_BATCH_MAX_C_LINES");
+    }
+
+    #[test]
+    fn test_batch_decision_reason_rejects_large_units() {
+        let _guard = process_state_lock().lock().unwrap();
+        remove_var("C2RUST_TRANSLATE_BATCH_MAX_C_LINES");
+        remove_var("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS");
+
+        let (eligible, reason) = Feature::batch_decision_reason(101, 1);
+        assert!(!eligible);
+        assert!(reason.contains("line_count 101 exceeds threshold 100"));
+
+        let (eligible, reason) = Feature::batch_decision_reason(50, 7);
+        assert!(!eligible);
+        assert!(reason.contains("symbol_count 7 exceeds threshold 6"));
+    }
+
+    #[test]
+    fn test_batch_decision_reason_accepts_small_units() {
+        let _guard = process_state_lock().lock().unwrap();
+        remove_var("C2RUST_TRANSLATE_BATCH_MAX_C_LINES");
+        remove_var("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS");
+
+        let (eligible, reason) = Feature::batch_decision_reason(64, 3);
+        assert!(eligible);
+        assert!(reason.contains("eligible for batch translation"));
+    }
+
+    #[test]
+    fn test_code_references_symbol_detects_function_call() {
+        assert!(Feature::code_references_symbol(
+            "int a() { return helper(1); }",
+            "a",
+            "helper"
+        ));
+        assert!(!Feature::code_references_symbol(
+            "int helper() { return 0; }",
+            "helper",
+            "helper"
+        ));
+    }
+
+    #[test]
+    fn test_referenced_identifiers_extracts_unique_names() {
+        let refs = Feature::referenced_identifiers(
+            "int a() { helper(1); helper(2); int value = target + helper_result; return value; }",
+            "a",
+        );
+        assert!(refs.contains(&"helper".to_string()));
+        assert!(refs.contains(&"target".to_string()));
+        assert!(refs.contains(&"helper_result".to_string()));
+        assert!(!refs.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn test_referenced_identifiers_ignores_comments_and_literals() {
+        let refs = Feature::referenced_identifiers(
+            r#"
+            int caller(void) {
+                /* helper_in_block_comment(); */
+                // helper_in_line_comment();
+                const char* s = "helper_in_string()";
+                int c = 'x';
+                return real_helper();
+            }
+            "#,
+            "caller",
+        );
+        assert!(refs.contains(&"real_helper".to_string()));
+        assert!(!refs.contains(&"helper_in_block_comment".to_string()));
+        assert!(!refs.contains(&"helper_in_line_comment".to_string()));
+        assert!(!refs.contains(&"helper_in_string".to_string()));
+    }
+
+    #[test]
+    fn test_topo_sort_with_cycles_prefers_dependencies_first() {
+        let symbols = vec![
+            "src/mod/fun_caller.rs".to_string(),
+            "src/mod/fun_helper.rs".to_string(),
+            "src/mod/fun_leaf.rs".to_string(),
+        ];
+        let edges = vec![
+            [
+                "src/mod/fun_leaf.rs".to_string(),
+                "src/mod/fun_helper.rs".to_string(),
+            ],
+            [
+                "src/mod/fun_helper.rs".to_string(),
+                "src/mod/fun_caller.rs".to_string(),
+            ],
+        ];
+
+        let sorted = Feature::topo_sort_with_cycles(&symbols, &edges);
+        assert_eq!(
+            sorted,
+            vec![
+                "src/mod/fun_leaf.rs".to_string(),
+                "src/mod/fun_helper.rs".to_string(),
+                "src/mod/fun_caller.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scc_groups_for_symbols_groups_cycles_together() {
+        let symbols = vec![
+            "src/mod/fun_a.rs".to_string(),
+            "src/mod/fun_b.rs".to_string(),
+            "src/mod/fun_c.rs".to_string(),
+        ];
+        let edges = vec![
+            [
+                "src/mod/fun_a.rs".to_string(),
+                "src/mod/fun_b.rs".to_string(),
+            ],
+            [
+                "src/mod/fun_b.rs".to_string(),
+                "src/mod/fun_a.rs".to_string(),
+            ],
+            [
+                "src/mod/fun_b.rs".to_string(),
+                "src/mod/fun_c.rs".to_string(),
+            ],
+        ];
+
+        let groups = Feature::scc_groups_for_symbols(&symbols, &edges);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0],
+            vec![
+                "src/mod/fun_a.rs".to_string(),
+                "src/mod/fun_b.rs".to_string(),
+            ]
+        );
+        assert_eq!(groups[1], vec!["src/mod/fun_c.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_build_cross_unit_edges_detects_dependency_between_units() {
+        let analyses = vec![
+            TranslationUnitAnalysis {
+                plan: TranslationUnitPlan {
+                    unit_id: "mod_a".to_string(),
+                    source: "a.c2rust".to_string(),
+                    module: "mod_a".to_string(),
+                    line_count: 10,
+                    symbols: vec!["src/mod_a/fun_a.rs".to_string()],
+                    edges: vec![],
+                    scc_groups: vec![],
+                    batch_candidate: true,
+                    batch_reason: "eligible".to_string(),
+                },
+                symbol_entries: vec![(
+                    "fun_a".to_string(),
+                    "src/mod_a/fun_a.rs".to_string(),
+                    "int fun_a() { return fun_b(); }".to_string(),
+                )],
+            },
+            TranslationUnitAnalysis {
+                plan: TranslationUnitPlan {
+                    unit_id: "mod_b".to_string(),
+                    source: "b.c2rust".to_string(),
+                    module: "mod_b".to_string(),
+                    line_count: 10,
+                    symbols: vec!["src/mod_b/fun_b.rs".to_string()],
+                    edges: vec![],
+                    scc_groups: vec![],
+                    batch_candidate: true,
+                    batch_reason: "eligible".to_string(),
+                },
+                symbol_entries: vec![(
+                    "fun_b".to_string(),
+                    "src/mod_b/fun_b.rs".to_string(),
+                    "int fun_b() { return 0; }".to_string(),
+                )],
+            },
+        ];
+
+        let edges = Feature::build_cross_unit_edges(&analyses);
+        assert_eq!(edges, vec![["mod_b".to_string(), "mod_a".to_string()]]);
     }
 
     #[test]
@@ -1882,7 +2638,10 @@ pub struct MyStruct {
             .collect();
 
         // uint, ushort, ulong should appear exactly once (from the cstddef block)
-        assert_eq!(type_names.iter().filter(|n| n.as_str() == "uint").count(), 1);
+        assert_eq!(
+            type_names.iter().filter(|n| n.as_str() == "uint").count(),
+            1
+        );
         assert_eq!(
             type_names.iter().filter(|n| n.as_str() == "ushort").count(),
             1
@@ -2019,6 +2778,7 @@ pub struct KeepMe;
 
     #[test]
     fn test_sync_basic() {
+        let _guard = process_state_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let test_root = temp_dir.path();
 
@@ -2039,6 +2799,7 @@ pub struct KeepMe;
 
     #[test]
     fn test_sync_c_content_different() {
+        let _guard = process_state_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let test_root = temp_dir.path();
 
@@ -2059,6 +2820,7 @@ pub struct KeepMe;
 
     #[test]
     fn test_sync_target_not_empty() {
+        let _guard = process_state_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let test_root = temp_dir.path();
 
@@ -2079,6 +2841,7 @@ pub struct KeepMe;
 
     #[test]
     fn test_sync_multiple_files() {
+        let _guard = process_state_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let test_root = temp_dir.path();
 
@@ -2142,6 +2905,7 @@ pub struct KeepMe;
 
     #[test]
     fn test_sync_module_not_exist() {
+        let _guard = process_state_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let test_root = temp_dir.path();
 
@@ -2177,6 +2941,7 @@ pub struct KeepMe;
 
     #[test]
     fn test_sync_dst_file_not_exist() {
+        let _guard = process_state_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let test_root = temp_dir.path();
 
@@ -2197,6 +2962,7 @@ pub struct KeepMe;
 
     #[test]
     fn test_sync_c_file_not_exist() {
+        let _guard = process_state_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let test_root = temp_dir.path();
 
@@ -2333,6 +3099,9 @@ pub struct KeepMe;
     #[test]
     fn test_postprocess_decl_no_link_name() {
         let content = r#"#[export_name = "foo"]"#;
-        assert_eq!(Feature::postprocess_decl(content), r#"#[export_name = "foo"]"#);
+        assert_eq!(
+            Feature::postprocess_decl(content),
+            r#"#[export_name = "foo"]"#
+        );
     }
 }

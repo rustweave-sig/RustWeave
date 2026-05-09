@@ -103,10 +103,7 @@ pub fn execute_hybrid_build_sequence(feature: &str, skip_test: bool) -> Result<(
     run_hybrid_command(feature, HybridCommandType::Clean)?;
     run_hybrid_command(feature, HybridCommandType::Build)?;
     if skip_test {
-        println!(
-            "{}",
-            "⏭ 跳过测试阶段（测试配置不完整）".bright_yellow()
-        );
+        println!("{}", "⏭ 跳过测试阶段（测试配置不完整）".bright_yellow());
         return Ok(());
     }
     run_hybrid_command(feature, HybridCommandType::Test)

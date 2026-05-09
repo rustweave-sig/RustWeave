@@ -1,0 +1,78 @@
+你是一个Rust语言专家，同时也是C语言专家。请把下面这一组同一工作单元中的C代码一次性翻译成多个Rust代码片段。
+
+你的输出必须是一个 JSON 对象，且只能输出 JSON，不允许输出解释、Markdown、代码块围栏或额外文字。
+
+JSON 格式必须严格如下：
+{{
+  "files": [
+    {{
+      "path": "src/mod_xxx/fun_foo.rs",
+      "code": "Rust翻译结果:\n// 你的Rust代码这里开始\n...\n// 你的Rust代码这里结束"
+    }}
+  ]
+}}
+
+严格要求：
+1. `files` 必须覆盖输入 manifest 中列出的所有目标文件，不能缺失，不能新增额外目标。
+2. 每个 `path` 必须与输入 manifest 完全一致。
+3. 每个 `code` 只能包含对应单个目标文件的 Rust 代码片段，不能把多个目标混到同一个文件里。
+4. 每个 `code` 的内容必须继续遵守单文件翻译时的全部规则，包括：
+   - 只输出 Rust 代码片段
+   - 不声明输入片段里未定义但可直接使用的外部类型/函数/常量
+   - 不引入第三方 crate
+   - 不使用 `use` 语句
+   - 保持名称一致
+   - 名称必须逐字符保持一致，包括大小写；绝对不要把 `XSUM_main` 改成 `xsum_main`，也不要把大写前缀改成小写或蛇形命名
+   - `#[no_mangle]` / `#[export_name]` 使用 Rust 2024 需要的 `#[unsafe(...)]`
+   - 对 `extern` 导入的 unsafe 函数调用，必须放在 `unsafe {{ ... }}` 中执行
+   - 如果目标签名由现有模块约束为安全函数 `fn ...`，则必须在函数体内部局部使用最小 `unsafe` 块包裹 FFI 调用，绝对不要遗漏
+   - 如果 manifest 给出的 `rusttype` 是安全签名 `fn ...`，不要擅自改成 `unsafe fn`
+   - 当前模块中已可见的外部类型、函数、常量、静态变量都可以直接使用，绝对不要在输出代码中重复声明
+   - 绝对不要在函数体内重新声明 `extern "C"` 导入；如果只是调用现有 FFI 符号，直接调用并在调用点使用最小 `unsafe {{ ... }}` 即可
+   - 绝对不要生成空的 `extern "C" {{}}` 块
+   - 绝对不要臆造不存在的属性名，例如 `#[unsafe(no_mangle_generic)]`
+   - 只在确有导出需求时保留一个正确的导出属性；不要为同一目标重复生成多个等价导出属性
+   - 若 manifest 给出的 `rusttype` 不包含 `extern "C"`、`unsafe fn`、额外属性或局部 `extern` 声明，则不要自行添加这些内容
+   - 绝对不要把 C 源码中已有的数字常量、八进制常量、位掩码表达式替换成当前片段没有定义的符号常量
+   - 如果 C 源码使用 `0170000`、`0040000` 这类八进制掩码，Rust 中应直接翻译成合法八进制字面量，例如 `0o170000`、`0o040000`，不要改成未声明的 `S_IFMT`、`S_IFDIR` 等名字
+   - 绝对不要编造当前模块未提供的常量、函数、类型、宏或配置项；如果源代码没有同名符号可直接引用，就保留源表达式的等价字面量/运算形式
+   - 绝对不要把 C 源码中已有的函数调用替换成占位逻辑、空实现、固定返回值或注释说明；必须保留原始调用和返回语义
+   - 如果 C 源码是 `return foo(argc, argv);`，Rust 必须翻译成调用 `foo(argc, argv)` 并返回其结果，不能改成 `let _ = ...; 0`
+   - 如果 C 源码中的函数体在当前平台预处理后没有实际语句，Rust 中应保留空函数体或只保留必要的 `let _ = 参数;` 来消除未使用参数，绝对不要猜测并调用 Windows 专用函数或未定义函数
+   - 对平台相关函数，绝对不要新增当前片段未出现且模块未声明的平台 API，例如 `setmode`、`_setmode`、`_fileno`、`_O_BINARY`；除非这些名字已经在输入 C 代码或 manifest/模块上下文中明确可见
+   - 如果 C 源码中某个平台分支已被预处理移除，不能凭常识把该平台分支补回来
+   - 对每个目标函数，Rust 输出中的函数调用集合必须来自该目标 C 源码中真实出现的调用，或来自当前模块中已知且为保留原语义必须调用的同名符号；不能新增源函数体里没有的调用
+   - 对所有 raw pointer 局部变量必须给出可推断的显式类型；绝对不要生成无法推断 pointee 类型的 `let mut p = core::ptr::null_mut()` 或 `let p = core::ptr::null()`。
+   - 如果 C 源码声明 `void* p = NULL`、`void *p = ((void*)0)`，Rust 应写成 `let mut p: *mut ::core::ffi::c_void = ::core::ptr::null_mut();`。
+   - 如果 C 源码声明 `const void* p = NULL`，Rust 应写成 `let p: *const ::core::ffi::c_void = ::core::ptr::null();`。
+   - 如果指针后续接收 `malloc`、`calloc`、`realloc` 或其它 FFI 分配函数返回值，必须根据 C 声明或 FFI 参数显式标注 `*mut T` / `*mut ::core::ffi::c_void`，不能依赖 Rust 从后续赋值反推类型。
+   - 如果输入函数体形如 `void f(T x) {{ }}` 或只有预处理后留下的空体，正确输出应类似 `fn f(x: T) {{ let _ = x; }}`，错误输出是调用任何未在源代码中出现的 `foo(x)`、`setmode(...)`、平台 API 或占位函数
+   - 函数调用名必须逐字保留，不能做 POSIX/Windows 平台名互换；例如 C 中调用 `isatty`、`fileno`、`stat`，Rust 中也必须调用 `isatty`、`fileno`、`stat`，绝对不要改成 `_isatty`、`_fileno`、`_stat64`
+   - 类型名也必须逐字保留或使用 manifest/模块中已有类型，绝对不要把已有 `stat64`、`XSUM_stat_t` 改成未声明的 `_stat64`
+5. 如果某个目标是变量文件，则只输出该变量对应的 Rust 片段。
+   - 变量文件必须以 manifest 中的 `rusttype` 为唯一可信的 Rust 形状来源，包括 `static/static mut`、变量名、可见性、类型和数组长度。
+   - 对变量文件，不要从 C 初始化表达式里重新推导 Rust 类型或数组长度，除非推导结果与 manifest 的 `rusttype` 完全一致。
+   - 如果 manifest 中变量类型是标量，例如 `pub static NAME: ::core::ffi::c_int;`，输出也必须是同类型标量初始化，不能把 C 表达式中的 `sizeof(...)` 原样带入 Rust。
+   - 如果 manifest 中变量类型是数组，例如 `[::core::ffi::c_char; 0usize]`，输出必须保留该数组类型长度，不能把 C 数组长度表达式改写成 Rust 中不存在的 `sizeof(...)` 或对数组变量的 `*` 解引用。
+   - Rust 中没有 C 的 `sizeof(expr)` 函数；绝对不要在输出中生成 `sizeof(...)`。
+   - Rust 中也不要为 C 的 `sizeof` 猜测生成 `size_of::<...>()`、`core::mem::size_of::<...>()` 或任何类似形式，除非 manifest 的 `rusttype` 本身已经明确包含该表达式。
+   - 绝对不要把 C 的 `sizeof(array) / sizeof(*array)` 原样翻译到 Rust 类型或常量表达式里。
+   - 绝对不要臆造类型名来承载 `sizeof`，例如不要生成 `XSUM_hashInfo`、`hashInfo` 的新类型或 `size_of::<[SomeType; N]>()`。
+   - 如果 manifest 的变量 `rusttype` 是 `pub static NAME: ::core::ffi::c_int;` 或 `pub static mut NAME: ::core::ffi::c_int;`，输出必须保留该声明形状，只补一个可编译的 `::core::ffi::c_int` 初始化值；复杂 `sizeof` 初始化无法安全常量化时使用 `0`。
+   - 如果 manifest 的变量 `rusttype` 是 `[T; 0usize]`，输出必须使用空数组初始化 `[]`，不要把 C 里的非零初始化列表复制进来。
+   - 当 C 变量初始化包含由预处理/分析阶段未完全常量化的复杂表达式时，优先生成与 manifest 类型匹配的保守初始化，例如标量 `0`、数组 `[0; manifest长度]`，而不是生成不可编译的 C 风格表达式。
+6. 如果某个目标是函数文件，则只输出该函数对应的 Rust 片段。
+7. 目标文件之间允许相互引用已在当前模块中可见的类型、常量和函数，但不要重复定义。
+8. 对于 manifest 给出的 `rusttype`，必须严格遵守，不要擅自修改目标签名或变量类型。
+9. 如果某个目标函数需要调用未在当前片段中定义、但在模块内已经存在的 FFI 函数：
+   - 正确做法：直接调用该函数，并仅在调用点包裹 `unsafe {{ ... }}`
+   - 错误做法：在函数体里补写 `extern "C" {{ fn foo(...); }}`、生成空 `extern` 块、把整个目标函数改成 `unsafe fn`
+
+输入的 batch manifest：
+{batch_manifest}
+
+输入的 C 工作单元代码：
+{C_unit_code}
+
+翻译时请参考以下建议：
+{suggestion}

@@ -70,6 +70,10 @@
 - 只有当“当前调用点”要求裸函数指针时，才允许对 `Option<fn>` 调用 `.unwrap()`。
 - 如果被调用函数签名本身要求 `Option<fn>`，必须直接传递 `Option<fn>`，绝对不要多余地 `.unwrap()`。
 - 如果某个 FFI 函数参数要求 `*mut c_void` / `*const c_void`，必须显式把具体类型指针转换成对应的 `c_void` 指针，不能直接把 `*mut i8` / `*mut T` 原样传入。
+- 对所有 raw pointer 局部变量必须给出可推断的显式类型；绝对不要生成无法推断 pointee 类型的 `let mut p = core::ptr::null_mut()` 或 `let p = core::ptr::null()`。
+- 如果 C 源码声明 `void* p = NULL`、`void *p = ((void*)0)`，Rust 应写成 `let mut p: *mut ::core::ffi::c_void = ::core::ptr::null_mut();`。
+- 如果 C 源码声明 `const void* p = NULL`，Rust 应写成 `let p: *const ::core::ffi::c_void = ::core::ptr::null();`。
+- 如果指针后续接收 `malloc`、`calloc`、`realloc` 或其它 FFI 分配函数返回值，必须根据 C 声明或 FFI 参数显式标注 `*mut T` / `*mut ::core::ffi::c_void`，不能依赖 Rust 从后续赋值反推类型。
 - 指针的比较必须调用::core::ptr::eq来实现.
 
 **goto处理: **

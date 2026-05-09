@@ -19,7 +19,11 @@ use std::path::Path;
 /// 3. 提交到 git
 ///
 /// 当 `skip_test` 为 `true` 时跳过混合构建中的测试阶段。
-pub fn execute_code_error_check(feature: &str, show_full_output: bool, skip_test: bool) -> Result<()> {
+pub fn execute_code_error_check(
+    feature: &str,
+    show_full_output: bool,
+    skip_test: bool,
+) -> Result<()> {
     println!("{}", "执行代码错误检查...".bright_blue());
 
     println!("{}", "  → 构建中（抑制警告）...".bright_blue());

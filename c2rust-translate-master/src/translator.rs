@@ -1,6 +1,7 @@
 use crate::util;
 use anyhow::{Context, Result};
 use colored::Colorize;
+use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,6 +16,17 @@ use toml::value::Table;
 #[derive(Debug)]
 pub struct TranslationScriptFailedError {
     pub exit_code: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchManifest {
+    pub files: Vec<BatchManifestEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchManifestEntry {
+    pub path: String,
+    pub rusttype: Option<String>,
 }
 
 impl std::fmt::Display for TranslationScriptFailedError {
@@ -261,6 +273,31 @@ fn read_rusttype_from_decl_file(rs_file: &Path) -> Option<String> {
     }
 }
 
+fn build_batch_translate_args<'a>(
+    script_path: &'a str,
+    config_path: &'a str,
+    c_code_file: &'a str,
+    output_manifest_file: &'a str,
+    output_dir: &'a str,
+    batch_manifest_file: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        script_path,
+        "--config",
+        config_path,
+        "--type",
+        "batch_fn_var",
+        "--c_code",
+        c_code_file,
+        "--output",
+        output_manifest_file,
+        "--output_dir",
+        output_dir,
+        "--batch_manifest",
+        batch_manifest_file,
+    ]
+}
+
 /// 构建修复命令的参数列表
 ///
 /// 返回一个参数向量，传递给 translate_and_fix.py 用于修复错误。
@@ -458,6 +495,154 @@ pub fn translate_c_to_rust(
         util::CODE_PREVIEW_LINES,
         show_full_output,
     );
+
+    Ok(())
+}
+
+pub fn translate_c_batch_to_rust(
+    feature: &str,
+    c_file: &Path,
+    rs_files: &[PathBuf],
+    output_dir: &Path,
+    output_manifest_file: &Path,
+    batch_manifest_file: &Path,
+    show_full_output: bool,
+) -> Result<()> {
+    util::validate_feature_name(feature)?;
+
+    let project_root = util::find_project_root()?;
+    let project_config_path = get_project_config_path()?;
+    let runtime_config = create_runtime_config(&project_config_path)?;
+    let work_dir = project_root.join(".c2rust").join(feature).join("rust");
+
+    if !work_dir.exists() {
+        anyhow::bail!(
+            "Working directory does not exist: {}. Expected: <project_root>/.c2rust/<feature>/rust",
+            work_dir.display()
+        );
+    }
+
+    display_code(
+        c_file,
+        "─ Batch C Source Preview ─",
+        util::CODE_PREVIEW_LINES,
+        show_full_output,
+    );
+
+    let script_path = get_translate_script_full_path()?;
+    let script_str = script_path
+        .to_str()
+        .with_context(|| format!("Non-UTF8 path: {}", script_path.display()))?;
+    let config_str = runtime_config
+        .path()
+        .to_str()
+        .with_context(|| format!("Non-UTF8 path: {}", runtime_config.path().display()))?;
+    let c_file_str = c_file
+        .to_str()
+        .with_context(|| format!("Non-UTF8 path: {}", c_file.display()))?;
+    let output_manifest_str = output_manifest_file
+        .to_str()
+        .with_context(|| format!("Non-UTF8 path: {}", output_manifest_file.display()))?;
+    let output_dir_str = output_dir
+        .to_str()
+        .with_context(|| format!("Non-UTF8 path: {}", output_dir.display()))?;
+    let batch_manifest_str = batch_manifest_file
+        .to_str()
+        .with_context(|| format!("Non-UTF8 path: {}", batch_manifest_file.display()))?;
+
+    let manifest = BatchManifest {
+        files: rs_files
+            .iter()
+            .map(|rs_file| BatchManifestEntry {
+                path: rs_file
+                    .strip_prefix(&work_dir)
+                    .unwrap_or(rs_file)
+                    .to_string_lossy()
+                    .to_string(),
+                rusttype: read_rusttype_from_decl_file(rs_file),
+            })
+            .collect(),
+    };
+    std::fs::write(
+        batch_manifest_file,
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    let python = find_python_interpreter()?;
+    println!("│ {}", "Executing batch translation command:".bright_blue());
+    println!(
+        "│ {} {} {} --config {} --type batch_fn_var --c_code {} --output {} --output_dir {} --batch_manifest {}",
+        "→".bright_blue(),
+        python.as_str().bright_blue(),
+        script_str.dimmed(),
+        config_str.dimmed(),
+        c_file_str.bright_yellow(),
+        output_manifest_str.bright_yellow(),
+        output_dir_str.bright_yellow(),
+        batch_manifest_str.bright_yellow()
+    );
+    println!("│");
+
+    let args = build_batch_translate_args(
+        script_str,
+        config_str,
+        c_file_str,
+        output_manifest_str,
+        output_dir_str,
+        batch_manifest_str,
+    );
+    let status = Command::new(&python)
+        .args(&args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to execute translate_and_fix.py for batch translation")?;
+
+    if !status.success() {
+        return Err(TranslationScriptFailedError {
+            exit_code: status.code().unwrap_or(-1),
+        }
+        .into());
+    }
+
+    for rs_file in rs_files {
+        let output_file = output_dir.join(
+            rs_file
+                .file_name()
+                .with_context(|| format!("Missing file name: {}", rs_file.display()))?,
+        );
+        let batch_output = std::fs::read_to_string(&output_file).with_context(|| {
+            format!(
+                "Failed to read batch output file: {}",
+                output_file.display()
+            )
+        })?;
+        std::fs::write(rs_file, batch_output.as_bytes()).with_context(|| {
+            format!(
+                "Failed to copy batch output into target Rust file: {}",
+                rs_file.display()
+            )
+        })?;
+
+        let metadata = std::fs::metadata(rs_file).with_context(|| {
+            format!(
+                "Failed to read batch output file metadata: {}",
+                rs_file.display()
+            )
+        })?;
+        if metadata.len() == 0 {
+            anyhow::bail!(
+                "Batch translation failed: output file is empty: {}",
+                rs_file.display()
+            );
+        }
+        display_code(
+            rs_file,
+            "─ Batch Translated Rust Code ─",
+            util::CODE_PREVIEW_LINES,
+            show_full_output,
+        );
+    }
 
     Ok(())
 }
@@ -882,6 +1067,32 @@ mod tests {
         assert_eq!(args_with_suggestion.len(), 15);
         assert_eq!(args_with_suggestion[13], "--suggestion");
         assert_eq!(args_with_suggestion[14], suggestion);
+    }
+
+    #[test]
+    fn test_build_batch_translate_args() {
+        let args = build_batch_translate_args(
+            "/path/to/translate_and_fix.py",
+            "/tmp/runtime.toml",
+            "/tmp/unit.c",
+            "/tmp/result.json",
+            "/tmp/outdir",
+            "/tmp/manifest.json",
+        );
+        assert_eq!(args.len(), 13);
+        assert_eq!(args[0], "/path/to/translate_and_fix.py");
+        assert_eq!(args[1], "--config");
+        assert_eq!(args[2], "/tmp/runtime.toml");
+        assert_eq!(args[3], "--type");
+        assert_eq!(args[4], "batch_fn_var");
+        assert_eq!(args[5], "--c_code");
+        assert_eq!(args[6], "/tmp/unit.c");
+        assert_eq!(args[7], "--output");
+        assert_eq!(args[8], "/tmp/result.json");
+        assert_eq!(args[9], "--output_dir");
+        assert_eq!(args[10], "/tmp/outdir");
+        assert_eq!(args[11], "--batch_manifest");
+        assert_eq!(args[12], "/tmp/manifest.json");
     }
 
     #[test]

@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -89,6 +90,9 @@ enum Commands {
 
         #[arg(long)]
         file: Option<String>,
+
+        #[arg(long)]
+        unit: Option<String>,
 
         #[arg(long)]
         show_full_output: bool,
@@ -285,7 +289,8 @@ Example: export C2RUST_HOME=/path/to/c2rust"
 }
 
 fn find_project_root_from_cwd() -> Result<PathBuf, String> {
-    let search_start = env::current_dir().map_err(|e| format!("Error: Failed to get current directory: {}", e))?;
+    let search_start =
+        env::current_dir().map_err(|e| format!("Error: Failed to get current directory: {}", e))?;
     let mut current = search_start.clone();
 
     loop {
@@ -506,8 +511,7 @@ fn load_feature_status(feature: &str) -> Result<FeatureStatus, String> {
                     if status.scrub_recoverable {
                         status.scrub_blocked_files.clear();
                     } else {
-                        let blocked =
-                            collect_non_scrubbable_rs_files(&stderr, &status.rust_dir);
+                        let blocked = collect_non_scrubbable_rs_files(&stderr, &status.rust_dir);
                         status.scrub_blocked_files = blocked.into_iter().collect();
                         status.scrub_non_scrubbable = !status.scrub_blocked_files.is_empty();
                     }
@@ -523,31 +527,101 @@ fn print_feature_status(status: &FeatureStatus) {
     println!("feature = {}", status.feature);
     println!("project_root = {}", status.project_root.display());
     println!("feature_root = {}", status.feature_root.display());
-    println!("rust_dir = {} ({})", status.rust_dir.display(), if status.rust_dir_exists { "ok" } else { "missing" });
-    println!("c_dir = {} ({})", status.c_dir.display(), if status.c_dir_exists { "ok" } else { "missing" });
-    println!("config = {} ({})", status.config_path.display(), if status.config_exists { "ok" } else { "missing" });
-    println!("env = {} ({})", status.env_path.display(), if status.env_exists { "ok" } else { "missing" });
-    println!("selected_files = {}", if status.selected_files_exists { "present" } else { "missing" });
-    println!("translation_stats = {}", if status.stats_exists { "present" } else { "missing" });
+    println!(
+        "rust_dir = {} ({})",
+        status.rust_dir.display(),
+        if status.rust_dir_exists {
+            "ok"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "c_dir = {} ({})",
+        status.c_dir.display(),
+        if status.c_dir_exists { "ok" } else { "missing" }
+    );
+    println!(
+        "config = {} ({})",
+        status.config_path.display(),
+        if status.config_exists {
+            "ok"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "env = {} ({})",
+        status.env_path.display(),
+        if status.env_exists { "ok" } else { "missing" }
+    );
+    println!(
+        "selected_files = {}",
+        if status.selected_files_exists {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "translation_stats = {}",
+        if status.stats_exists {
+            "present"
+        } else {
+            "missing"
+        }
+    );
     println!(
         "build_config = cmd:{} dir:{}",
-        if status.build_cmd_configured { "ok" } else { "missing" },
-        if status.build_dir_configured { "ok" } else { "missing" }
+        if status.build_cmd_configured {
+            "ok"
+        } else {
+            "missing"
+        },
+        if status.build_dir_configured {
+            "ok"
+        } else {
+            "missing"
+        }
     );
     println!(
         "clean_config = cmd:{} dir:{}",
-        if status.clean_cmd_configured { "ok" } else { "missing" },
-        if status.clean_dir_configured { "ok" } else { "missing" }
+        if status.clean_cmd_configured {
+            "ok"
+        } else {
+            "missing"
+        },
+        if status.clean_dir_configured {
+            "ok"
+        } else {
+            "missing"
+        }
     );
     println!(
         "test_config = cmd:{} dir:{}",
-        if status.test_cmd_configured { "ok" } else { "missing" },
-        if status.test_dir_configured { "ok" } else { "missing" }
+        if status.test_cmd_configured {
+            "ok"
+        } else {
+            "missing"
+        },
+        if status.test_dir_configured {
+            "ok"
+        } else {
+            "missing"
+        }
     );
     println!(
         "model_config = user_env:{} project_legacy:{}",
-        if status.user_model_present { "present" } else { "missing" },
-        if status.project_model_present { "present" } else { "missing" }
+        if status.user_model_present {
+            "present"
+        } else {
+            "missing"
+        },
+        if status.project_model_present {
+            "present"
+        } else {
+            "missing"
+        }
     );
     println!(
         "runtime_tools = c2rust_home:{} code_analyse:{} c2rust_config:{} translate_dir:{} hybrid_lib:{} python:{} bindgen:{}",
@@ -700,7 +774,6 @@ fn build_feature_phase_report(status: &FeatureStatus) -> FeaturePhaseReport {
 }
 
 fn emit_phase_guidance(status: &FeatureStatus, report: &FeaturePhaseReport) {
-
     println!(
         "translate_blockers = {}",
         if report.translate_blockers.is_empty() {
@@ -754,13 +827,25 @@ fn emit_phase_guidance(status: &FeatureStatus, report: &FeaturePhaseReport) {
 
     if !report.translate_blockers.is_empty() {
         if !status.translate_dir_ready {
-            println!("next_action = {}", preflight_hint("translate_dir_missing").unwrap());
+            println!(
+                "next_action = {}",
+                preflight_hint("translate_dir_missing").unwrap()
+            );
         } else if !status.python_available {
-            println!("next_action = {}", preflight_hint("python_missing").unwrap());
+            println!(
+                "next_action = {}",
+                preflight_hint("python_missing").unwrap()
+            );
         } else if !status.bindgen_available {
-            println!("next_action = {}", preflight_hint("bindgen_missing").unwrap());
+            println!(
+                "next_action = {}",
+                preflight_hint("bindgen_missing").unwrap()
+            );
         } else if !(status.user_model_present || status.project_model_present) {
-            println!("next_action = {}", preflight_hint("model_config_missing").unwrap());
+            println!(
+                "next_action = {}",
+                preflight_hint("model_config_missing").unwrap()
+            );
         } else if !(status.build_cmd_configured && status.build_dir_configured) {
             println!("next_action = complete feature build config in .c2rust/config.toml");
         } else if !(status.clean_cmd_configured && status.clean_dir_configured) {
@@ -779,9 +864,7 @@ fn emit_phase_guidance(status: &FeatureStatus, report: &FeaturePhaseReport) {
 
     if !report.verify_blockers.is_empty() {
         if !status.hybrid_build_lib_ready {
-            println!(
-                "next_action = set C2RUST_HYBRID_BUILD_LIB or restore libc2rust-hybrid-build"
-            );
+            println!("next_action = set C2RUST_HYBRID_BUILD_LIB or restore libc2rust-hybrid-build");
         }
         return;
     }
@@ -798,7 +881,14 @@ fn emit_phase_guidance(status: &FeatureStatus, report: &FeaturePhaseReport) {
 }
 
 fn print_doctor_summary(status: &FeatureStatus, report: &FeaturePhaseReport) {
-    println!("doctor_translate = {}", if report.translate_blockers.is_empty() { "ready" } else { "blocked" });
+    println!(
+        "doctor_translate = {}",
+        if report.translate_blockers.is_empty() {
+            "ready"
+        } else {
+            "blocked"
+        }
+    );
     println!(
         "doctor_verify = {}",
         if status.scrub_recoverable {
@@ -809,7 +899,14 @@ fn print_doctor_summary(status: &FeatureStatus, report: &FeaturePhaseReport) {
             "blocked"
         }
     );
-    println!("doctor_test = {}", if report.test_blockers.is_empty() { "ready" } else { "incomplete" });
+    println!(
+        "doctor_test = {}",
+        if report.test_blockers.is_empty() {
+            "ready"
+        } else {
+            "incomplete"
+        }
+    );
 }
 
 fn overall_status(report: &FeaturePhaseReport) -> &'static str {
@@ -827,7 +924,11 @@ fn overall_status(report: &FeaturePhaseReport) -> &'static str {
 }
 
 fn doctor_translate_status(report: &FeaturePhaseReport) -> &'static str {
-    if report.translate_blockers.is_empty() { "ready" } else { "blocked" }
+    if report.translate_blockers.is_empty() {
+        "ready"
+    } else {
+        "blocked"
+    }
 }
 
 fn doctor_verify_status(status: &FeatureStatus, report: &FeaturePhaseReport) -> &'static str {
@@ -841,7 +942,11 @@ fn doctor_verify_status(status: &FeatureStatus, report: &FeaturePhaseReport) -> 
 }
 
 fn doctor_test_status(report: &FeaturePhaseReport) -> &'static str {
-    if report.test_blockers.is_empty() { "ready" } else { "incomplete" }
+    if report.test_blockers.is_empty() {
+        "ready"
+    } else {
+        "incomplete"
+    }
 }
 
 fn print_feature_summary(report: &FeaturePhaseReport) {
@@ -855,7 +960,11 @@ fn print_feature_summary(report: &FeaturePhaseReport) {
     }
 }
 
-fn emit_feature_json(status: &FeatureStatus, report: &FeaturePhaseReport, include_doctor: bool) -> i32 {
+fn emit_feature_json(
+    status: &FeatureStatus,
+    report: &FeaturePhaseReport,
+    include_doctor: bool,
+) -> i32 {
     let output = FeatureCommandOutput {
         status,
         report,
@@ -870,7 +979,11 @@ fn emit_feature_json(status: &FeatureStatus, report: &FeaturePhaseReport, includ
     match serde_json::to_string_pretty(&output) {
         Ok(json) => {
             println!("{}", json);
-            if output.overall_status == "blocked" { 1 } else { 0 }
+            if output.overall_status == "blocked" {
+                1
+            } else {
+                0
+            }
         }
         Err(e) => {
             eprintln!("Error: Failed to serialize feature status as JSON: {}", e);
@@ -903,7 +1016,11 @@ fn handle_feature_check(feature: &str, json: bool) -> i32 {
 
     print_feature_status(&status);
     print_feature_summary(&report);
-    if overall_status(&report) == "blocked" { 1 } else { 0 }
+    if overall_status(&report) == "blocked" {
+        1
+    } else {
+        0
+    }
 }
 
 fn handle_feature_status(feature: &str, json: bool) -> i32 {
@@ -940,7 +1057,11 @@ fn handle_feature_doctor(feature: &str, json: bool) -> i32 {
     print_feature_status(&status);
     print_doctor_summary(&status, &report);
     print_feature_summary(&report);
-    if overall_status(&report) == "blocked" { 1 } else { 0 }
+    if overall_status(&report) == "blocked" {
+        1
+    } else {
+        0
+    }
 }
 
 fn handle_feature_reinit(feature: &str) -> i32 {
@@ -960,7 +1081,10 @@ fn handle_feature_reinit(feature: &str) -> i32 {
     match status {
         Ok(exit_status) => exit_status.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("Error: Failed to execute code_analyse --reinit --feature {}: {}", feature, e);
+            eprintln!(
+                "Error: Failed to execute code_analyse --reinit --feature {}: {}",
+                feature, e
+            );
             1
         }
     }
@@ -971,7 +1095,11 @@ fn handle_feature_verify(feature: &str, show_full_output: bool) -> i32 {
         return code;
     }
 
-    let mut args = vec!["verify".to_string(), "--feature".to_string(), feature.to_string()];
+    let mut args = vec![
+        "verify".to_string(),
+        "--feature".to_string(),
+        feature.to_string(),
+    ];
     if show_full_output {
         args.push("--show-full-output".to_string());
     }
@@ -1053,9 +1181,7 @@ fn run_build_preflight(feature: &str) -> Result<(), i32> {
     if !(status.build_cmd_configured && status.build_dir_configured) {
         build_blockers.push("build_config_incomplete");
     }
-    if env::var("C2RUST_HOOK_LIB").is_err()
-        && get_lib_path(&get_lib_filename("libhook")).is_err()
-    {
+    if env::var("C2RUST_HOOK_LIB").is_err() && get_lib_path(&get_lib_filename("libhook")).is_err() {
         build_blockers.push("hook_lib_missing");
     }
 
@@ -1533,11 +1659,10 @@ Please ensure c2rust-{}{} is an executable file in $C2RUST_HOME/bin/",
 
 fn get_direct_bin_path(bin_name: &str) -> Result<PathBuf, String> {
     let c2rust_home = get_c2rust_home()?;
-    let bin_path = c2rust_home.join("bin").join(format!(
-        "{}{}",
-        bin_name,
-        std::env::consts::EXE_SUFFIX
-    ));
+    let bin_path =
+        c2rust_home
+            .join("bin")
+            .join(format!("{}{}", bin_name, std::env::consts::EXE_SUFFIX));
 
     if !bin_path.exists() {
         return Err(format!(
@@ -1567,7 +1692,7 @@ fn run_tool(tool_name: &str, args: &[String]) -> i32 {
 }
 
 /// Runs a tool with custom environment variables.
-fn run_tool_with_env(tool_name: &str, args: &[String], env_vars: &[(&str, PathBuf)]) -> i32 {
+fn run_tool_with_env(tool_name: &str, args: &[String], env_vars: &[(&str, OsString)]) -> i32 {
     let tool_path = match get_tool_path(tool_name) {
         Ok(path) => path,
         Err(e) => {
@@ -1678,29 +1803,31 @@ fn main() {
             if let Err(code) = run_build_preflight(&feature_name) {
                 code
             } else {
-            let mut args = vec!["build".to_string()];
+                let mut args = vec!["build".to_string()];
 
-            if let Some(f) = feature {
-                args.push("--feature".to_string());
-                args.push(f);
-            }
-
-            if no_interactive {
-                args.push("--no-interactive".to_string());
-            }
-
-            args.push("--".to_string());
-            args.extend(build_cmd);
-
-            let mut env_vars = Vec::new();
-            if env::var("C2RUST_HOOK_LIB").is_err() {
-                match get_lib_path(&get_lib_filename("libhook")) {
-                    Ok(lib_path) => env_vars.push(("C2RUST_HOOK_LIB", lib_path)),
-                    Err(e) => eprintln!("{}", e),
+                if let Some(f) = feature {
+                    args.push("--feature".to_string());
+                    args.push(f);
                 }
-            }
 
-            run_tool_with_env("build", &args, &env_vars)
+                if no_interactive {
+                    args.push("--no-interactive".to_string());
+                }
+
+                args.push("--".to_string());
+                args.extend(build_cmd);
+
+                let mut env_vars = Vec::new();
+                if env::var("C2RUST_HOOK_LIB").is_err() {
+                    match get_lib_path(&get_lib_filename("libhook")) {
+                        Ok(lib_path) => {
+                            env_vars.push(("C2RUST_HOOK_LIB", lib_path.into_os_string()))
+                        }
+                        Err(e) => eprintln!("{}", e),
+                    }
+                }
+
+                run_tool_with_env("build", &args, &env_vars)
             }
         }
 
@@ -1709,17 +1836,17 @@ fn main() {
             if let Err(code) = run_test_preflight(&feature_name) {
                 code
             } else {
-            let mut args = vec!["test".to_string()];
+                let mut args = vec!["test".to_string()];
 
-            if let Some(f) = feature {
-                args.push("--feature".to_string());
-                args.push(f);
-            }
+                if let Some(f) = feature {
+                    args.push("--feature".to_string());
+                    args.push(f);
+                }
 
-            args.push("--".to_string());
-            args.extend(test_cmd);
+                args.push("--".to_string());
+                args.extend(test_cmd);
 
-            run_tool("test", &args)
+                run_tool("test", &args)
             }
         }
 
@@ -1728,17 +1855,17 @@ fn main() {
             if let Err(code) = run_clean_preflight(&feature_name) {
                 code
             } else {
-            let mut args = vec!["clean".to_string()];
+                let mut args = vec!["clean".to_string()];
 
-            if let Some(f) = feature {
-                args.push("--feature".to_string());
-                args.push(f);
-            }
+                if let Some(f) = feature {
+                    args.push("--feature".to_string());
+                    args.push(f);
+                }
 
-            args.push("--".to_string());
-            args.extend(clean_cmd);
+                args.push("--".to_string());
+                args.extend(clean_cmd);
 
-            run_tool("clean", &args)
+                run_tool("clean", &args)
             }
         }
 
@@ -1748,57 +1875,68 @@ fn main() {
             max_error_fix_attempts,
             max_warning_fix_attempts,
             file,
+            unit,
             show_full_output,
         } => {
             let feature_name = feature.clone().unwrap_or_else(|| "default".to_string());
             if let Err(code) = run_translate_preflight(&feature_name) {
                 code
             } else {
-            let mut args = vec!["translate".to_string()];
+                let mut args = vec!["translate".to_string()];
 
-            if let Some(f) = feature {
-                args.push("--feature".to_string());
-                args.push(f);
-            }
-
-            if allow_all {
-                args.push("--allow-all".to_string());
-            }
-
-            if let Some(file) = file {
-                args.push("--file".to_string());
-                args.push(file);
-            }
-
-            if let Some(attempts) = max_error_fix_attempts {
-                args.push("--max-error-fix-attempts".to_string());
-                args.push(attempts.to_string());
-            }
-
-            if let Some(attempts) = max_warning_fix_attempts {
-                args.push("--max-warning-fix-attempts".to_string());
-                args.push(attempts.to_string());
-            }
-
-            if show_full_output {
-                args.push("--show-full-output".to_string());
-            }
-
-            let mut env_vars = Vec::new();
-            if env::var("C2RUST_TRANSLATE_DIR").is_err() {
-                match get_python_dir("translate_and_fix") {
-                    Ok(dir_path) => env_vars.push(("C2RUST_TRANSLATE_DIR", dir_path)),
-                    Err(e) => eprintln!("{}", e),
+                if let Some(f) = feature {
+                    args.push("--feature".to_string());
+                    args.push(f);
                 }
-            }
-            if env::var("C2RUST_HYBRID_BUILD_LIB").is_err() {
-                match get_lib_path(&get_lib_filename("libc2rust-hybrid-build")) {
-                    Ok(lib_path) => env_vars.push(("C2RUST_HYBRID_BUILD_LIB", lib_path)),
-                    Err(e) => eprintln!("{}", e),
-                }
-            }
 
-            run_tool_with_env("translate", &args, &env_vars)
+                if allow_all {
+                    args.push("--allow-all".to_string());
+                }
+
+                if let Some(file) = file {
+                    args.push("--file".to_string());
+                    args.push(file);
+                }
+
+                if let Some(unit) = unit {
+                    args.push("--unit".to_string());
+                    args.push(unit);
+                }
+
+                if let Some(attempts) = max_error_fix_attempts {
+                    args.push("--max-error-fix-attempts".to_string());
+                    args.push(attempts.to_string());
+                }
+
+                if let Some(attempts) = max_warning_fix_attempts {
+                    args.push("--max-warning-fix-attempts".to_string());
+                    args.push(attempts.to_string());
+                }
+
+                if show_full_output {
+                    args.push("--show-full-output".to_string());
+                }
+
+                let mut env_vars = Vec::new();
+                env_vars.push(("C2RUST_TRANSLATE_DEP_ORDER", OsString::from("1")));
+                if env::var("C2RUST_TRANSLATE_DIR").is_err() {
+                    match get_python_dir("translate_and_fix") {
+                        Ok(dir_path) => {
+                            env_vars.push(("C2RUST_TRANSLATE_DIR", dir_path.into_os_string()))
+                        }
+                        Err(e) => eprintln!("{}", e),
+                    }
+                }
+                if env::var("C2RUST_HYBRID_BUILD_LIB").is_err() {
+                    match get_lib_path(&get_lib_filename("libc2rust-hybrid-build")) {
+                        Ok(lib_path) => {
+                            env_vars.push(("C2RUST_HYBRID_BUILD_LIB", lib_path.into_os_string()))
+                        }
+                        Err(e) => eprintln!("{}", e),
+                    }
+                }
+
+                run_tool_with_env("translate", &args, &env_vars)
             }
         }
 
@@ -1975,7 +2113,10 @@ mod tests {
             detected.as_ref().map(|(path, _)| path.as_str()),
             Some(python_path.to_string_lossy().as_ref())
         );
-        assert_eq!(detected.as_ref().map(|(_, source)| *source), Some("c2rust_home"));
+        assert_eq!(
+            detected.as_ref().map(|(_, source)| *source),
+            Some("c2rust_home")
+        );
     }
 
     #[test]

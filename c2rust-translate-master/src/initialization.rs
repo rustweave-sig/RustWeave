@@ -112,7 +112,11 @@ pub fn check_and_initialize_feature(feature: &str) -> Result<()> {
 /// 在项目初始化后执行一次完整的代码错误检查，确保项目基础状态正常。
 ///
 /// 当 `skip_test` 为 `true` 时，跳过混合构建序列中的测试阶段。
-pub fn execute_initial_verification(feature: &str, show_full_output: bool, skip_test: bool) -> Result<()> {
+pub fn execute_initial_verification(
+    feature: &str,
+    show_full_output: bool,
+    skip_test: bool,
+) -> Result<()> {
     util::validate_feature_name(feature)?;
 
     println!(
@@ -159,10 +163,7 @@ pub fn execute_initial_verification(feature: &str, show_full_output: bool, skip_
                             skip_test,
                         ) {
                             Ok(_) => {
-                                println!(
-                                    "{}",
-                                    "✓ 初始化验证完成并已提交".bright_green().bold()
-                                );
+                                println!("{}", "✓ 初始化验证完成并已提交".bright_green().bold());
                                 return Ok(());
                             }
                             Err(e) => {

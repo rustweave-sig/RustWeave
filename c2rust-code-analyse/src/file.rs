@@ -120,6 +120,14 @@ fn localize_extern_inline_definition(code: &mut String) -> Result<bool> {
     Ok(false)
 }
 
+fn is_intrinsic_like_inline(code: &str) -> bool {
+    let trimmed = code.trim_start();
+    trimmed.starts_with("static __inline")
+        || trimmed.starts_with("static inline")
+        || trimmed.starts_with("__inline")
+        || trimmed.starts_with("inline ")
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum Kind {
     EnumDecl(EnumDecl),
@@ -245,10 +253,12 @@ impl Kind {
             if self.is_inline() && self.is_extern_fn() {
                 localize_extern_inline_definition(&mut code)?;
             }
-            eprintln!(
-                "missing global name for static/inline item; preserving original exported C body: {}",
-                code
-            );
+            if !is_intrinsic_like_inline(&code) {
+                eprintln!(
+                    "missing global name for static/inline item; preserving original exported C body: {}",
+                    code
+                );
+            }
             return Ok(code);
         };
 
@@ -450,6 +460,31 @@ fn ensure_extern_decl(code: &mut String) -> Result<()> {
         code.insert_str(0, "extern ");
     }
     Ok(())
+}
+
+fn should_force_extern_for_function_decl(code: &str) -> Result<bool> {
+    let has_extern = regex::Regex::new(r"(^|[^\w])extern([^\w]|$)")
+        .map_err(|_| Error::inval())?
+        .is_match(code);
+    if has_extern {
+        return Ok(false);
+    }
+
+    let has_static = regex::Regex::new(r"(^|[^\w])static([^\w]|$)")
+        .map_err(|_| Error::inval())?
+        .is_match(code);
+    if has_static {
+        return Ok(false);
+    }
+
+    let has_inline = regex::Regex::new(r"(^|[^\w])(__inline__|__inline|inline)([^\w]|$)")
+        .map_err(|_| Error::inval())?
+        .is_match(code);
+    if has_inline {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -987,7 +1022,9 @@ impl File {
                         code.drain(pos..);
                         code.push(';');
                     }
-                    ensure_extern_decl(&mut code)?;
+                    if should_force_extern_for_function_decl(&code)? {
+                        ensure_extern_decl(&mut code)?;
+                    }
                 }
                 // 全局变量可能是static int g_i32[] = { ... }
                 // 数组大小只能从var.ty中提取.
@@ -1427,6 +1464,38 @@ mod tests {
         assert!(!code.starts_with("extern "));
     }
 
+    #[test]
+    fn test_header_decl_does_not_prefix_static_inline_with_extern() {
+        let mut code =
+            "static __inline int intrinsic_like(void) __attribute__((__gnu_inline__));".to_string();
+        if should_force_extern_for_function_decl(&code).unwrap() {
+            ensure_extern_decl(&mut code).unwrap();
+        }
+        assert_eq!(
+            code,
+            "static __inline int intrinsic_like(void) __attribute__((__gnu_inline__));"
+        );
+    }
+
+    #[test]
+    fn test_header_decl_prefixes_plain_function_with_extern() {
+        let mut code = "int exported_fn(void);".to_string();
+        if should_force_extern_for_function_decl(&code).unwrap() {
+            ensure_extern_decl(&mut code).unwrap();
+        }
+        assert_eq!(code, "extern int exported_fn(void);");
+    }
+
+    #[test]
+    fn test_intrinsic_like_inline_is_detected() {
+        assert!(is_intrinsic_like_inline(
+            "static __inline int intrinsic_like(void) { return 0; }"
+        ));
+        assert!(is_intrinsic_like_inline(
+            "inline int intrinsic_like(void) { return 0; }"
+        ));
+        assert!(!is_intrinsic_like_inline("int exported_fn(void);"));
+    }
 
     #[test]
     fn test_ignore_fn() {

@@ -9,6 +9,7 @@
   - `XXH-SKIP-001`
   - `XXH-FIX-001`
   - `XXH-FIX-002`
+  - `XXH-BATCH-005`
   - `XXH-UX-001`
 - P2:
   - `XXH-ENV-001`
@@ -16,6 +17,10 @@
   - `XXH-RECOVER-001`
   - `XXH-TOOL-001`
   - `XXH-FEATURE-001`
+  - `XXH-BATCH-001`
+  - `XXH-BATCH-002`
+  - `XXH-BATCH-003`
+  - `XXH-BATCH-004`
 - P3:
   - `XXH-BUILD-002`
   - `XXH-CONFIG-001`
@@ -30,7 +35,171 @@
 
 - `XSUM_autox86` 当前是最适合作为函数级质量评估的 Tier-1 候选
 - `xsum_bench` 导出路径是最适合作为闭包级质量评估的 Tier-2 候选
+- `mod_cli_xsum_os_specific` 当前是最适合作为小文件 batch 翻译质量评估的 Tier-1 候选
 - `XSUM_clockSpan` 这类叶子探针不应被当作独立质量结论
+
+## XXH-BATCH-001
+
+- 编号：`XXH-BATCH-001`
+- 层级：小文件 batch 翻译 / prompt 泛化约束
+- 现象：
+  - 在 `mod_cli_xsum_os_specific` 的 batch 翻译验证中，首轮输出曾出现多类“单函数翻译时较少暴露、batch 输出时更明显”的问题
+  - 典型问题包括：
+    - 生成不存在的伪属性 `#[unsafe(no_mangle_generic)]`
+    - 在函数体内部重复生成空的 `extern "C"` 块
+    - 把八进制位掩码错误转换为十进制或语义不清的常量
+    - 错改函数名大小写，例如破坏 `XSUM_main`
+    - 把 POSIX API 改写成 Windows API，例如 `isatty -> _isatty`、`stat -> _stat64`
+    - 对 `((void)stream);` 这类空操作函数生成空 stub，而不是保留参数消费语义
+- 复现对象：
+  - `testing/projects/xxHash-benchhelpers-20260416`
+  - `mod_cli_xsum_os_specific`
+- 最终验证命令：
+  - `C2RUST_HOME=/tmp/c2rust-home C2RUST_TRANSLATE_DIR=/home/server/C2RustXW-workspace-wsl/tools/.local-dev/python/translate_and_fix C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS=8 /tmp/c2rust-home/bin/c2rust-xw translate --feature default --allow-all --unit mod_cli_xsum_os_specific --show-full-output --max-error-fix-attempts 1 --max-warning-fix-attempts 1`
+- 最终验证日志：
+  - `/tmp/xxhash-batch-os-specific-xw-final.log`
+- 当前状态：
+  - 已通过 prompt 约束收敛
+  - 已把运行时验证过的 batch Python 入口和 prompt 迁回 CLI 仓库源码：
+    - `translate_and_fix/batch_translation.py`
+    - `translate_and_fix/prompts/batch_translation.txt`
+    - `translate_and_fix/translate_and_fix.py` 的 `batch_fn_var` 分支
+  - `Attempting batch translation = 1`
+  - `Batch translation fallback = 0`
+  - `Check successful = 7`
+  - `Hybrid build tests passed = 7`
+  - `still has build errors = 0`
+  - `Skipping file = 0`
+- 工程含义：
+  - 小文件 batch 能提升上下文完整性，但也会放大“模型自由发挥”的风险
+  - batch prompt 必须比单函数 prompt 更严格地约束输出边界、平台 API、函数名、位级常量和空操作语义
+- 希望达到的效果：
+  - batch 翻译应稳定输出 manifest 内目标符号，不生成额外伪结构
+  - 不允许跨平台 API 猜测式替换
+  - 不允许破坏 C ABI 名称
+  - 空操作函数也应生成可编译、语义可追踪的 Rust 主体
+
+## XXH-BATCH-002
+
+- 编号：`XXH-BATCH-002`
+- 层级：依赖分析 / batch 粒度选择
+- 现象：
+  - 当前 `translation_plan.json` 已能支撑同 unit 内调度和小 unit batch
+  - 当前也已生成基于符号引用的轻量跨 unit 顺序
+  - 但它还不是完整的 C 编译级项目依赖图
+  - 当前 unit 边界仍然主要等价于现有 `mod_xxx`
+- 当前证据：
+  - `mod_cli_xsum_arch`、`mod_cli_xsum_output`、`mod_cli_xsum_os_specific` 都能作为小 unit batch 成功
+  - `mod_cli_xsum_bench` 约 `321` 行、`28` 个 symbol，不适合直接整 unit batch
+- 影响：
+  - 当前能力足以支撑小文件 batch 质量样例
+  - 但还不足以自动把大文件拆成最优 batch 子组
+- 希望达到的效果：
+  - 对大 unit 能基于依赖边和 SCC 自动拆分成多个子 batch
+  - 每个子 batch 保持在模型稳定输入规模内
+  - 子 batch 之间仍按依赖顺序验证，避免再次形成空 stub 阻塞
+  - 后续跨 unit 调度能覆盖 include/macro/类型依赖/函数指针等隐式依赖，而不只依赖符号正文 identifier 引用
+- 当前推荐方向：
+  - 不直接整批翻译 `mod_cli_xsum_bench`
+  - 先设计并落地 SCC/子组 batch，再扩大 benchmark 路径样例
+
+## XXH-BATCH-003
+
+- 编号：`XXH-BATCH-003`
+- 层级：小文件 batch 翻译 / 输入完整性
+- 现象：
+  - 初版 batch 实现虽然会把多个 `fun_*.rs / var_*.rs` 作为同一个 group 处理
+  - 但传给 Python 翻译脚本的 `--c_code` 实际只来自 `rs_files[0].with_extension("c")`
+  - 也就是只包含 batch group 第一个目标的 sidecar C 片段
+- 影响：
+  - 模型没有看到完整 batch unit 上下文
+  - 多目标 batch 成功可能被高估
+  - 后续扩大 batch 粒度时会得到不可信质量结论
+- 已落地修复：
+  - `process_batch_candidate_group` 现在会聚合 group 内所有目标的同名 sidecar `.c`
+  - 聚合结果写入：
+    - `rust/target/batch-translate/unit.c`
+  - 每次 batch 前清理：
+    - `rust/target/batch-translate/outputs`
+  - 避免旧输出文件污染本轮结果
+- 回归证据：
+  - 目标 unit：`mod_cli_xsum_arch`
+  - 日志：`/tmp/xxhash-batch-arch-aggregated.log`
+  - batch C preview 同时包含：
+    - `fun_XSUM_autox86.rs`
+    - `var_g_xsumarch_avoid_empty_unit.rs`
+  - 两个目标均通过：
+    - Rust check
+    - warning check
+    - hybrid build
+    - `make test_sanity`
+- 希望达到的效果：
+  - 后续所有 batch 质量数据都必须建立在完整 C 输入基础上
+  - 不能再把“只看首个 sidecar C 的多目标输出”计入 batch 成功样例
+
+## XXH-BATCH-004
+
+- 编号：`XXH-BATCH-004`
+- 层级：大 unit 子 batch / 变量 lowering / prompt 约束
+- 现象：
+  - 对 `mod_cli_xsum_bench` 的第 3 个子 batch 做受控探针时，调度正确扩展到 6 个目标
+  - batch C 输入也正确聚合了 6 个 sidecar `.c`
+  - 但变量文件的首轮输出会把 C 的 `sizeof(g_hashesToBench) / sizeof(*g_hashesToBench)` 带入 Rust
+- 第一轮探针：
+  - 日志：`/tmp/xxhash-bench-subbatch-findmaxmem.log`
+  - 结果：
+    - `sizeof(...)` 原样出现在 Rust
+    - `var_g_nbTestFunctions.rs`
+    - `var_g_testIDs.rs`
+    - `var_k_testIDs_default.rs`
+    均触发编译错误或类型错误
+    - 这些 sibling 变量错误会拖住前面的函数目标
+- 第二轮 prompt 收紧后：
+  - 日志：`/tmp/xxhash-bench-subbatch-findmaxmem-prompt2.log`
+  - 已改善：
+    - `sizeof(...)` 不再原样出现
+    - `var_g_testIDs.rs` 通过 Rust check、hybrid build、`make test_sanity`
+    - `var_k_testIDs_default.rs` 通过 Rust check、hybrid build、`make test_sanity`
+  - 剩余问题：
+    - `var_g_nbTestFunctions.rs` 仍生成 `size_of::<[XSUM_hashInfo; 0]>()`
+    - `XSUM_hashInfo` 并非当前模块可见类型
+    - 表达式类型为 `usize`，与 manifest 中的 `::core::ffi::c_int` 不匹配
+- 第三轮 prompt 继续收紧后：
+  - 日志：`/tmp/xxhash-bench-subbatch-findmaxmem-prompt3.log`
+  - `var_g_nbTestFunctions.rs` 改为：
+    - `pub static g_nbTestFunctions: ::core::ffi::c_int = 0;`
+  - 6 个目标全部通过：
+    - Rust check
+    - warning check 后续流程
+    - hybrid build
+    - `make test_sanity`
+  - `translation_stats.json` 显示：
+    - `total_files = 23`
+    - `skipped_files = []`
+    - 该 6 个目标均不在 `translation_failed_files`
+- 当前已补充的 prompt 约束：
+  - 变量文件必须以 manifest `rusttype` 为唯一 Rust 形状来源
+  - 不允许输出 C `sizeof(...)`
+  - 不允许为了 C `sizeof` 猜测生成 Rust `size_of::<...>()`
+  - 不允许臆造 `XSUM_hashInfo` 等类型名
+  - 复杂 `sizeof` 标量初始化无法安全常量化时，优先使用与 manifest 类型匹配的保守初始化
+- 工程含义：
+  - 子 batch 调度本身已工作
+  - batch prompt 的变量 lowering 已能处理该组 `sizeof` 变量样例
+  - 但 warning 阶段仍可能在处理后续变量时反复修同 batch sibling 的 warning
+  - 因此后续仍需要改进 batch 级验证与错误/告警归因
+- 希望达到的效果：
+  - batch 中变量文件首轮输出不得生成不可编译的 C 风格大小表达式
+  - batch 级错误应能归因到具体 sibling，而不是把前序函数目标误标为失败
+  - 统计中应区分“当前文件自身错误”和“batch sibling 错误”
+- 2026-05-09 复测更新：
+  - 第一轮复测日志：`/tmp/xxhash-batch-warning-scope-20260509.log`
+  - 第一轮复测中，变量 lowering 已保持可编译，但 `fun_XSUM_findMaxMem.rs` 暴露 `E0282`
+  - 具体原因是模型生成了 `let mut testmem = core::ptr::null_mut()`，Rust 无法推断 raw pointer pointee 类型
+  - 已补充泛化 prompt 约束：`void*` / `const void*` 的 `NULL` 初始化必须显式标注 `*mut/*const ::core::ffi::c_void`
+  - 第二轮复测日志：`/tmp/xxhash-batch-pointer-prompt-20260509.log`
+  - 第二轮复测 6 个目标全部通过 Rust check、hybrid build 和 `make test_sanity`
+  - `translation_stats.json` 显示 `skipped_files = []`，该 6 个目标均不在 `translation_failed_files`
 
 ## XXH-FIX-001
 
@@ -426,3 +595,31 @@
     - `phase=hybrid-build`
     - `tty_available=false`
     - `error_excerpt` 存在
+
+## XXH-BATCH-005
+
+- 编号：`XXH-BATCH-005`
+- 层级：batch 翻译验证归因
+- 现象：batch 翻译写回多个 `fun_*.rs / var_*.rs` 后，系统仍逐个符号执行 warning check；当同 batch sibling 存在 warning 时，后续目标可能反复触发对 sibling 的 warning 修复
+- 复现样例：
+  - `mod_cli_xsum_bench` 的第 `3` 个子 batch
+  - 触发入口：`src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs`
+  - batch 目标数：`6`
+- 影响：
+  - batch 翻译本身可能已经完成，但后续逐文件 warning 阶段会引入重复修复噪声
+  - 变量目标容易被错误归因到函数 sibling 的 warning
+  - 日志中会出现“当前处理文件”和“实际修复文件”不一致，降低质量评估可信度
+- 现阶段处理：
+  - 已于 `2026-05-09` 收窄 warning 修复作用域
+  - 普通单文件翻译维持原来的全项目 warning 分组修复
+  - batch 写回复用 Rust 输出路径下，只修复当前目标文件的 warning
+  - 如果诊断只来自同 batch sibling，则当前目标跳过 warning 修复
+- 验证：
+  - 新增单测：`test_apply_fixes_for_messages_current_file_scope_ignores_sibling_warning`
+  - 已通过 `cargo test test_apply_fixes_for_messages_current_file_scope_ignores_sibling_warning -- --nocapture`
+  - 真实 CLI 复测日志：`/tmp/xxhash-batch-pointer-prompt-20260509.log`
+  - 复测中后续目标出现 sibling warning 时记录 `Diagnostics belong only to other batch sibling file(s); skipping current-file fix.`
+  - 同一轮 6 个目标全部通过 Rust check、hybrid build 和 `make test_sanity`
+- 后续建议：
+  - 将 batch attempt、batch group、warning 归因结果写入结构化 stats
+  - 在 report 中区分 batch 级成功、符号级成功和 warning-only sibling 噪声

@@ -443,7 +443,10 @@ pub fn c2rust_build(feature: &str) -> Result<()> {
     analyzer::update_code_analysis(feature)?;
     println!("{}", "✓ Code analysis updated".bright_green());
 
-    println!("{}", "Rebuilding Rust static library for hybrid link...".bright_blue());
+    println!(
+        "{}",
+        "Rebuilding Rust static library for hybrid link...".bright_blue()
+    );
     cargo_build(feature, true, false)?;
     println!("{}", "✓ Rust static library refreshed".bright_green());
 
@@ -458,7 +461,10 @@ pub fn c2rust_build(feature: &str) -> Result<()> {
 pub(crate) fn c2rust_build_no_analysis(feature: &str) -> Result<()> {
     util::validate_feature_name(feature)?;
 
-    println!("{}", "Rebuilding Rust static library for hybrid link...".bright_blue());
+    println!(
+        "{}",
+        "Rebuilding Rust static library for hybrid link...".bright_blue()
+    );
     cargo_build(feature, true, false)?;
     println!("{}", "✓ Rust static library refreshed".bright_green());
 
@@ -856,7 +862,11 @@ pub(crate) fn handle_build_failure_interactive(
                                                     interaction::FailureChoice::ManualFix => {
                                                         // 重新打开 vim
                                                         println!("│ {}", "Reopening Vim for another manual fix attempt...".bright_blue());
-                                                        let fix_files = get_manual_fix_files(feature, rs_file, &e.to_string());
+                                                        let fix_files = get_manual_fix_files(
+                                                            feature,
+                                                            rs_file,
+                                                            &e.to_string(),
+                                                        );
                                                         interaction::open_files_for_manual_fix(&fix_files)
                                                             .context("Failed to reopen vim for additional manual fix")?;
                                                         // 更新错误并继续外部循环以重新构建
@@ -893,7 +903,9 @@ pub(crate) fn handle_build_failure_interactive(
                             }
                             interaction::FailureChoice::Skip
                             | interaction::FailureChoice::FixOtherFile => {
-                                unreachable!("Skip and FixOtherFile are not offered in this context")
+                                unreachable!(
+                                    "Skip and FixOtherFile are not offered in this context"
+                                )
                             }
                             interaction::FailureChoice::Exit => {
                                 return Err(current_error)
@@ -920,7 +932,9 @@ pub(crate) fn handle_build_failure_interactive(
                         );
 
                         // Vim 编辑后尝试使用混合构建流程进行构建和测试
-                        match run_full_build_and_test_interactive(feature, file_type, rs_file, skip_test) {
+                        match run_full_build_and_test_interactive(
+                            feature, file_type, rs_file, skip_test,
+                        ) {
                             Ok(_) => {
                                 return Ok(true);
                             }
@@ -954,10 +968,12 @@ pub(crate) fn handle_build_failure_interactive(
                                             "Reopening Vim for another manual fix attempt..."
                                                 .bright_blue()
                                         );
-                                        let fix_files = get_manual_fix_files(feature, rs_file, &e.to_string());
-                                        interaction::open_files_for_manual_fix(&fix_files).context(
-                                            "Failed to reopen vim for additional manual fix",
-                                        )?;
+                                        let fix_files =
+                                            get_manual_fix_files(feature, rs_file, &e.to_string());
+                                        interaction::open_files_for_manual_fix(&fix_files)
+                                            .context(
+                                                "Failed to reopen vim for additional manual fix",
+                                            )?;
                                         // Vim 关闭后，继续循环重新构建和重新测试
                                         continue;
                                     }
@@ -977,9 +993,7 @@ pub(crate) fn handle_build_failure_interactive(
                                         ));
                                     }
                                     interaction::FailureChoice::FixOtherFile => {
-                                        unreachable!(
-                                            "FixOtherFile is not offered in this context"
-                                        )
+                                        unreachable!("FixOtherFile is not offered in this context")
                                     }
                                     interaction::FailureChoice::Exit => {
                                         return Err(e).context(
@@ -1225,7 +1239,9 @@ pub(crate) fn handle_test_failure_interactive(
                             }
                             interaction::FailureChoice::Skip
                             | interaction::FailureChoice::FixOtherFile => {
-                                unreachable!("Skip and FixOtherFile are not offered in this context")
+                                unreachable!(
+                                    "Skip and FixOtherFile are not offered in this context"
+                                )
                             }
                             interaction::FailureChoice::Exit => {
                                 return Err(current_error)
@@ -1252,7 +1268,9 @@ pub(crate) fn handle_test_failure_interactive(
                         );
 
                         // Vim 编辑后尝试使用混合构建流程进行构建和测试
-                        match run_full_build_and_test_interactive(feature, file_type, rs_file, skip_test) {
+                        match run_full_build_and_test_interactive(
+                            feature, file_type, rs_file, skip_test,
+                        ) {
                             Ok(_) => {
                                 return Ok(true);
                             }
@@ -1282,10 +1300,12 @@ pub(crate) fn handle_test_failure_interactive(
                                             "Reopening Vim for another manual fix attempt..."
                                                 .bright_blue()
                                         );
-                                        let fix_files = get_manual_fix_files(feature, rs_file, &e.to_string());
-                                        interaction::open_files_for_manual_fix(&fix_files).context(
-                                            "Failed to reopen vim for additional manual fix",
-                                        )?;
+                                        let fix_files =
+                                            get_manual_fix_files(feature, rs_file, &e.to_string());
+                                        interaction::open_files_for_manual_fix(&fix_files)
+                                            .context(
+                                                "Failed to reopen vim for additional manual fix",
+                                            )?;
                                         // Vim 关闭后，继续循环重新构建和重新测试
                                         continue;
                                     }
@@ -1298,7 +1318,9 @@ pub(crate) fn handle_test_failure_interactive(
                                     }
                                     interaction::FailureChoice::Skip
                                     | interaction::FailureChoice::FixOtherFile => {
-                                        unreachable!("Skip and FixOtherFile are not offered in this context")
+                                        unreachable!(
+                                            "Skip and FixOtherFile are not offered in this context"
+                                        )
                                     }
                                     interaction::FailureChoice::Exit => {
                                         return Err(e).context(
@@ -1320,8 +1342,7 @@ pub(crate) fn handle_test_failure_interactive(
                 }
             }
         }
-        interaction::FailureChoice::Skip
-        | interaction::FailureChoice::FixOtherFile => {
+        interaction::FailureChoice::Skip | interaction::FailureChoice::FixOtherFile => {
             unreachable!("Skip and FixOtherFile are not offered in this context")
         }
         interaction::FailureChoice::Exit => {
@@ -1549,8 +1570,7 @@ mod tests {
             "error[E0308]: mismatched types\n  --> src/fun_test.rs:10:5\n  |\n10 |     x\n"
         );
 
-        let files =
-            super::get_manual_fix_files(feature, &rs_file_path, &error_str);
+        let files = super::get_manual_fix_files(feature, &rs_file_path, &error_str);
 
         // rs_file should appear only once
         let canonical_rs = rs_file_path.canonicalize().ok();

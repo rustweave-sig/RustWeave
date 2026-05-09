@@ -389,7 +389,9 @@ pub(crate) fn handle_startup_test_failure_with_files(
                                             match retry_choice {
                                                 interaction::FailureChoice::ManualFix => {
                                                     println!("│ {}", "Reopening file in Vim for additional manual fixes...".bright_blue());
-                                                    match interaction::open_files_for_manual_fix(&files) {
+                                                    match interaction::open_files_for_manual_fix(
+                                                        &files,
+                                                    ) {
                                                         Ok(_) => {
                                                             // 循环将重试构建
                                                             continue;
@@ -422,14 +424,14 @@ pub(crate) fn handle_startup_test_failure_with_files(
                                                         "Skipping current file(s) to fix other files..."
                                                             .bright_cyan()
                                                     );
-                                                    return Err(crate::verification::SkipFileSignal.into());
+                                                    return Err(
+                                                        crate::verification::SkipFileSignal.into(),
+                                                    );
                                                 }
                                                 interaction::FailureChoice::RetryDirectly
                                                 | interaction::FailureChoice::AddSuggestion
                                                 | interaction::FailureChoice::Skip => {
-                                                    unreachable!(
-                                                        "此选项在此上下文中不受支持"
-                                                    )
+                                                    unreachable!("此选项在此上下文中不受支持")
                                                 }
                                             }
                                         }

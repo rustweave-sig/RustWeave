@@ -4,16 +4,21 @@ from LLM_calling import load_LLM_config, init_openai_instance, close_openai_inst
 from proxy import ProxyDetector
 from function_translation import function_translation
 from variable_translation import var_translation
+from batch_translation import batch_translation
 from syntax_fixing import syntax_fixing
 from semantic_fixing import semantic_fixing
+import json
+import os
 
 # 输入参数。error参数只在调用语法修复时需要填写；其他所有参数每次调用时都必须填写
 parser = argparse.ArgumentParser(description='Translate and fix')
 parser.add_argument('--config', type=str, help='Config file path. The config file should be in toml format.')
-parser.add_argument('--type', type=str, help='Type of translate tools. Allowed values: "var", "fn", "syntax_fix", "semantic_fix"')
+parser.add_argument('--type', type=str, help='Type of translate tools. Allowed values: "var", "fn", "batch_fn_var", "syntax_fix", "semantic_fix"')
 parser.add_argument('--c_code', type=str, default=None, help='The input file path. Input C code for var/fun translation or fixing. The input file should ONLY contain the code that are about to be translated.')
 parser.add_argument('--rust_code', type=str, default=None, help='The input file path. Input rust code for fixing. The input file should ONLY contain the code that are about to be fixed.')
 parser.add_argument('--output', type=str, help='The output file path of LLM translation/fixing result. The content of output file will be OVEWRITTEN.')
+parser.add_argument('--output_dir', type=str, default=None, help='The output directory path for batch translation result files.')
+parser.add_argument('--batch_manifest', type=str, default=None, help='The manifest json file path for batch translation.')
 parser.add_argument('--error', type=str, default=None, help='The file path of error message for syntax fixing. The error message file should ONLY contain the error message about the code in the input file.')
 parser.add_argument('--suggestion', type=str, default=None, help='The file path of human suggestion for fixing.')
 parser.add_argument('--rusttype', type=str, help='The type of Rust var or func after translation or fix. e.g.: i32')
@@ -70,6 +75,15 @@ if tool_type == "var":
     res = var_translation(c_code, LLM_config.model, openai_instance, args.rusttype)
 elif tool_type == "fn":
     res = function_translation(c_code, LLM_config.model, openai_instance, args.rusttype)
+elif tool_type == "batch_fn_var":
+    try:
+        with open(args.batch_manifest, 'r', encoding='utf-8') as file:
+            manifest_json = file.read()
+    except Exception as e:
+        close_openai_instance(openai_instance)
+        print(f"ERROR - 读取batch manifest文件时发生错误: {e}")
+        exit(1)
+    res = batch_translation(c_code, manifest_json, LLM_config.model, openai_instance, args.suggestion)
 elif tool_type == "syntax_fix":
     # 加错误信息
     try:
@@ -92,17 +106,31 @@ elif tool_type == "semantic_fix":
 else:
     # 关闭大模型会话
     close_openai_instance(openai_instance)
-    print(f"ERROR - 调用工具的类型出错，只允许以下值： var/fn/syntax_fix/semantic_fix（分别代表变量翻译/函数翻译/语法修复/语义修复）")
+    print(f"ERROR - 调用工具的类型出错，只允许以下值： var/fn/batch_fn_var/syntax_fix/semantic_fix（分别代表变量翻译/函数翻译/批量翻译/语法修复/语义修复）")
     exit(1)
 
 # 关闭大模型会话
 close_openai_instance(openai_instance)
 
-# 将结果写入输入路径
-try:
-    with open(args.output, 'w', encoding='utf-8') as file:
-        file.write(res)
-        print(f"Info - 翻译/修复结果已写入 {args.output}")
-except Exception as e:
-    print(f"ERROR - 写入output文件时发生错误: {e}")
-    exit(1)
+if tool_type == "batch_fn_var":
+    try:
+        os.makedirs(args.output_dir, exist_ok=True)
+        for item in res["files"]:
+            target = os.path.join(args.output_dir, os.path.basename(item["path"]))
+            with open(target, 'w', encoding='utf-8') as file:
+                file.write(item["code"])
+        with open(args.output, 'w', encoding='utf-8') as file:
+            file.write(json.dumps(res, ensure_ascii=False, indent=2))
+        print(f"Info - batch翻译结果已写入 {args.output_dir}")
+    except Exception as e:
+        print(f"ERROR - 写入batch output文件时发生错误: {e}")
+        exit(1)
+else:
+    # 将结果写入输入路径
+    try:
+        with open(args.output, 'w', encoding='utf-8') as file:
+            file.write(res)
+            print(f"Info - 翻译/修复结果已写入 {args.output}")
+    except Exception as e:
+        print(f"ERROR - 写入output文件时发生错误: {e}")
+        exit(1)

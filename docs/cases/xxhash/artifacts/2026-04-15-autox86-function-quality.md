@@ -447,6 +447,81 @@
   - prompt 主线不再只是在修补编译错误
   - 已经能够把 benchmark 主链路代表性函数推进到完整自动闭环
 
+## 6. 2026-04-27 benchmark 子闭包扩展里程碑
+
+- 在新的隔离副本 `testing/projects/xxHash-benchhelpers-20260416` 上，继续沿 `xsum_bench.c` 的真实依赖关系扩展 benchmark 子闭包。
+- 本轮目标不是重新验证 `benchHash / benchMem / benchFiles / benchInternal`，而是确认：
+  - 当前 `translate --file` 能否继续稳定推进相邻 helper
+  - 当前 prompt 主线是否已足以覆盖最小 wrapper 类函数
+
+### 本轮新增闭合函数
+
+- benchmark helper：
+  - `src/mod_cli_xsum_bench/fun_XSUM_clockSpan.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_strcatDup.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_selectBenchedSize.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs`
+- 最小 hash wrapper：
+  - `src/mod_cli_xsum_bench/fun_localXXH32.rs`
+
+### 各函数结果概览
+
+- `XSUM_clockSpan`
+  - 纯自动首轮通过
+  - `cargo check`、hybrid `make xxhsum`、`make test_sanity` 全通过
+- `XSUM_strcatDup`
+  - 首轮翻译仅暴露 `c"XSUM_strcatDup".as_ptr().as_ptr()` 这一条字符串指针层级错误
+  - 1 轮 syntax-fix 后收敛
+  - `cargo check`、hybrid `make xxhsum`、`make test_sanity` 全通过
+- `XSUM_selectBenchedSize`
+  - 首轮翻译本体质量已足够
+  - 初次 targeted rerun 时，hybrid 链接被旧的空 `XSUM_strcatDup` stub 阻塞
+  - 在 `XSUM_strcatDup` 补齐后，已确认该函数可通过完整闭环
+- `XSUM_findMaxMem`
+  - 纯自动首轮通过
+  - 直接落成可编译、可链接、可测试形式
+- `localXXH32`
+  - 纯自动首轮通过
+  - 直接落成 `unsafe { XXH32(buffer, bufferSize, seed) }`
+  - `cargo check`、hybrid `make xxhsum`、`make test_sanity` 全通过
+
+### 当前闭包状态
+
+- 截至本轮，副本 `testing/projects/xxHash-benchhelpers-20260416` 中共有 `9` 个非空函数实体文件：
+  - `XSUM_benchHash`
+  - `XSUM_benchMem`
+  - `XSUM_benchFiles`
+  - `XSUM_benchInternal`
+  - `XSUM_clockSpan`
+  - `XSUM_strcatDup`
+  - `XSUM_selectBenchedSize`
+  - `XSUM_findMaxMem`
+  - `localXXH32`
+- 对应 `translation_stats.json` 也已同步收敛为：
+  - `total_files = 9`
+  - `file_attempts = 9`
+  - `skipped_files = []`
+  - `translation_failed_files = []`
+
+### 本轮结论
+
+- 这条质量线已经从：
+  - “4 个 benchmark 主函数样例”
+  推进到：
+  - “benchmark 主链 + helper + 首个 wrapper 的 9 函数闭合里程碑”
+- 其意义在于：
+  - 当前自动链路已不只是能打通代表性入口
+  - 还能够沿真实依赖关系继续扩展子闭包
+  - 对简单 helper / wrapper 的泛化能力已经明显强于之前阶段
+
+### 下一候选
+
+- 若继续沿同一方向扩展，建议顺序为：
+  - `localXXH64`
+  - `localXXH3_64b`
+  - `localXXH3_64b_seeded`
+  - 再进入 `stream` / `secret` 版本
+
 ### 当前评价
 
 - 质量状态：

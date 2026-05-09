@@ -751,8 +751,8 @@ impl Feature {
         // Ensure `use ::core::ffi::*;` is present so that C FFI type aliases
         // (c_uchar, c_int, …) are in scope for all child modules.
         if !lib_items.iter().any(Self::is_ffi_glob_import) {
-            let use_ffi: syn::Item = syn::parse_str("use ::core::ffi::*;")
-                .log_err("parse use ::core::ffi::*")?;
+            let use_ffi: syn::Item =
+                syn::parse_str("use ::core::ffi::*;").log_err("parse use ::core::ffi::*")?;
             lib_items.insert(0, use_ffi);
         }
 
@@ -873,7 +873,7 @@ mod tests {
 
         let item: syn::Item = syn::parse_str("fn my_func() {}").unwrap();
         assert_eq!(Feature::item_name(&item), Some("my_func".to_string()));
-    
+
         let item: syn::Item = syn::parse_str("use std::ffi::*;").unwrap();
         assert_eq!(Feature::item_name(&item), None);
     }
@@ -1354,7 +1354,11 @@ mod tests {
             "mod ffi {}",
         ] {
             let item: syn::Item = syn::parse_str(src).unwrap();
-            assert!(!Feature::is_ffi_glob_import(&item), "{} should not match", src);
+            assert!(
+                !Feature::is_ffi_glob_import(&item),
+                "{} should not match",
+                src
+            );
         }
     }
 
@@ -1369,11 +1373,7 @@ mod tests {
         fs::create_dir_all(&src_2_dir).unwrap();
 
         let lib_rs_src = src_dir.join("lib.rs");
-        fs::write(
-            &lib_rs_src,
-            "#![allow(unused_imports)]\nmod mod_cJSON;\n",
-        )
-        .unwrap();
+        fs::write(&lib_rs_src, "#![allow(unused_imports)]\nmod mod_cJSON;\n").unwrap();
 
         let mut duplicates = Duplicates::default();
         Feature::update_lib_rs(&src_2_dir, &mut duplicates, &None).unwrap();
@@ -1446,6 +1446,9 @@ mod tests {
         let out = fs::read_to_string(src_2_dir.join("lib.rs")).unwrap();
         // No duplicate import should be inserted
         let ffi_count = out.matches("ffi::*").count();
-        assert_eq!(ffi_count, 1, "should have exactly one ffi::* glob; got:\n{out}");
+        assert_eq!(
+            ffi_count, 1,
+            "should have exactly one ffi::* glob; got:\n{out}"
+        );
     }
 }

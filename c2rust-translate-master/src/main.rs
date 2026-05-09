@@ -39,6 +39,10 @@ enum Commands {
         #[arg(long)]
         file: Option<String>,
 
+        /// 仅处理指定的 translation unit（来自 `.c2rust/<feature>/translation_plan.json` 的 `unit_id`）
+        #[arg(long)]
+        unit: Option<String>,
+
         /// 构建错误的最大修复尝试次数（必须 > 0，默认为 5）
         #[arg(long, default_value = "5", value_parser = parse_positive_usize)]
         max_error_fix_attempts: usize,
@@ -72,6 +76,7 @@ fn main() {
             feature,
             allow_all,
             file,
+            unit,
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,
@@ -79,6 +84,7 @@ fn main() {
             &feature,
             allow_all,
             file.as_deref(),
+            unit.as_deref(),
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,

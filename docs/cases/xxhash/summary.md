@@ -1,5 +1,91 @@
 # 测试摘要
 
+## 截至 2026-05-08 的状态更新
+
+- 已在隔离副本 `testing/projects/xxHash-benchhelpers-20260416` 上完成依赖计划驱动的小文件 batch 翻译验证。
+- 当前 `.c2rust/default/translation_plan.json` 已真实生成，并被 `translate` 消费用于调度。
+- 已落地两个新的定点入口：
+  - `translate --file <src/.../fun_or_var.rs>`：命中 batch candidate 时自动扩展到所属 unit
+  - `translate --unit <unit_id>`：直接指定 translation unit 翻译
+- 外层 `c2rust-xw translate` 已透传 `--unit`，并默认为内部翻译器开启 `C2RUST_TRANSLATE_DEP_ORDER=1`。
+- 当前已验证通过的小文件 batch unit：
+  - `mod_cli_xsum_arch`：`17` 行，`2` 个 symbol
+  - `mod_cli_xsum_output`：`1` 行，`1` 个 symbol
+  - `mod_cli_xsum_os_specific`：`34` 行，`7` 个 symbol，在 `C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS=8` 下通过
+- `mod_cli_xsum_os_specific` 的最终验证结果：
+  - `Attempting batch translation = 1`
+  - `Batch translation fallback = 0`
+  - `Check successful = 7`
+  - `Hybrid build tests passed = 7`
+  - `still has build errors = 0`
+  - `Skipping file = 0`
+- 随后修正了 batch 输入完整性问题：
+  - 旧实现只把 batch group 第一个目标的 sidecar `.c` 传给模型
+  - 现已改为聚合全部目标 sidecar `.c` 到 `rust/target/batch-translate/unit.c`
+  - 每次 batch 前清理旧 `outputs`，避免过期输出造成假成功
+- 修复后的回归验证：
+  - 目标 unit：`mod_cli_xsum_arch`
+  - batch C preview 同时包含：
+    - `fun_XSUM_autox86.rs`
+    - `var_g_xsumarch_avoid_empty_unit.rs`
+  - 两个目标均通过 Rust check、warning check、hybrid build 和 `make test_sanity`
+  - 日志：`/tmp/xxhash-batch-arch-aggregated.log`
+- 本阶段的结论：
+  - xxHash 已新增一个“小文件 batch 翻译质量样例”
+  - 当前样例证明 batch 上下文可以稳定处理多个强相关 helper/wrapper
+  - 当前已具备基于符号引用的轻量跨 unit 顺序，但 unit 边界仍是现有 `mod_xxx`，尚未完成 include/macro/类型依赖/函数指针级的完整项目依赖分析
+- 当前不建议直接把 `mod_cli_xsum_bench` 整体作为下一个 batch 目标：
+  - 该 unit 约 `321` 行、`28` 个 symbol
+  - 已超过当前小文件 batch 的安全输入规模
+  - 更合理的后续方向是做 SCC/子组 batch，而不是整 unit 一次性输入
+
+## 截至 2026-04-27 的状态更新
+
+- 已在新的隔离副本 `testing/projects/xxHash-benchhelpers-20260416` 上，把 `xsum_bench.c` 的 benchmark 子闭包继续向相邻 helper / wrapper 扩展。
+- 这条副本当前已形成 `9` 个非空函数实体文件，且 `translation_stats.json` 与实际非空函数数一致：
+  - `total_files = 9`
+  - `file_attempts = 9`
+  - `skipped_files = []`
+  - `translation_failed_files = []`
+- 当前已闭合的函数集合为：
+  - `src/mod_cli_xsum_bench/fun_XSUM_benchHash.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_benchMem.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_benchFiles.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_benchInternal.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_clockSpan.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_strcatDup.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_selectBenchedSize.rs`
+  - `src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs`
+  - `src/mod_cli_xsum_bench/fun_localXXH32.rs`
+- 其中本轮新增闭合的 5 个函数可分两类：
+  - benchmark helper：
+    - `XSUM_clockSpan`
+    - `XSUM_strcatDup`
+    - `XSUM_selectBenchedSize`
+    - `XSUM_findMaxMem`
+  - 最小 hash wrapper：
+    - `localXXH32`
+- 本轮观察到的关键现象：
+  - `XSUM_clockSpan` 纯自动首轮通过
+  - `XSUM_findMaxMem` 纯自动首轮通过
+  - `localXXH32` 纯自动首轮通过
+  - `XSUM_strcatDup` 首轮仅暴露 `c"...".as_ptr().as_ptr()`，在 1 轮 syntax-fix 后通过
+  - `XSUM_selectBenchedSize` 的首次 targeted rerun 一度被 `XSUM_strcatDup` 空 stub 阻塞 hybrid 链接；待依赖补齐后，已确认其可通过 `cargo check`、hybrid `make xxhsum` 与 `make test_sanity`
+- 这说明：
+  - 当前质量线已经不只是“4 个 benchmark 主函数样例”
+  - `translate --file` 已能沿着真实调用依赖，把 benchmark 子闭包从主入口逐步扩到相邻 helper 和最小 wrapper
+  - 新增函数大多可在首轮或单次 fix 内收敛，说明当前 prompt 主线对这类简单包装 / 小型 helper 已具备较强泛化性
+- 因而当前可以把这一阶段定义为新的独立里程碑：
+  - `xxHash benchmark 子闭包扩展里程碑（9 函数闭合）`
+- 这个里程碑的工程意义是：
+  - 已从“只证明代表性主函数能跑通”
+  - 推进到“benchmark 子闭包开始连续扩张，且统计、hybrid 构建、测试结果彼此一致”
+- 若后续继续沿同一方向扩展，当前最自然的下一批候选是：
+  - `localXXH64`
+  - `localXXH3_64b`
+  - `localXXH3_64b_seeded`
+  - 之后再进入 `stream` / `secret` 版本
+
 ## 截至 2026-04-15 的状态更新
 
 - 已在新的隔离副本 `testing/projects/xxHash-autox86-quality-20260415` 上对 `autox86` 最小样例做了一次完整回归：
@@ -462,3 +548,16 @@
 - 产品状态表达上，建议明确拆分：
   - `hybrid-pass`
   - `rust-closure-pass`
+
+## 2026-05-09 batch 翻译进展
+
+- 当前已经具备“依赖计划顺序 + 小文件 batch 输入 + 符号级状态管理”的第一版能力。
+- `translate --unit <unit_id>` 可以直接指定 translation unit。
+- `translate --file <path>` 在命中 batch candidate 时会扩展到对应 unit；在大 unit 内会扩展到该文件所属的子 batch。
+- `mod_cli_xsum_bench` 当前默认切成 `6` 个子 batch，不直接整 unit 翻译。
+- 已验证的 `findMaxMem` 子 batch 包含 `6` 个目标，第三轮 prompt 修正后全部通过 Rust check、hybrid build 和 `make test_sanity`。
+- 2026-05-09 复测中，首轮暴露 `void*` 空指针初始化缺少显式 Rust raw pointer 类型的问题；补充 prompt 后，6 个目标再次全部通过 Rust check、hybrid build 和 `make test_sanity`。
+- 成功日志：
+  - `/tmp/xxhash-bench-subbatch-findmaxmem-prompt3.log`
+  - `/tmp/xxhash-batch-pointer-prompt-20260509.log`
+- batch 写回后的 warning 归因已收窄：复用 batch 输出逐目标验证时，只修当前目标 warning，不再被同 batch sibling 的 warning 反复牵引。

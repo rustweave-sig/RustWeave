@@ -516,6 +516,7 @@ impl ProgressState {
     /// clamping `processed` at `total` to prevent overflow.
     /// Useful when resuming a session or when an external source supplies
     /// the true counts directly.
+    #[cfg(test)]
     pub(crate) fn refresh(&mut self, total: usize, processed: usize) {
         self.total_count = total;
         self.processed_count = processed.min(total);
@@ -1015,10 +1016,22 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let rust_dir = temp_dir.path().join("rust").join("src");
         fs::create_dir_all(rust_dir.join("mod_a")).unwrap();
-        fs::write(rust_dir.join("mod_a").join("fun_done.rs"), "pub fn done() {}\n").unwrap();
-        fs::write(rust_dir.join("mod_a").join("var_done.rs"), "pub static X: i32 = 1;\n").unwrap();
+        fs::write(
+            rust_dir.join("mod_a").join("fun_done.rs"),
+            "pub fn done() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            rust_dir.join("mod_a").join("var_done.rs"),
+            "pub static X: i32 = 1;\n",
+        )
+        .unwrap();
         fs::write(rust_dir.join("mod_a").join("fun_empty.rs"), "").unwrap();
-        fs::write(rust_dir.join("mod_a").join("decl_only.rs"), "extern \"C\" {}\n").unwrap();
+        fs::write(
+            rust_dir.join("mod_a").join("decl_only.rs"),
+            "extern \"C\" {}\n",
+        )
+        .unwrap();
 
         let mut stats = TranslationStats::new();
         let changed = stats.reconcile_with_workspace(&rust_dir).unwrap();
@@ -1037,7 +1050,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let rust_dir = temp_dir.path().join("rust").join("src");
         fs::create_dir_all(rust_dir.join("mod_a")).unwrap();
-        fs::write(rust_dir.join("mod_a").join("fun_done.rs"), "pub fn done() {}\n").unwrap();
+        fs::write(
+            rust_dir.join("mod_a").join("fun_done.rs"),
+            "pub fn done() {}\n",
+        )
+        .unwrap();
 
         let mut stats = TranslationStats::new();
         stats.record_file_completion("src/mod_a/fun_done.rs".to_string(), 2, true, 3);
@@ -1058,7 +1075,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let rust_dir = temp_dir.path().join("rust").join("src");
         fs::create_dir_all(rust_dir.join("mod_a")).unwrap();
-        fs::write(rust_dir.join("mod_a").join("fun_done.rs"), "pub fn done() {}\n").unwrap();
+        fs::write(
+            rust_dir.join("mod_a").join("fun_done.rs"),
+            "pub fn done() {}\n",
+        )
+        .unwrap();
 
         let mut stats = TranslationStats::new();
         stats.file_attempts.insert(
@@ -1091,7 +1112,8 @@ mod tests {
             },
         );
         stats.skipped_files.push("mod_a/fun_done.rs".to_string());
-        stats.translation_failed_files
+        stats
+            .translation_failed_files
             .push("mod_a/fun_done.rs".to_string());
         stats.normalize_file_keys();
 
@@ -1105,9 +1127,21 @@ mod tests {
 
     #[test]
     fn test_canonicalize_stats_file_key_prefixes_src() {
-        assert_eq!(canonicalize_stats_file_key("mod_a/fun_done.rs"), "src/mod_a/fun_done.rs");
-        assert_eq!(canonicalize_stats_file_key("src/mod_a/fun_done.rs"), "src/mod_a/fun_done.rs");
-        assert_eq!(canonicalize_stats_file_key("./mod_a/fun_done.rs"), "src/mod_a/fun_done.rs");
-        assert_eq!(canonicalize_stats_file_key(r"mod_a\fun_done.rs"), "src/mod_a/fun_done.rs");
+        assert_eq!(
+            canonicalize_stats_file_key("mod_a/fun_done.rs"),
+            "src/mod_a/fun_done.rs"
+        );
+        assert_eq!(
+            canonicalize_stats_file_key("src/mod_a/fun_done.rs"),
+            "src/mod_a/fun_done.rs"
+        );
+        assert_eq!(
+            canonicalize_stats_file_key("./mod_a/fun_done.rs"),
+            "src/mod_a/fun_done.rs"
+        );
+        assert_eq!(
+            canonicalize_stats_file_key(r"mod_a\fun_done.rs"),
+            "src/mod_a/fun_done.rs"
+        );
     }
 }

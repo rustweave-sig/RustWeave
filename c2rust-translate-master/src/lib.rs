@@ -21,16 +21,53 @@ pub(crate) mod error_handler;
 pub(crate) mod interaction;
 pub(crate) mod suggestion;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use quote::ToTokens;
-use std::path::Path;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
 /// Interval (in successfully processed files) at which periodic git GC is triggered.
 /// Increasing this value reduces GC frequency; decreasing it compacts the repo more often.
 const GIT_GC_INTERVAL: usize = 10;
+
+#[derive(Debug, Clone, Deserialize)]
+struct TranslationPlan {
+    #[allow(dead_code)]
+    unit_edges: Vec<[String; 2]>,
+    #[allow(dead_code)]
+    unit_scc_groups: Vec<Vec<String>>,
+    unit_order: Vec<String>,
+    units: Vec<TranslationUnitPlan>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TranslationUnitPlan {
+    unit_id: String,
+    symbols: Vec<String>,
+    #[allow(dead_code)]
+    edges: Vec<[String; 2]>,
+    #[allow(dead_code)]
+    scc_groups: Vec<Vec<String>>,
+    #[allow(dead_code)]
+    batch_candidate: bool,
+    #[allow(dead_code)]
+    batch_reason: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum TranslationWorkItem {
+    Single(std::path::PathBuf),
+    BatchCandidateGroup {
+        unit_id: String,
+        reason: String,
+        files: Vec<std::path::PathBuf>,
+    },
+}
 
 /// Run periodic `git reflog expire` + `git gc` every [`GIT_GC_INTERVAL`] successfully
 /// processed files to keep the `.c2rust/.git` directory from growing unbounded.
@@ -39,9 +76,7 @@ const GIT_GC_INTERVAL: usize = 10;
 /// produced it, so that long runs with many skipped-file retries also get periodic
 /// compaction.  Both reflog expiry and GC failures are non-fatal (warnings only).
 fn maybe_run_periodic_git_gc(progress_state: &util::ProgressState) {
-    if progress_state.processed_count % GIT_GC_INTERVAL == 0
-        && progress_state.processed_count > 0
-    {
+    if progress_state.processed_count % GIT_GC_INTERVAL == 0 && progress_state.processed_count > 0 {
         git::git_expire_reflog();
         git::git_gc(false); // cheap periodic compaction, default prune grace period
     }
@@ -70,6 +105,7 @@ pub fn translate_feature(
     feature: &str,
     allow_all: bool,
     target_file: Option<&str>,
+    target_unit: Option<&str>,
     max_error_fix_attempts: usize,
     max_warning_fix_attempts: usize,
     show_full_output: bool,
@@ -113,13 +149,14 @@ pub fn translate_feature(
         skip_test,
     )?;
 
-    if let Some(target_file) = target_file {
-        prepare_target_file_rerun(feature, target_file, &mut stats)?;
+    let target_files = resolve_target_files(feature, target_file, target_unit)?;
+    if let Some(target_files) = target_files.as_deref() {
+        prepare_target_files_rerun(feature, target_files, &mut stats)?;
     }
 
     // Step 3 & 4: Select files and initialize progress
     let (rust_dir, mut progress_state) =
-        step_3_4_select_files_and_init_progress(feature, &stats, target_file)?;
+        step_3_4_select_files_and_init_progress(feature, &stats, target_files.as_deref())?;
 
     // Step 5: Execute translation loop
     let step5_result = step_5_execute_translation_loop(
@@ -127,7 +164,7 @@ pub fn translate_feature(
         &rust_dir,
         &mut progress_state,
         allow_all,
-        target_file,
+        target_files.as_deref(),
         max_error_fix_attempts,
         max_warning_fix_attempts,
         show_full_output,
@@ -185,7 +222,11 @@ fn step_1_initialize(feature: &str) -> Result<()> {
 }
 
 /// Step 2: Run initial verification
-fn step_2_initial_verification(feature: &str, show_full_output: bool, skip_test: bool) -> Result<()> {
+fn step_2_initial_verification(
+    feature: &str,
+    show_full_output: bool,
+    skip_test: bool,
+) -> Result<()> {
     initialization::execute_initial_verification(feature, show_full_output, skip_test)
 }
 
@@ -210,9 +251,7 @@ fn check_test_configuration(feature: &str) -> Result<bool> {
 
     match choice {
         interaction::TestConfigChoice::Exit => {
-            anyhow::bail!(
-                "User chose to exit to configure test settings in .c2rust/config.toml"
-            );
+            anyhow::bail!("User chose to exit to configure test settings in .c2rust/config.toml");
         }
         interaction::TestConfigChoice::Continue => {
             println!(
@@ -249,8 +288,9 @@ fn step_2_5_load_or_create_stats(
             loop {
                 print_previous_progress_summary(&existing_stats);
 
-                let choice =
-                    interaction::prompt_continue_or_restart(!existing_stats.skipped_files.is_empty())?;
+                let choice = interaction::prompt_continue_or_restart(
+                    !existing_stats.skipped_files.is_empty(),
+                )?;
 
                 match compute_resume_action(choice, feature, preexisting_resume_snapshot_needed) {
                     ResumeAction::Continue { snapshot_message } => {
@@ -360,7 +400,7 @@ fn print_previous_progress_summary(stats: &util::TranslationStats) {
 fn step_3_4_select_files_and_init_progress(
     feature: &str,
     _stats: &util::TranslationStats,
-    target_file: Option<&str>,
+    target_files: Option<&[String]>,
 ) -> Result<(std::path::PathBuf, util::ProgressState)> {
     println!(
         "\n{}",
@@ -370,7 +410,7 @@ fn step_3_4_select_files_and_init_progress(
     // Get rust directory path
     let project_root = util::find_project_root()?;
     let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
-    let progress_state = build_progress_state(&rust_dir, target_file)?;
+    let progress_state = build_progress_state(&rust_dir, target_files)?;
     let already_processed = progress_state.processed_count;
     let total_rs_files = progress_state.total_count;
 
@@ -380,13 +420,21 @@ fn step_3_4_select_files_and_init_progress(
     Ok((rust_dir, progress_state))
 }
 
-fn build_progress_state(rust_dir: &Path, target_file: Option<&str>) -> Result<util::ProgressState> {
-    let (already_processed, total_rs_files) = if let Some(target_file) = target_file {
-        let target_path = rust_dir.join(target_file);
-        let exists = target_path.is_file();
-        let is_empty = exists && std::fs::metadata(&target_path)?.len() == 0;
-        let already_processed = if exists && !is_empty { 1 } else { 0 };
-        (already_processed, 1)
+fn build_progress_state(
+    rust_dir: &Path,
+    target_files: Option<&[String]>,
+) -> Result<util::ProgressState> {
+    let (already_processed, total_rs_files) = if let Some(target_files) = target_files {
+        let mut already_processed = 0usize;
+        for target_file in target_files {
+            let target_path = rust_dir.join(target_file);
+            let exists = target_path.is_file();
+            let is_empty = exists && std::fs::metadata(&target_path)?.len() == 0;
+            if exists && !is_empty {
+                already_processed += 1;
+            }
+        }
+        (already_processed, target_files.len())
     } else {
         let total_rs_files = file_scanner::count_all_rs_files(rust_dir)?;
         let initial_empty_count = file_scanner::find_empty_rs_files(rust_dir)?.len();
@@ -398,6 +446,365 @@ fn build_progress_state(rust_dir: &Path, target_file: Option<&str>) -> Result<ut
         total_rs_files,
         already_processed,
     ))
+}
+
+fn should_use_translation_plan_order() -> bool {
+    matches!(
+        std::env::var("C2RUST_TRANSLATE_DEP_ORDER").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+fn load_translation_plan(feature: &str) -> Result<Option<TranslationPlan>> {
+    let project_root = util::find_project_root()?;
+    let path = project_root
+        .join(".c2rust")
+        .join(feature)
+        .join("translation_plan.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read translation plan: {}", path.display()))?;
+    let plan: TranslationPlan = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse translation plan: {}", path.display()))?;
+    Ok(Some(plan))
+}
+
+fn translation_batch_max_c_lines() -> usize {
+    translation_env_usize("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", 100)
+}
+
+fn translation_batch_max_symbols() -> usize {
+    translation_env_usize("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS", 6)
+}
+
+fn translation_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn should_use_translation_sub_batches() -> bool {
+    !matches!(
+        std::env::var("C2RUST_TRANSLATE_SUB_BATCH_ENABLE").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    )
+}
+
+fn resolve_target_files(
+    feature: &str,
+    target_file: Option<&str>,
+    target_unit: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    if target_file.is_some() && target_unit.is_some() {
+        bail!("--file and --unit cannot be used together");
+    }
+
+    if let Some(target_unit) = target_unit {
+        let Some(plan) = load_translation_plan(feature)? else {
+            bail!(
+                "Translation unit `{}` requires .c2rust/{}/translation_plan.json; run feature reinit/update first",
+                target_unit,
+                feature
+            );
+        };
+
+        let Some(unit) = plan.units.iter().find(|unit| unit.unit_id == target_unit) else {
+            bail!(
+                "Translation unit `{}` not found in .c2rust/{}/translation_plan.json",
+                target_unit,
+                feature
+            );
+        };
+
+        println!(
+            "{}",
+            format!(
+                "Target unit {} resolved to {} file(s)",
+                unit.unit_id,
+                unit.symbols.len()
+            )
+            .bright_cyan()
+        );
+        return Ok(Some(unit.symbols.clone()));
+    }
+
+    let Some(target_file) = target_file else {
+        return Ok(None);
+    };
+
+    let Some(plan) = load_translation_plan(feature)? else {
+        return Ok(Some(vec![target_file.to_string()]));
+    };
+    let project_root = util::find_project_root()?;
+    let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
+
+    for unit in &plan.units {
+        if unit.symbols.iter().any(|symbol| symbol == target_file) {
+            if !unit.batch_candidate && should_use_translation_sub_batches() {
+                let unit_files: Vec<PathBuf> = unit
+                    .symbols
+                    .iter()
+                    .map(|symbol| rust_dir.join(symbol))
+                    .collect();
+                for group in sub_batch_file_groups(&unit_files) {
+                    let rel_group: Vec<String> = group
+                        .iter()
+                        .filter_map(|path| {
+                            path.strip_prefix(&rust_dir)
+                                .ok()
+                                .and_then(|rel| rel.to_str())
+                                .map(|rel| rel.to_string())
+                        })
+                        .collect();
+                    if rel_group.iter().any(|symbol| symbol == target_file) {
+                        if rel_group.len() > 1 {
+                            println!(
+                                "{}",
+                                format!(
+                                    "Target file belongs to sub-batch in large unit {}; expanding targeted run to {} file(s)",
+                                    unit.unit_id,
+                                    rel_group.len()
+                                )
+                                .bright_cyan()
+                            );
+                            return Ok(Some(rel_group));
+                        }
+                        return Ok(Some(vec![target_file.to_string()]));
+                    }
+                }
+            }
+
+            if !unit.batch_candidate {
+                return Ok(Some(vec![target_file.to_string()]));
+            }
+            if unit.symbols.len() > 1 {
+                println!(
+                    "{}",
+                    format!(
+                        "Target file belongs to batch-candidate unit {}; expanding targeted run to {} file(s)",
+                        unit.unit_id,
+                        unit.symbols.len()
+                    )
+                    .bright_cyan()
+                );
+            }
+            return Ok(Some(unit.symbols.clone()));
+        }
+    }
+
+    Ok(Some(vec![target_file.to_string()]))
+}
+
+fn sort_files_by_translation_plan(
+    mut files: Vec<std::path::PathBuf>,
+    rust_dir: &Path,
+    plan: &TranslationPlan,
+) -> Vec<std::path::PathBuf> {
+    let unit_order_map: HashMap<String, usize> = plan
+        .unit_order
+        .iter()
+        .enumerate()
+        .map(|(idx, unit_id)| (unit_id.clone(), idx))
+        .collect();
+    let mut symbol_order = HashMap::new();
+    for unit in &plan.units {
+        let unit_idx = unit_order_map
+            .get(&unit.unit_id)
+            .copied()
+            .unwrap_or(usize::MAX);
+        for (symbol_idx, symbol) in unit.symbols.iter().enumerate() {
+            symbol_order.insert(symbol.clone(), (unit_idx, symbol_idx));
+        }
+    }
+
+    files.sort_by(|left, right| {
+        let left_key = left
+            .strip_prefix(rust_dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .and_then(|rel| symbol_order.get(rel))
+            .copied();
+        let right_key = right
+            .strip_prefix(rust_dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .and_then(|rel| symbol_order.get(rel))
+            .copied();
+
+        left_key
+            .is_none()
+            .cmp(&right_key.is_none())
+            .then_with(|| left_key.cmp(&right_key))
+            .then_with(|| left.as_os_str().cmp(right.as_os_str()))
+    });
+
+    files
+}
+
+fn build_translation_work_items(
+    files: Vec<std::path::PathBuf>,
+    rust_dir: &Path,
+    plan: Option<&TranslationPlan>,
+) -> Vec<TranslationWorkItem> {
+    let Some(plan) = plan else {
+        return files.into_iter().map(TranslationWorkItem::Single).collect();
+    };
+
+    let selected: HashMap<String, PathBuf> = files
+        .iter()
+        .filter_map(|file| {
+            file.strip_prefix(rust_dir)
+                .ok()
+                .and_then(|path| path.to_str())
+                .map(|rel| (rel.to_string(), file.clone()))
+        })
+        .collect();
+    let mut emitted = std::collections::HashSet::<String>::new();
+    let mut result = Vec::new();
+
+    for unit in ordered_plan_units(plan) {
+        let unit_files: Vec<PathBuf> = unit
+            .symbols
+            .iter()
+            .filter_map(|symbol| {
+                selected.get(symbol).map(|path| {
+                    emitted.insert(symbol.clone());
+                    path.clone()
+                })
+            })
+            .collect();
+        if unit_files.is_empty() {
+            continue;
+        }
+
+        if unit.batch_candidate {
+            result.push(TranslationWorkItem::BatchCandidateGroup {
+                unit_id: unit.unit_id.clone(),
+                reason: unit.batch_reason.clone(),
+                files: unit_files,
+            });
+            continue;
+        }
+
+        if should_use_translation_sub_batches() {
+            append_sub_batch_work_items(&mut result, unit, &unit_files);
+        } else {
+            result.extend(unit_files.into_iter().map(TranslationWorkItem::Single));
+        }
+    }
+
+    for file in files {
+        let rel = file
+            .strip_prefix(rust_dir)
+            .ok()
+            .and_then(|path| path.to_str())
+            .map(|s| s.to_string());
+        if rel.as_ref().is_some_and(|rel| emitted.contains(rel)) {
+            continue;
+        }
+        result.push(TranslationWorkItem::Single(file));
+    }
+
+    result
+}
+
+fn ordered_plan_units(plan: &TranslationPlan) -> Vec<&TranslationUnitPlan> {
+    let mut by_id: HashMap<&str, &TranslationUnitPlan> = HashMap::new();
+    for unit in &plan.units {
+        by_id.insert(unit.unit_id.as_str(), unit);
+    }
+
+    let mut ordered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for unit_id in &plan.unit_order {
+        if let Some(unit) = by_id.get(unit_id.as_str()) {
+            ordered.push(*unit);
+            seen.insert(unit.unit_id.as_str());
+        }
+    }
+    for unit in &plan.units {
+        if seen.insert(unit.unit_id.as_str()) {
+            ordered.push(unit);
+        }
+    }
+    ordered
+}
+
+fn append_sub_batch_work_items(
+    result: &mut Vec<TranslationWorkItem>,
+    unit: &TranslationUnitPlan,
+    unit_files: &[PathBuf],
+) {
+    for files in sub_batch_file_groups(unit_files) {
+        if files.len() > 1 {
+            let line_count = files
+                .iter()
+                .filter_map(|file| sidecar_c_line_count(file))
+                .sum::<usize>();
+            result.push(TranslationWorkItem::BatchCandidateGroup {
+                unit_id: unit.unit_id.clone(),
+                reason: format!(
+                    "sub-batch from large unit: line_count {} <= {}, symbol_count {} <= {}",
+                    line_count,
+                    translation_batch_max_c_lines(),
+                    files.len(),
+                    translation_batch_max_symbols()
+                ),
+                files,
+            });
+        } else {
+            result.push(TranslationWorkItem::Single(files[0].clone()));
+        }
+    }
+}
+
+fn sub_batch_file_groups(unit_files: &[PathBuf]) -> Vec<Vec<PathBuf>> {
+    let max_lines = translation_batch_max_c_lines();
+    let max_symbols = translation_batch_max_symbols();
+    let mut groups = Vec::<Vec<PathBuf>>::new();
+    let mut current_files = Vec::<PathBuf>::new();
+    let mut current_lines = 0usize;
+
+    let flush = |groups: &mut Vec<Vec<PathBuf>>,
+                 current_files: &mut Vec<PathBuf>,
+                 current_lines: &mut usize| {
+        if current_files.is_empty() {
+            return;
+        }
+        groups.push(std::mem::take(current_files));
+        *current_lines = 0;
+    };
+    for file in unit_files {
+        let line_count = sidecar_c_line_count(file).unwrap_or(max_lines.saturating_add(1));
+        if line_count > max_lines {
+            flush(&mut groups, &mut current_files, &mut current_lines);
+            groups.push(vec![file.clone()]);
+            continue;
+        }
+
+        let would_exceed_symbols = current_files.len().saturating_add(1) > max_symbols;
+        let would_exceed_lines = current_lines.saturating_add(line_count) > max_lines;
+        if would_exceed_symbols || would_exceed_lines {
+            flush(&mut groups, &mut current_files, &mut current_lines);
+        }
+
+        current_files.push(file.clone());
+        current_lines = current_lines.saturating_add(line_count);
+    }
+
+    flush(&mut groups, &mut current_files, &mut current_lines);
+    groups
+}
+
+fn sidecar_c_line_count(rs_file: &Path) -> Option<usize> {
+    let sidecar = rs_file.with_extension("c");
+    std::fs::read_to_string(sidecar)
+        .ok()
+        .map(|content| content.lines().count())
 }
 
 /// Print current progress status
@@ -428,7 +835,7 @@ fn step_5_execute_translation_loop(
     rust_dir: &Path,
     progress_state: &mut util::ProgressState,
     allow_all: bool,
-    target_file: Option<&str>,
+    target_files: Option<&[String]>,
     max_error_fix_attempts: usize,
     max_warning_fix_attempts: usize,
     show_full_output: bool,
@@ -473,7 +880,14 @@ fn step_5_execute_translation_loop(
             })
             .collect();
 
-        let empty_rs_files = filter_target_files(empty_rs_files, rust_dir, target_file)?;
+        let mut empty_rs_files = filter_target_files(empty_rs_files, rust_dir, target_files)?;
+        let mut loaded_plan = None;
+        if should_use_translation_plan_order() {
+            if let Some(plan) = load_translation_plan(feature)? {
+                empty_rs_files = sort_files_by_translation_plan(empty_rs_files, rust_dir, &plan);
+                loaded_plan = Some(plan);
+            }
+        }
 
         if empty_rs_files.is_empty() {
             if stats.skipped_files.is_empty() {
@@ -482,7 +896,10 @@ fn step_5_execute_translation_loop(
             break;
         }
 
+        let work_items =
+            build_translation_work_items(empty_rs_files.clone(), rust_dir, loaded_plan.as_ref());
         print_files_found_message(empty_rs_files.len());
+        print_work_item_summary(&work_items);
 
         // Select files to process
         let selected_indices = select_files_to_process(&empty_rs_files, rust_dir, allow_all)?;
@@ -493,6 +910,7 @@ fn step_5_execute_translation_loop(
             &empty_rs_files,
             &selected_indices,
             rust_dir,
+            loaded_plan.as_ref(),
             progress_state,
             max_error_fix_attempts,
             max_warning_fix_attempts,
@@ -502,13 +920,13 @@ fn step_5_execute_translation_loop(
             &mut translations_since_last_test,
         )?;
 
-        if target_file.is_some() {
+        if target_files.is_some() {
             break;
         }
     }
 
     // Handle skipped files after the main translation loop
-    if target_file.is_none() {
+    if target_files.is_none() {
         handle_skipped_files_loop(
             feature,
             rust_dir,
@@ -649,7 +1067,8 @@ fn process_skipped_files_once_inner(
         ) {
             Err(e) => {
                 if e.downcast_ref::<verification::SkipFileSignal>().is_some()
-                    || e.downcast_ref::<verification::TranslationFailedSignal>().is_some()
+                    || e.downcast_ref::<verification::TranslationFailedSignal>()
+                        .is_some()
                 {
                     // File was re-skipped or translation failed; already recorded
                     // by process_rs_file into the appropriate list.
@@ -685,6 +1104,13 @@ enum TranslationInputMode {
     ReuseExistingRust,
 }
 
+fn warning_fix_scope_for_mode(mode: TranslationInputMode) -> verification::FixMessageScope {
+    match mode {
+        TranslationInputMode::TranslateFromC => verification::FixMessageScope::AllFiles,
+        TranslationInputMode::ReuseExistingRust => verification::FixMessageScope::CurrentFileOnly,
+    }
+}
+
 struct BackgroundFailedFileIsolation {
     feature: String,
     rust_dir: std::path::PathBuf,
@@ -698,8 +1124,10 @@ impl BackgroundFailedFileIsolation {
         skipped_retry_files: &[String],
         stats: &util::TranslationStats,
     ) -> Result<Self> {
-        let skipped_set: std::collections::HashSet<&str> =
-            skipped_retry_files.iter().map(|item| item.as_str()).collect();
+        let skipped_set: std::collections::HashSet<&str> = skipped_retry_files
+            .iter()
+            .map(|item| item.as_str())
+            .collect();
         let mut stashed_files = Vec::new();
 
         for file_name in &stats.translation_failed_files {
@@ -739,7 +1167,12 @@ fn prepare_skipped_file_for_retry(
     current_file: &str,
     remaining_skipped_files: &[String],
 ) -> Result<TranslationInputMode> {
-    temporarily_clear_other_skipped_files(feature, rust_dir, current_file, remaining_skipped_files)?;
+    temporarily_clear_other_skipped_files(
+        feature,
+        rust_dir,
+        current_file,
+        remaining_skipped_files,
+    )?;
     let current_rs_file = rust_dir.join(current_file);
     let restored = restore_skipped_file_stash(feature, current_file, &current_rs_file)?;
     let current_has_content = rust_file_has_content(&current_rs_file)?;
@@ -801,7 +1234,10 @@ fn validate_relative_stats_path(file_name: &str) -> Result<std::path::PathBuf> {
         match component {
             Component::Normal(part) => relative.push(part),
             Component::CurDir => {}
-            _ => anyhow::bail!("Skipped file path must not contain path traversal: {}", file_name),
+            _ => anyhow::bail!(
+                "Skipped file path must not contain path traversal: {}",
+                file_name
+            ),
         }
     }
 
@@ -837,12 +1273,19 @@ fn stash_skipped_file_for_later(feature: &str, file_name: &str, rs_file: &Path) 
     let stash_path = skipped_file_stash_path(feature, file_name)?;
     if let Some(parent) = stash_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create skipped-file stash directory: {}", parent.display())
+            format!(
+                "Failed to create skipped-file stash directory: {}",
+                parent.display()
+            )
         })?;
     }
 
-    let content = std::fs::read(rs_file)
-        .with_context(|| format!("Failed to read Rust file for skipped stash: {}", rs_file.display()))?;
+    let content = std::fs::read(rs_file).with_context(|| {
+        format!(
+            "Failed to read Rust file for skipped stash: {}",
+            rs_file.display()
+        )
+    })?;
     std::fs::write(&stash_path, content).with_context(|| {
         format!(
             "Failed to write skipped-file stash for {} at {}",
@@ -900,10 +1343,7 @@ fn clear_skipped_file_stash(feature: &str, file_name: &str) -> Result<()> {
     }
 }
 
-fn prune_empty_stash_dirs(
-    feature: &str,
-    start_dir: Option<&Path>,
-) -> Result<()> {
+fn prune_empty_stash_dirs(feature: &str, start_dir: Option<&Path>) -> Result<()> {
     let stash_root = skipped_file_stash_root(feature)?;
     let mut current = start_dir.map(|path| path.to_path_buf());
 
@@ -919,14 +1359,22 @@ fn prune_empty_stash_dirs(
             break;
         }
         std::fs::remove_dir(&dir).with_context(|| {
-            format!("Failed to remove empty skipped-file stash dir: {}", dir.display())
+            format!(
+                "Failed to remove empty skipped-file stash dir: {}",
+                dir.display()
+            )
         })?;
         current = dir.parent().map(|parent| parent.to_path_buf());
     }
 
     if stash_root.is_dir()
         && std::fs::read_dir(&stash_root)
-            .with_context(|| format!("Failed to read skipped-file stash root: {}", stash_root.display()))?
+            .with_context(|| {
+                format!(
+                    "Failed to read skipped-file stash root: {}",
+                    stash_root.display()
+                )
+            })?
             .next()
             .is_none()
     {
@@ -1018,7 +1466,10 @@ fn run_final_interval_test_if_needed(
     // is non-fatal: if it fails a warning is printed, the working tree may remain
     // dirty, and subsequent analysis commits may include extra unintended changes.
     git_commit_or_warn(
-        &format!("Update code analysis after final interval test (feature: {})", feature),
+        &format!(
+            "Update code analysis after final interval test (feature: {})",
+            feature
+        ),
         feature,
     );
 
@@ -1078,11 +1529,14 @@ fn select_files_to_process(
 fn filter_target_files(
     empty_rs_files: Vec<std::path::PathBuf>,
     rust_dir: &Path,
-    target_file: Option<&str>,
+    target_files: Option<&[String]>,
 ) -> Result<Vec<std::path::PathBuf>> {
-    let Some(target_file) = target_file else {
+    let Some(target_files) = target_files else {
         return Ok(empty_rs_files);
     };
+
+    let target_set: std::collections::HashSet<&str> =
+        target_files.iter().map(|s| s.as_str()).collect();
 
     let filtered: Vec<_> = empty_rs_files
         .into_iter()
@@ -1090,7 +1544,7 @@ fn filter_target_files(
             path.strip_prefix(rust_dir)
                 .ok()
                 .and_then(|rel| rel.to_str())
-                .map(|rel| rel == target_file)
+                .map(|rel| target_set.contains(rel))
                 .unwrap_or(false)
         })
         .collect();
@@ -1099,51 +1553,60 @@ fn filter_target_files(
         return Ok(filtered);
     }
 
-    let target_path = rust_dir.join(target_file);
-    if !target_path.exists() {
-        anyhow::bail!(
-            "Target Rust file not found under feature workspace: {}",
-            target_file
-        );
+    for target_file in target_files {
+        let target_path = rust_dir.join(target_file);
+        if !target_path.exists() {
+            anyhow::bail!(
+                "Target Rust file not found under feature workspace: {}",
+                target_file
+            );
+        }
     }
 
     anyhow::bail!(
-        "Target Rust file is currently excluded from translation (likely skipped or marked translation-failed): {}",
-        target_file
+        "Target Rust file(s) are currently excluded from translation (likely skipped or marked translation-failed): {}",
+        target_files.join(", ")
     );
 }
 
-fn prepare_target_file_rerun(
+fn prepare_target_files_rerun(
     feature: &str,
-    target_file: &str,
+    target_files: &[String],
     stats: &mut util::TranslationStats,
 ) -> Result<()> {
     let project_root = util::find_project_root()?;
     let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
-    let target_path = rust_dir.join(target_file);
 
-    stats.clear_target_history(target_file);
+    for target_file in target_files {
+        let target_path = rust_dir.join(target_file);
+        stats.clear_target_history(target_file);
+
+        if !target_path.exists() {
+            continue;
+        }
+
+        let metadata = std::fs::metadata(&target_path)?;
+        if metadata.len() == 0 {
+            continue;
+        }
+
+        println!(
+            "{}",
+            format!(
+                "Target file already has previous Rust output; clearing it for targeted rerun: {}",
+                target_file
+            )
+            .bright_yellow()
+        );
+        std::fs::write(&target_path, "").with_context(|| {
+            format!(
+                "Failed to clear target Rust file for rerun: {}",
+                target_file
+            )
+        })?;
+    }
+
     save_stats_or_warn(stats, feature);
-
-    if !target_path.exists() {
-        return Ok(());
-    }
-
-    let metadata = std::fs::metadata(&target_path)?;
-    if metadata.len() == 0 {
-        return Ok(());
-    }
-
-    println!(
-        "{}",
-        format!(
-            "Target file already has previous Rust output; clearing it for targeted rerun: {}",
-            target_file
-        )
-        .bright_yellow()
-    );
-    std::fs::write(&target_path, "")
-        .with_context(|| format!("Failed to clear target Rust file for rerun: {}", target_file))?;
 
     Ok(())
 }
@@ -1154,6 +1617,7 @@ fn process_selected_files(
     empty_rs_files: &[std::path::PathBuf],
     selected_indices: &[usize],
     rust_dir: &Path,
+    plan: Option<&TranslationPlan>,
     progress_state: &mut util::ProgressState,
     max_error_fix_attempts: usize,
     max_warning_fix_attempts: usize,
@@ -1162,63 +1626,275 @@ fn process_selected_files(
     skip_test: bool,
     translations_since_last_test: &mut usize,
 ) -> Result<()> {
-    for &idx in selected_indices.iter() {
-        let rs_file = &empty_rs_files[idx];
-        let current_position = progress_state.get_current_position();
-        let total_count = progress_state.get_total_count();
+    let selected_set: std::collections::HashSet<usize> = selected_indices.iter().copied().collect();
+    let selected_files: Vec<_> = empty_rs_files
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, path)| selected_set.contains(&idx).then_some(path.clone()))
+        .collect();
+    let work_items = build_translation_work_items(selected_files, rust_dir, plan);
 
-        let file_name = rs_file
-            .strip_prefix(rust_dir)
-            .ok()
-            .and_then(|p| p.to_str())
-            .unwrap_or_else(|| {
-                rs_file
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("<unknown>")
-            });
+    for item in work_items {
+        let files = match &item {
+            TranslationWorkItem::Single(path) => vec![path.clone()],
+            TranslationWorkItem::BatchCandidateGroup { files, .. } => files.clone(),
+        };
+        if let TranslationWorkItem::BatchCandidateGroup {
+            unit_id,
+            reason,
+            files,
+        } = &item
+        {
+            println!(
+                "{}",
+                format!(
+                    "Attempting batch translation for {} ({} file(s), {})",
+                    unit_id,
+                    files.len(),
+                    reason
+                )
+                .bright_cyan()
+            );
+            if let Err(err) = process_batch_candidate_group(
+                feature,
+                files,
+                rust_dir,
+                progress_state,
+                max_error_fix_attempts,
+                max_warning_fix_attempts,
+                show_full_output,
+                stats,
+                skip_test,
+                translations_since_last_test,
+            ) {
+                println!(
+                    "{}",
+                    format!(
+                        "Batch translation fallback to per-symbol for {}: {}",
+                        unit_id, err
+                    )
+                    .bright_yellow()
+                );
+                for rs_file in files {
+                    process_single_selected_file(
+                        feature,
+                        rs_file,
+                        rust_dir,
+                        progress_state,
+                        max_error_fix_attempts,
+                        max_warning_fix_attempts,
+                        show_full_output,
+                        stats,
+                        skip_test,
+                        translations_since_last_test,
+                    )?;
+                }
+            }
+            continue;
+        }
+        for rs_file in files {
+            process_single_selected_file(
+                feature,
+                &rs_file,
+                rust_dir,
+                progress_state,
+                max_error_fix_attempts,
+                max_warning_fix_attempts,
+                show_full_output,
+                stats,
+                skip_test,
+                translations_since_last_test,
+            )?;
+        }
+    }
+    Ok(())
+}
 
-        print_file_processing_header(current_position, total_count, file_name);
+fn process_single_selected_file(
+    feature: &str,
+    rs_file: &Path,
+    rust_dir: &Path,
+    progress_state: &mut util::ProgressState,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
+    show_full_output: bool,
+    stats: &mut util::TranslationStats,
+    skip_test: bool,
+    translations_since_last_test: &mut usize,
+) -> Result<()> {
+    process_single_selected_file_with_mode(
+        feature,
+        rs_file,
+        rust_dir,
+        progress_state,
+        max_error_fix_attempts,
+        max_warning_fix_attempts,
+        show_full_output,
+        stats,
+        skip_test,
+        translations_since_last_test,
+        TranslationInputMode::TranslateFromC,
+    )
+}
 
-        let (_, skip_interval_test) =
-            compute_interval_test_decision(*translations_since_last_test);
+fn process_single_selected_file_with_mode(
+    feature: &str,
+    rs_file: &Path,
+    rust_dir: &Path,
+    progress_state: &mut util::ProgressState,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
+    show_full_output: bool,
+    stats: &mut util::TranslationStats,
+    skip_test: bool,
+    translations_since_last_test: &mut usize,
+    translation_mode: TranslationInputMode,
+) -> Result<()> {
+    let current_position = progress_state.get_current_position();
+    let total_count = progress_state.get_total_count();
 
-        match process_rs_file(
+    let file_name = rs_file
+        .strip_prefix(rust_dir)
+        .ok()
+        .and_then(|p| p.to_str())
+        .unwrap_or_else(|| {
+            rs_file
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unknown>")
+        });
+
+    print_file_processing_header(current_position, total_count, file_name);
+
+    let (_, skip_interval_test) = compute_interval_test_decision(*translations_since_last_test);
+
+    match process_rs_file(
+        feature,
+        rs_file,
+        file_name,
+        current_position,
+        total_count,
+        max_error_fix_attempts,
+        max_warning_fix_attempts,
+        show_full_output,
+        stats,
+        skip_test,
+        skip_interval_test,
+        translation_mode,
+    ) {
+        Err(e) => {
+            if e.downcast_ref::<verification::SkipFileSignal>().is_none()
+                && e.downcast_ref::<verification::TranslationFailedSignal>()
+                    .is_none()
+            {
+                return Err(e);
+            }
+            save_stats_or_warn(stats, feature);
+        }
+        Ok(tests_ran) => {
+            progress_state.mark_processed();
+            update_interval_counter(translations_since_last_test, tests_ran);
+            save_stats_or_warn(stats, feature);
+            maybe_run_periodic_git_gc(progress_state);
+        }
+    }
+    Ok(())
+}
+
+fn process_batch_candidate_group(
+    feature: &str,
+    rs_files: &[PathBuf],
+    rust_dir: &Path,
+    progress_state: &mut util::ProgressState,
+    max_error_fix_attempts: usize,
+    max_warning_fix_attempts: usize,
+    show_full_output: bool,
+    stats: &mut util::TranslationStats,
+    skip_test: bool,
+    translations_since_last_test: &mut usize,
+) -> Result<()> {
+    if rs_files.is_empty() {
+        return Ok(());
+    }
+
+    let batch_root = rust_dir.join("target").join("batch-translate");
+    std::fs::create_dir_all(&batch_root)?;
+    let c_file = write_batch_c_unit_file(&batch_root, rs_files)?;
+    let output_dir = batch_root.join("outputs");
+    let output_manifest = batch_root.join("result.json");
+    let batch_manifest = batch_root.join("manifest.json");
+    if output_dir.exists() {
+        std::fs::remove_dir_all(&output_dir).with_context(|| {
+            format!(
+                "Failed to clear stale batch output directory: {}",
+                output_dir.display()
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&output_dir)?;
+
+    translator::translate_c_batch_to_rust(
+        feature,
+        &c_file,
+        rs_files,
+        &output_dir,
+        &output_manifest,
+        &batch_manifest,
+        show_full_output,
+    )?;
+
+    for rs_file in rs_files {
+        process_single_selected_file_with_mode(
             feature,
             rs_file,
-            file_name,
-            current_position,
-            total_count,
+            rust_dir,
+            progress_state,
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,
             stats,
             skip_test,
-            skip_interval_test,
-            TranslationInputMode::TranslateFromC,
-        ) {
-            Err(e) => {
-                if e.downcast_ref::<verification::SkipFileSignal>().is_none()
-                    && e.downcast_ref::<verification::TranslationFailedSignal>().is_none()
-                {
-                    return Err(e);
-                }
-                // File was skipped (deliberate) or translation failed (non-fatal).
-                // Already recorded in process_rs_file. Don't mark as processed.
-                // Save stats immediately so the outcome is persisted.
-                save_stats_or_warn(stats, feature);
-            }
-            Ok(tests_ran) => {
-                // Mark file as processed. mark_processed() is capped at total_count.
-                progress_state.mark_processed();
-                update_interval_counter(translations_since_last_test, tests_ran);
-                // Save stats immediately after successful completion.
-                save_stats_or_warn(stats, feature);
-                maybe_run_periodic_git_gc(progress_state);
-            }
-        }
+            translations_since_last_test,
+            TranslationInputMode::ReuseExistingRust,
+        )?;
     }
     Ok(())
+}
+
+fn write_batch_c_unit_file(batch_root: &Path, rs_files: &[PathBuf]) -> Result<PathBuf> {
+    let c_file = batch_root.join("unit.c");
+    let mut content = String::new();
+
+    for rs_file in rs_files {
+        let sidecar = rs_file.with_extension("c");
+        let source = std::fs::read_to_string(&sidecar).with_context(|| {
+            format!(
+                "Failed to read sidecar C file for batch translation: {}",
+                sidecar.display()
+            )
+        })?;
+
+        content.push_str("\n/* ===== C2RustXW batch source: ");
+        content.push_str(
+            &rs_file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<unknown>"),
+        );
+        content.push_str(" ===== */\n");
+        content.push_str(&source);
+        if !source.ends_with('\n') {
+            content.push('\n');
+        }
+    }
+
+    std::fs::write(&c_file, content).with_context(|| {
+        format!(
+            "Failed to write aggregated batch C source: {}",
+            c_file.display()
+        )
+    })?;
+    Ok(c_file)
 }
 
 // ============================================================================
@@ -1237,6 +1913,39 @@ fn print_files_found_message(count: usize) {
         "{}",
         format!("Found {} empty .rs file(s) to process", count).cyan()
     );
+}
+
+fn print_work_item_summary(work_items: &[TranslationWorkItem]) {
+    let batch_groups = work_items
+        .iter()
+        .filter(|item| matches!(item, TranslationWorkItem::BatchCandidateGroup { .. }))
+        .count();
+    if batch_groups == 0 {
+        return;
+    }
+    println!(
+        "{}",
+        format!(
+            "Detected {} batch-candidate unit(s); batch translation will be attempted for each eligible unit.",
+            batch_groups
+        )
+        .bright_yellow()
+    );
+    for item in work_items {
+        if let TranslationWorkItem::BatchCandidateGroup {
+            unit_id,
+            reason,
+            files,
+        } = item
+        {
+            println!(
+                "  - batch candidate {}: {} file(s), {}",
+                unit_id,
+                files.len(),
+                reason
+            );
+        }
+    }
 }
 
 /// Print file processing header
@@ -1328,11 +2037,10 @@ fn process_rs_file(
             show_full_output,
             translation_mode,
         ) {
-            if e.downcast_ref::<translator::TranslationScriptFailedError>().is_some() {
-                println!(
-                    "│ {}",
-                    format!("⚠ Translation failed: {:#}", e).yellow()
-                );
+            if e.downcast_ref::<translator::TranslationScriptFailedError>()
+                .is_some()
+            {
+                println!("│ {}", format!("⚠ Translation failed: {:#}", e).yellow());
                 stash_skipped_file_for_later(feature, file_name, rs_file)?;
                 println!(
                     "│ {}",
@@ -1407,6 +2115,7 @@ fn process_rs_file(
                     &format_progress,
                     max_warning_fix_attempts,
                     show_full_output,
+                    warning_fix_scope_for_mode(translation_mode),
                 )
                 .unwrap_or_else(|e| {
                     println!(
@@ -1425,8 +2134,7 @@ fn process_rs_file(
                 };
                 println!(
                     "│ {}",
-                    format!("Phase 2: Warning processing skipped ({}).", reason)
-                        .bright_yellow()
+                    format!("Phase 2: Warning processing skipped ({}).", reason).bright_yellow()
                 );
             }
 
@@ -1666,14 +2374,20 @@ where
     F: Fn(&str) -> String,
 {
     match translation_mode {
-        TranslationInputMode::TranslateFromC => {
-            translate_file(feature, file_type, rs_file, format_progress, show_full_output)
-        }
+        TranslationInputMode::TranslateFromC => translate_file(
+            feature,
+            file_type,
+            rs_file,
+            format_progress,
+            show_full_output,
+        ),
         TranslationInputMode::ReuseExistingRust => {
             println!("│");
             println!(
                 "│ {}",
-                format_progress("Reuse Existing Rust").bright_magenta().bold()
+                format_progress("Reuse Existing Rust")
+                    .bright_magenta()
+                    .bold()
             );
             println!(
                 "│ {}",
@@ -1703,8 +2417,7 @@ where
             );
             println!(
                 "│ {}",
-                format!("✓ Reused existing Rust output ({} bytes)", metadata.len())
-                    .bright_green()
+                format!("✓ Reused existing Rust output ({} bytes)", metadata.len()).bright_green()
             );
             Ok(())
         }
@@ -1777,10 +2490,7 @@ where
     println!("│ {}", format_progress("Fix").bright_magenta().bold());
 
     if try_apply_local_build_error_fix(rs_file, &build_error.to_string())? {
-        println!(
-            "│ {}",
-            "✓ Applied local compiler-error fix".bright_green()
-        );
+        println!("│ {}", "✓ Applied local compiler-error fix".bright_green());
         return Ok(());
     }
 
@@ -1851,7 +2561,12 @@ impl VisitMut for UnsafeRegionCollapser {
 }
 
 fn has_export_name_attr(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| attr.meta.to_token_stream().to_string().contains("export_name"))
+    attrs.iter().any(|attr| {
+        attr.meta
+            .to_token_stream()
+            .to_string()
+            .contains("export_name")
+    })
 }
 
 fn should_collapse_fn_unsafe_regions(item_fn: &syn::ItemFn) -> bool {
@@ -1968,7 +2683,9 @@ fn try_fix_static_mut_array_pointer_access(rs_file: &Path, build_error: &str) ->
             regex::Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\.len\(\)")?,
         ];
         for pattern in size_patterns {
-            updated = pattern.replace_all(&updated, array_len.as_str()).into_owned();
+            updated = pattern
+                .replace_all(&updated, array_len.as_str())
+                .into_owned();
         }
     }
 
@@ -2000,16 +2717,14 @@ fn try_fix_c_string_slice_pointer_cast(rs_file: &Path, build_error: &str) -> Res
 }
 
 fn try_fix_option_fn_unwrap_mismatch(rs_file: &Path, build_error: &str) -> Result<bool> {
-    if !build_error.contains("expected enum `Option<")
-        || !build_error.contains("found fn pointer")
+    if !build_error.contains("expected enum `Option<") || !build_error.contains("found fn pointer")
     {
         return Ok(false);
     }
 
     let source = std::fs::read_to_string(rs_file)?;
-    let pattern = regex::Regex::new(
-        r#"(?P<prefix>[A-Za-z_][A-Za-z0-9_\[\]\.\(\)\s]*?)\.func\.unwrap\(\)"#,
-    )?;
+    let pattern =
+        regex::Regex::new(r#"(?P<prefix>[A-Za-z_][A-Za-z0-9_\[\]\.\(\)\s]*?)\.func\.unwrap\(\)"#)?;
     let updated = pattern.replace_all(&source, "${prefix}.func").into_owned();
 
     if updated == source {
@@ -2216,8 +2931,13 @@ where
     // Handle build
     if let Err(build_error) = builder::c2rust_build_no_analysis(feature) {
         println!("│ {}", "✗ Build failed".red().bold());
-        let processing_complete =
-            builder::handle_build_failure_interactive(feature, file_type, rs_file, build_error, skip_test)?;
+        let processing_complete = builder::handle_build_failure_interactive(
+            feature,
+            file_type,
+            rs_file,
+            build_error,
+            skip_test,
+        )?;
         if !processing_complete {
             return Ok((false, false)); // Retry translation; tests did not run
         }
@@ -2234,7 +2954,14 @@ where
             "│ {}",
             "⚠ Skipping test phase (test configuration not available)".yellow()
         );
-        let tests_ran = handle_successful_tests(feature, file_name, file_type, rs_file, format_progress, TestStatus::SkippedNoConfig)?;
+        let tests_ran = handle_successful_tests(
+            feature,
+            file_name,
+            file_type,
+            rs_file,
+            format_progress,
+            TestStatus::SkippedNoConfig,
+        )?;
         return Ok((true, tests_ran));
     }
 
@@ -2248,7 +2975,14 @@ where
             )
             .yellow()
         );
-        let tests_ran = handle_successful_tests(feature, file_name, file_type, rs_file, format_progress, TestStatus::DeferredByInterval)?;
+        let tests_ran = handle_successful_tests(
+            feature,
+            file_name,
+            file_type,
+            rs_file,
+            format_progress,
+            TestStatus::DeferredByInterval,
+        )?;
         return Ok((true, tests_ran));
     }
 
@@ -2256,7 +2990,14 @@ where
     match builder::c2rust_test_no_analysis(feature) {
         Ok(_) => {
             println!("│ {}", "✓ Hybrid build tests passed".bright_green().bold());
-            let tests_ran = handle_successful_tests(feature, file_name, file_type, rs_file, format_progress, TestStatus::Passed)?;
+            let tests_ran = handle_successful_tests(
+                feature,
+                file_name,
+                file_type,
+                rs_file,
+                format_progress,
+                TestStatus::Passed,
+            )?;
             Ok((true, tests_ran)) // Processing complete; tests ran
         }
         Err(test_error) => {
@@ -2427,7 +3168,9 @@ where
                         "Running full build after manual changes...".bright_blue()
                     );
                     // Tests remain skipped: config is still unavailable.
-                    builder::run_full_build_and_test_interactive(feature, file_type, rs_file, true)?;
+                    builder::run_full_build_and_test_interactive(
+                        feature, file_type, rs_file, true,
+                    )?;
                     println!(
                         "│ {}",
                         "✓ Build passes after manual changes (tests skipped)".bright_green()
@@ -2489,7 +3232,9 @@ where
                         "Running full build and test after manual changes...".bright_blue()
                     );
                     // Config is available: run real tests during the manual-fix validation.
-                    builder::run_full_build_and_test_interactive(feature, file_type, rs_file, false)?;
+                    builder::run_full_build_and_test_interactive(
+                        feature, file_type, rs_file, false,
+                    )?;
                     println!(
                         "│ {}",
                         "✓ All builds and tests pass after manual changes".bright_green()
@@ -2543,7 +3288,9 @@ where
                         "│ {}",
                         "Running full build and test after manual changes...".bright_blue()
                     );
-                    builder::run_full_build_and_test_interactive(feature, file_type, rs_file, false)?;
+                    builder::run_full_build_and_test_interactive(
+                        feature, file_type, rs_file, false,
+                    )?;
                     println!(
                         "│ {}",
                         "✓ All builds and tests pass after manual changes".bright_green()
@@ -2784,11 +3531,7 @@ mod tests {
 
     #[test]
     fn test_compute_resume_action_skips_snapshot_when_preexisting_tree_is_clean() {
-        let action = compute_resume_action(
-            interaction::ContinueChoice::Continue,
-            "default",
-            false,
-        );
+        let action = compute_resume_action(interaction::ContinueChoice::Continue, "default", false);
 
         match action {
             ResumeAction::Continue { snapshot_message } => {
@@ -2802,17 +3545,15 @@ mod tests {
 
     #[test]
     fn test_compute_resume_action_requests_snapshot_when_preexisting_tree_is_dirty() {
-        let action = compute_resume_action(
-            interaction::ContinueChoice::Continue,
-            "default",
-            true,
-        );
+        let action = compute_resume_action(interaction::ContinueChoice::Continue, "default", true);
 
         match action {
             ResumeAction::Continue { snapshot_message } => {
                 assert_eq!(
                     snapshot_message.as_deref(),
-                    Some("Snapshot unfinished translation progress before resume (feature: default)")
+                    Some(
+                        "Snapshot unfinished translation progress before resume (feature: default)"
+                    )
                 );
             }
             ResumeAction::Restart | ResumeAction::FixSkippedFiles => {
@@ -3007,7 +3748,11 @@ mod tests {
         let _guard = EnvGuard::set("C2RUST_TEST_INTERVAL", "4");
         for counter in 0..12 {
             let (should_run, skip) = compute_interval_test_decision(counter);
-            assert_eq!(should_run, !skip, "counter={}: should_run and skip are not inverses", counter);
+            assert_eq!(
+                should_run, !skip,
+                "counter={}: should_run and skip are not inverses",
+                counter
+            );
         }
     }
 
@@ -3153,7 +3898,8 @@ pub extern "C" fn XSUM_autox86() -> *const ::core::ffi::c_char {
         assert!(!collapse_fn_unsafe_regions(item_fn));
         let rendered = prettyplease::unparse(&file);
         assert_eq!(rendered.matches("unsafe {").count(), 1);
-        assert!(rendered.contains("let vec_version: ::core::ffi::c_int = unsafe { XXH_featureTest() };"));
+        assert!(rendered
+            .contains("let vec_version: ::core::ffi::c_int = unsafe { XXH_featureTest() };"));
     }
 
     #[test]
@@ -3274,6 +4020,490 @@ found fn pointer"#;
     }
 
     #[test]
+    fn test_sort_files_by_translation_plan_prefers_plan_order() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(src_dir.join("mod_a")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_b")).unwrap();
+
+        let file_a = src_dir.join("mod_a").join("fun_a.rs");
+        let file_b = src_dir.join("mod_b").join("fun_b.rs");
+        let file_c = src_dir.join("mod_b").join("fun_c.rs");
+        fs::write(&file_a, "").unwrap();
+        fs::write(&file_b, "").unwrap();
+        fs::write(&file_c, "").unwrap();
+
+        let plan = TranslationPlan {
+            unit_edges: vec![],
+            unit_scc_groups: vec![],
+            unit_order: vec!["mod_b".to_string(), "mod_a".to_string()],
+            units: vec![
+                TranslationUnitPlan {
+                    unit_id: "mod_b".to_string(),
+                    symbols: vec![
+                        "src/mod_b/fun_b.rs".to_string(),
+                        "src/mod_b/fun_c.rs".to_string(),
+                    ],
+                    edges: vec![[
+                        "src/mod_b/fun_c.rs".to_string(),
+                        "src/mod_b/fun_b.rs".to_string(),
+                    ]],
+                    scc_groups: vec![
+                        vec!["src/mod_b/fun_b.rs".to_string()],
+                        vec!["src/mod_b/fun_c.rs".to_string()],
+                    ],
+                    batch_candidate: true,
+                    batch_reason: "eligible".to_string(),
+                },
+                TranslationUnitPlan {
+                    unit_id: "mod_a".to_string(),
+                    symbols: vec!["src/mod_a/fun_a.rs".to_string()],
+                    edges: vec![],
+                    scc_groups: vec![vec!["src/mod_a/fun_a.rs".to_string()]],
+                    batch_candidate: true,
+                    batch_reason: "eligible".to_string(),
+                },
+            ],
+        };
+
+        let sorted = sort_files_by_translation_plan(
+            vec![file_a.clone(), file_c.clone(), file_b.clone()],
+            &rust_dir,
+            &plan,
+        );
+        let rel: Vec<_> = sorted
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&rust_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            rel,
+            vec![
+                "src/mod_b/fun_b.rs".to_string(),
+                "src/mod_b/fun_c.rs".to_string(),
+                "src/mod_a/fun_a.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sort_files_by_translation_plan_keeps_unplanned_files_last() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(src_dir.join("mod_a")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_z")).unwrap();
+
+        let planned = src_dir.join("mod_a").join("fun_a.rs");
+        let unplanned = src_dir.join("mod_z").join("fun_z.rs");
+        fs::write(&planned, "").unwrap();
+        fs::write(&unplanned, "").unwrap();
+
+        let plan = TranslationPlan {
+            unit_edges: vec![],
+            unit_scc_groups: vec![],
+            unit_order: vec!["mod_a".to_string()],
+            units: vec![TranslationUnitPlan {
+                unit_id: "mod_a".to_string(),
+                symbols: vec!["src/mod_a/fun_a.rs".to_string()],
+                edges: vec![],
+                scc_groups: vec![vec!["src/mod_a/fun_a.rs".to_string()]],
+                batch_candidate: true,
+                batch_reason: "eligible".to_string(),
+            }],
+        };
+
+        let sorted = sort_files_by_translation_plan(
+            vec![unplanned.clone(), planned.clone()],
+            &rust_dir,
+            &plan,
+        );
+        let rel: Vec<_> = sorted
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&rust_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            rel,
+            vec![
+                "src/mod_a/fun_a.rs".to_string(),
+                "src/mod_z/fun_z.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_translation_work_items_groups_batch_candidates_by_unit() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(src_dir.join("mod_a")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_b")).unwrap();
+
+        let a1 = src_dir.join("mod_a").join("fun_a1.rs");
+        let a2 = src_dir.join("mod_a").join("fun_a2.rs");
+        let b1 = src_dir.join("mod_b").join("fun_b1.rs");
+        fs::write(&a1, "").unwrap();
+        fs::write(&a2, "").unwrap();
+        fs::write(&b1, "").unwrap();
+
+        let plan = TranslationPlan {
+            unit_edges: vec![],
+            unit_scc_groups: vec![],
+            unit_order: vec!["mod_a".to_string(), "mod_b".to_string()],
+            units: vec![
+                TranslationUnitPlan {
+                    unit_id: "mod_a".to_string(),
+                    symbols: vec![
+                        "src/mod_a/fun_a1.rs".to_string(),
+                        "src/mod_a/fun_a2.rs".to_string(),
+                    ],
+                    edges: vec![],
+                    scc_groups: vec![],
+                    batch_candidate: true,
+                    batch_reason: "small unit".to_string(),
+                },
+                TranslationUnitPlan {
+                    unit_id: "mod_b".to_string(),
+                    symbols: vec!["src/mod_b/fun_b1.rs".to_string()],
+                    edges: vec![],
+                    scc_groups: vec![],
+                    batch_candidate: false,
+                    batch_reason: "too large".to_string(),
+                },
+            ],
+        };
+
+        let items = build_translation_work_items(
+            vec![a1.clone(), a2.clone(), b1.clone()],
+            &rust_dir,
+            Some(&plan),
+        );
+
+        assert_eq!(items.len(), 2);
+        match &items[0] {
+            TranslationWorkItem::BatchCandidateGroup { files, reason, .. } => {
+                assert_eq!(files.len(), 2);
+                assert_eq!(reason, "small unit");
+            }
+            TranslationWorkItem::Single(_) => panic!("expected batch candidate group"),
+        }
+        match &items[1] {
+            TranslationWorkItem::Single(path) => {
+                assert_eq!(
+                    path.strip_prefix(&rust_dir).unwrap().to_string_lossy(),
+                    "src/mod_b/fun_b1.rs"
+                );
+            }
+            TranslationWorkItem::BatchCandidateGroup { .. } => {
+                panic!("expected single work item")
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_translation_work_items_splits_large_unit_into_sub_batches() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src").join("mod_big");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let a = src_dir.join("fun_a.rs");
+        let b = src_dir.join("fun_b.rs");
+        let c = src_dir.join("fun_c.rs");
+        let d = src_dir.join("fun_d.rs");
+        for file in [&a, &b, &c, &d] {
+            fs::write(file, "").unwrap();
+        }
+        fs::write(a.with_extension("c"), "int a(void) {\n return 1;\n}\n").unwrap();
+        fs::write(b.with_extension("c"), "int b(void) {\n return 2;\n}\n").unwrap();
+        fs::write(
+            c.with_extension("c"),
+            "int c(void) {\n int x = 1;\n int y = 2;\n int z = 3;\n return x + y + z;\n}\n",
+        )
+        .unwrap();
+        fs::write(d.with_extension("c"), "int d(void) {\n return 4;\n}\n").unwrap();
+
+        let plan = TranslationPlan {
+            unit_edges: vec![],
+            unit_scc_groups: vec![],
+            unit_order: vec!["mod_big".to_string()],
+            units: vec![TranslationUnitPlan {
+                unit_id: "mod_big".to_string(),
+                symbols: vec![
+                    "src/mod_big/fun_a.rs".to_string(),
+                    "src/mod_big/fun_b.rs".to_string(),
+                    "src/mod_big/fun_c.rs".to_string(),
+                    "src/mod_big/fun_d.rs".to_string(),
+                ],
+                edges: vec![],
+                scc_groups: vec![],
+                batch_candidate: false,
+                batch_reason: "line_count exceeds threshold".to_string(),
+            }],
+        };
+
+        let _max_lines = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", "6");
+        let _max_symbols = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS", "3");
+        let items = build_translation_work_items(
+            vec![a.clone(), b.clone(), c.clone(), d.clone()],
+            &rust_dir,
+            Some(&plan),
+        );
+
+        assert_eq!(items.len(), 3);
+        match &items[0] {
+            TranslationWorkItem::BatchCandidateGroup { files, reason, .. } => {
+                assert_eq!(files, &vec![a.clone(), b.clone()]);
+                assert!(reason.contains("sub-batch from large unit"));
+            }
+            TranslationWorkItem::Single(_) => panic!("expected first sub-batch"),
+        }
+        match &items[1] {
+            TranslationWorkItem::Single(path) => assert_eq!(path, &c),
+            TranslationWorkItem::BatchCandidateGroup { .. } => {
+                panic!("expected oversized symbol to stay single")
+            }
+        }
+        match &items[2] {
+            TranslationWorkItem::Single(path) => assert_eq!(path, &d),
+            TranslationWorkItem::BatchCandidateGroup { .. } => {
+                panic!("expected one trailing symbol to stay single")
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_batch_c_unit_file_aggregates_all_sidecar_sources() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src").join("mod_a");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let a1 = src_dir.join("fun_a1.rs");
+        let a2 = src_dir.join("fun_a2.rs");
+        fs::write(&a1, "").unwrap();
+        fs::write(&a2, "").unwrap();
+        fs::write(a1.with_extension("c"), "int a1(void) { return 1; }").unwrap();
+        fs::write(a2.with_extension("c"), "int a2(void) { return 2; }\n").unwrap();
+
+        let batch_root = rust_dir.join("target").join("batch-translate");
+        fs::create_dir_all(&batch_root).unwrap();
+
+        let c_unit = write_batch_c_unit_file(&batch_root, &[a1.clone(), a2.clone()]).unwrap();
+        let content = fs::read_to_string(c_unit).unwrap();
+
+        assert!(content.contains("C2RustXW batch source: fun_a1.rs"));
+        assert!(content.contains("int a1(void) { return 1; }"));
+        assert!(content.contains("C2RustXW batch source: fun_a2.rs"));
+        assert!(content.contains("int a2(void) { return 2; }"));
+        assert!(content.find("int a1").unwrap() < content.find("int a2").unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_files_expands_batch_candidate_unit() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path();
+        let feature_dir = project_root.join(".c2rust").join("default");
+        fs::create_dir_all(&feature_dir).unwrap();
+
+        fs::write(
+            feature_dir.join("translation_plan.json"),
+            r#"{
+  "unit_edges": [],
+  "unit_scc_groups": [],
+  "unit_order": ["mod_a"],
+  "units": [
+    {
+      "unit_id": "mod_a",
+      "symbols": ["src/mod_a/fun_a1.rs", "src/mod_a/fun_a2.rs"],
+      "edges": [],
+      "scc_groups": [],
+      "batch_candidate": true,
+      "batch_reason": "small unit"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_root).unwrap();
+        let expanded = resolve_target_files("default", Some("src/mod_a/fun_a1.rs"), None).unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(
+            expanded.unwrap(),
+            vec![
+                "src/mod_a/fun_a1.rs".to_string(),
+                "src/mod_a/fun_a2.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_files_supports_unit_selection() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path();
+        let feature_dir = project_root.join(".c2rust").join("default");
+        fs::create_dir_all(&feature_dir).unwrap();
+
+        fs::write(
+            feature_dir.join("translation_plan.json"),
+            r#"{
+  "unit_edges": [],
+  "unit_scc_groups": [],
+  "unit_order": ["mod_a"],
+  "units": [
+    {
+      "unit_id": "mod_a",
+      "symbols": ["src/mod_a/fun_a1.rs", "src/mod_a/fun_a2.rs"],
+      "edges": [],
+      "scc_groups": [],
+      "batch_candidate": true,
+      "batch_reason": "small unit"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_root).unwrap();
+        let expanded = resolve_target_files("default", None, Some("mod_a")).unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(
+            expanded.unwrap(),
+            vec![
+                "src/mod_a/fun_a1.rs".to_string(),
+                "src/mod_a/fun_a2.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_files_expands_file_to_large_unit_sub_batch() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path();
+        let feature_dir = project_root.join(".c2rust").join("default");
+        let rust_dir = feature_dir.join("rust");
+        let src_dir = rust_dir.join("src").join("mod_big");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        for name in ["fun_a", "fun_b", "fun_c"] {
+            fs::write(src_dir.join(format!("{name}.rs")), "").unwrap();
+        }
+        fs::write(src_dir.join("fun_a.c"), "int a(void) {\n return 1;\n}\n").unwrap();
+        fs::write(src_dir.join("fun_b.c"), "int b(void) {\n return 2;\n}\n").unwrap();
+        fs::write(
+            src_dir.join("fun_c.c"),
+            "int c(void) {\n int x = 1;\n int y = 2;\n int z = 3;\n return x + y + z;\n}\n",
+        )
+        .unwrap();
+
+        fs::write(
+            feature_dir.join("translation_plan.json"),
+            r#"{
+  "unit_edges": [],
+  "unit_scc_groups": [],
+  "unit_order": ["mod_big"],
+  "units": [
+    {
+      "unit_id": "mod_big",
+      "symbols": ["src/mod_big/fun_a.rs", "src/mod_big/fun_b.rs", "src/mod_big/fun_c.rs"],
+      "edges": [],
+      "scc_groups": [],
+      "batch_candidate": false,
+      "batch_reason": "line_count exceeds threshold"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_root).unwrap();
+        let _max_lines = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", "6");
+        let _max_symbols = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS", "3");
+        let expanded = resolve_target_files("default", Some("src/mod_big/fun_b.rs"), None).unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(
+            expanded.unwrap(),
+            vec![
+                "src/mod_big/fun_a.rs".to_string(),
+                "src/mod_big/fun_b.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_files_rejects_file_and_unit_together() {
+        let err = resolve_target_files("default", Some("src/mod_a/fun_a1.rs"), Some("mod_a"))
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--file and --unit cannot be used together"));
+    }
+
+    #[test]
+    fn test_filter_target_files_accepts_multiple_targets() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src").join("mod_a");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let a1 = src_dir.join("fun_a1.rs");
+        let a2 = src_dir.join("fun_a2.rs");
+        let a3 = src_dir.join("fun_a3.rs");
+        fs::write(&a1, "").unwrap();
+        fs::write(&a2, "").unwrap();
+        fs::write(&a3, "").unwrap();
+
+        let filtered = filter_target_files(
+            vec![a1.clone(), a2.clone(), a3.clone()],
+            &rust_dir,
+            Some(&[
+                "src/mod_a/fun_a1.rs".to_string(),
+                "src/mod_a/fun_a2.rs".to_string(),
+            ]),
+        )
+        .unwrap();
+
+        let rel: Vec<_> = filtered
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&rust_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            rel,
+            vec![
+                "src/mod_a/fun_a1.rs".to_string(),
+                "src/mod_a/fun_a2.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_stash_skipped_file_for_later_writes_stash_and_clears_source() {
         let (_temp_dir, _guard, feature_root, rust_dir) = create_temp_feature_workspace("default");
@@ -3288,7 +4518,10 @@ found fn pointer"#;
             .join("skipped-rust-stash")
             .join("src")
             .join("fun_example.rs");
-        assert_eq!(fs::read_to_string(stash_file).unwrap(), "pub fn kept() {}\n");
+        assert_eq!(
+            fs::read_to_string(stash_file).unwrap(),
+            "pub fn kept() {}\n"
+        );
     }
 
     #[test]
@@ -3320,14 +4553,20 @@ found fn pointer"#;
         .unwrap();
 
         assert_eq!(mode, TranslationInputMode::ReuseExistingRust);
-        assert_eq!(fs::read_to_string(&current).unwrap(), "pub fn current() {}\n");
+        assert_eq!(
+            fs::read_to_string(&current).unwrap(),
+            "pub fn current() {}\n"
+        );
         assert_eq!(fs::metadata(&other).unwrap().len(), 0);
         let other_stash = feature_root
             .join("tmp")
             .join("skipped-rust-stash")
             .join("src")
             .join("fun_other.rs");
-        assert_eq!(fs::read_to_string(other_stash).unwrap(), "pub fn other() {}\n");
+        assert_eq!(
+            fs::read_to_string(other_stash).unwrap(),
+            "pub fn other() {}\n"
+        );
     }
 
     #[test]
@@ -3373,7 +4612,10 @@ found fn pointer"#;
             .join("skipped-rust-stash")
             .join("src")
             .join("fun_failed.rs");
-        assert_eq!(fs::read_to_string(&stash_file).unwrap(), "pub fn failed() {}\n");
+        assert_eq!(
+            fs::read_to_string(&stash_file).unwrap(),
+            "pub fn failed() {}\n"
+        );
 
         isolation.restore().unwrap();
 

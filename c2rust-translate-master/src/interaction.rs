@@ -173,7 +173,6 @@ pub fn prompt_after_manual_fix_choice() -> Result<FailureChoice> {
     }
 }
 
-
 /// 如果 require_input 为 true，用户必须提供非空输入
 pub fn prompt_suggestion(require_input: bool) -> Result<Option<String>> {
     loop {
@@ -316,9 +315,7 @@ fn parse_file_option(selection: &str, file_count: usize) -> Result<usize> {
 }
 
 /// 提示用户选择要编辑的文件（1-based 编号展示）
-pub fn prompt_file_selection_for_edit(
-    files: &[std::path::PathBuf],
-) -> Result<std::path::PathBuf> {
+pub fn prompt_file_selection_for_edit(files: &[std::path::PathBuf]) -> Result<std::path::PathBuf> {
     println!("│ {}", "选择要编辑的文件:".bright_cyan().bold());
     println!("│ {}", "  （使用上下键选择，回车确认）".bright_blue());
 
@@ -402,10 +399,7 @@ pub fn prompt_compile_success_choice() -> Result<CompileSuccessChoice> {
 /// 此提示明确告知用户代码未经测试验证。
 pub fn prompt_build_success_tests_skipped_choice() -> Result<CompileSuccessChoice> {
     println!("│");
-    println!(
-        "│ {}",
-        "✓ Compilation successful!".bright_green().bold()
-    );
+    println!("│ {}", "✓ Compilation successful!".bright_green().bold());
     println!(
         "│ {}",
         "⚠ Tests skipped (test configuration not available — results are not validated by tests)."
@@ -452,10 +446,7 @@ pub fn prompt_build_success_tests_skipped_choice() -> Result<CompileSuccessChoic
 /// 选择 "Manual fix" 将执行完整的构建 + 测试。
 pub fn prompt_build_success_tests_deferred_choice() -> Result<CompileSuccessChoice> {
     println!("│");
-    println!(
-        "│ {}",
-        "✓ Compilation successful!".bright_green().bold()
-    );
+    println!("│ {}", "✓ Compilation successful!".bright_green().bold());
     println!(
         "│ {}",
         "⚠ Tests deferred by C2RUST_TEST_INTERVAL (build succeeded; tests will run on the next scheduled translation)."
@@ -670,7 +661,8 @@ fn build_resume_options(has_skipped_files: bool) -> Vec<&'static str> {
         "Start fresh (clear all progress)",
     ];
     if has_skipped_files {
-        options.push("Fix skipped files (attempt to translate skipped files from the previous run)");
+        options
+            .push("Fix skipped files (attempt to translate skipped files from the previous run)");
     }
     options
 }
@@ -794,7 +786,10 @@ mod tests {
     fn test_continue_choice_variants() {
         assert_eq!(ContinueChoice::Continue, ContinueChoice::Continue);
         assert_eq!(ContinueChoice::Restart, ContinueChoice::Restart);
-        assert_eq!(ContinueChoice::FixSkippedFiles, ContinueChoice::FixSkippedFiles);
+        assert_eq!(
+            ContinueChoice::FixSkippedFiles,
+            ContinueChoice::FixSkippedFiles
+        );
         assert_ne!(ContinueChoice::Continue, ContinueChoice::Restart);
     }
 

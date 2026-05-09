@@ -50,6 +50,22 @@ enum AutoRetryOutcome {
     Skip,
 }
 
+/// Scope used when applying diagnostics-driven fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FixMessageScope {
+    /// Apply fixes for every translated file mentioned in the diagnostic output.
+    AllFiles,
+    /// Apply fixes only when the diagnostic belongs to the current target file.
+    CurrentFileOnly,
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 /// Determine the automatic retry outcome when `C2RUST_AUTO_RETRY_ON_MAX_FIX` is set.
 ///
 /// Returns `Some(AutoRetryOutcome)` when the env var is enabled (truthy: `1`, `true`,
@@ -99,6 +115,7 @@ fn apply_fixes_for_messages<F>(
     format_progress: &F,
     show_full_output: bool,
     is_warning: bool,
+    scope: FixMessageScope,
 ) -> Result<usize>
 where
     F: Fn(&str) -> String,
@@ -116,18 +133,32 @@ where
         }
     };
 
-    if !file_messages.is_empty() {
-        if file_messages.len() > 1 && !is_warning {
+    let mut scoped_file_messages = file_messages;
+    if scope == FixMessageScope::CurrentFileOnly {
+        let before = scoped_file_messages.len();
+        scoped_file_messages.retain(|(msg_file, _)| same_file_path(msg_file, rs_file));
+        if before > 0 && scoped_file_messages.is_empty() {
+            println!(
+                "│ {}",
+                "Diagnostics belong only to other batch sibling file(s); skipping current-file fix."
+                    .bright_yellow()
+            );
+            return Ok(0);
+        }
+    }
+
+    if !scoped_file_messages.is_empty() {
+        if scoped_file_messages.len() > 1 && !is_warning {
             println!(
                 "│ {}",
                 format!(
                     "Found errors in {} file(s), fixing each in order...",
-                    file_messages.len()
+                    scoped_file_messages.len()
                 )
                 .bright_yellow()
             );
         }
-        for (msg_file, file_msg) in &file_messages {
+        for (msg_file, file_msg) in &scoped_file_messages {
             let Some(file_stem) = msg_file.file_stem().and_then(|s| s.to_str()) else {
                 println!(
                     "│ {}",
@@ -295,6 +326,7 @@ where
                         format_progress,
                         show_full_output,
                         false,
+                        FixMessageScope::AllFiles,
                     )?;
                 }
             }
@@ -318,7 +350,7 @@ where
 /// - 如果警告阶段出现意外检查错误，记录日志后继续（不中断文件处理）
 ///
 /// 返回 Ok(fix_attempts)：警告修复阶段中应用的修复次数
-pub fn execute_code_warning_check_with_fix_loop<F>(
+pub(crate) fn execute_code_warning_check_with_fix_loop<F>(
     feature: &str,
     file_type: &str,
     rs_file: &Path,
@@ -326,6 +358,7 @@ pub fn execute_code_warning_check_with_fix_loop<F>(
     format_progress: &F,
     max_warning_fix_attempts: usize,
     show_full_output: bool,
+    fix_scope: FixMessageScope,
 ) -> Result<usize>
 where
     F: Fn(&str) -> String,
@@ -363,6 +396,7 @@ where
                     format_progress,
                     show_full_output,
                     true,
+                    fix_scope,
                 )?;
             }
             Err(e) => {
@@ -627,7 +661,11 @@ fn handle_add_suggestion(
         );
         println!(
             "│ {}",
-            format!("(You will have {} error-fix attempts)", max_error_fix_attempts).bright_blue()
+            format!(
+                "(You will have {} error-fix attempts)",
+                max_error_fix_attempts
+            )
+            .bright_blue()
         );
         println!("│");
 
@@ -686,7 +724,9 @@ fn handle_manual_fix(
                 );
 
                 // 手动编辑后执行完整构建流程
-                match builder::run_full_build_and_test_interactive(feature, file_type, rs_file, skip_test) {
+                match builder::run_full_build_and_test_interactive(
+                    feature, file_type, rs_file, skip_test,
+                ) {
                     Ok(_) => {
                         println!(
                             "│ {}",
@@ -742,8 +782,7 @@ fn handle_manual_fix(
                             interaction::FailureChoice::FixOtherFile => {
                                 println!(
                                     "│ {}",
-                                    "Skipping current file to fix other files..."
-                                        .bright_cyan()
+                                    "Skipping current file to fix other files...".bright_cyan()
                                 );
                                 return Err(anyhow::Error::from(SkipFileSignal));
                             }
@@ -843,10 +882,56 @@ mod tests {
             &|op: &str| op.to_string(),
             false,
             true,
+            FixMessageScope::AllFiles,
         );
 
         // Fix failures are now non-fatal: the function logs a warning and returns
         // Ok(0) (zero fixes applied) instead of propagating the error.
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    /// CurrentFileOnly scope prevents batch sibling diagnostics from triggering
+    /// a fallback fix against the current file.
+    #[test]
+    #[serial_test::serial]
+    fn test_apply_fixes_for_messages_current_file_scope_ignores_sibling_warning() {
+        use std::env;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let orig_dir = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+        let _restore = scopeguard::guard(orig_dir, |dir| {
+            let _ = env::set_current_dir(dir);
+        });
+
+        let feature = "test_feature";
+        let feature_src_dir = tmp
+            .path()
+            .join(".c2rust")
+            .join(feature)
+            .join("rust")
+            .join("src");
+        std::fs::create_dir_all(&feature_src_dir).unwrap();
+
+        let current_rs = feature_src_dir.join("fun_current.rs");
+        let sibling_rs = feature_src_dir.join("fun_sibling.rs");
+        std::fs::write(&current_rs, "").unwrap();
+        std::fs::write(&sibling_rs, "").unwrap();
+
+        let result = apply_fixes_for_messages(
+            "warning: unnecessary parentheses\n  --> src/fun_sibling.rs:1:1",
+            &anyhow::anyhow!("dummy"),
+            feature,
+            "fun",
+            &current_rs,
+            &|op: &str| op.to_string(),
+            false,
+            true,
+            FixMessageScope::CurrentFileOnly,
+        );
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
@@ -879,6 +964,7 @@ mod tests {
             &|op: &str| op.to_string(),
             1, // max_warning_fix_attempts
             false,
+            FixMessageScope::AllFiles,
         );
 
         env::set_current_dir(orig).unwrap();
@@ -983,11 +1069,11 @@ mod tests {
         let result = collect_fix_files(feature, &rs_file, &error);
 
         // rs_file must appear exactly once
-        let count = result
-            .iter()
-            .filter(|f| f.ends_with("var_foo.rs"))
-            .count();
-        assert_eq!(count, 1, "var_foo.rs should appear exactly once, got: {result:?}");
+        let count = result.iter().filter(|f| f.ends_with("var_foo.rs")).count();
+        assert_eq!(
+            count, 1,
+            "var_foo.rs should appear exactly once, got: {result:?}"
+        );
     }
 
     /// collect_fix_files inserts rs_file at the front when it is not in the
@@ -1058,7 +1144,10 @@ mod tests {
     fn test_resolve_auto_retry_outcome_env_set_not_last_returns_retry() {
         let _restore = env_guard("C2RUST_AUTO_RETRY_ON_MAX_FIX");
         std::env::set_var("C2RUST_AUTO_RETRY_ON_MAX_FIX", "1");
-        assert_eq!(resolve_auto_retry_outcome(false), Some(AutoRetryOutcome::Retry));
+        assert_eq!(
+            resolve_auto_retry_outcome(false),
+            Some(AutoRetryOutcome::Retry)
+        );
     }
 
     /// When the env var is set and this is the last attempt,
@@ -1068,7 +1157,10 @@ mod tests {
     fn test_resolve_auto_retry_outcome_env_set_last_attempt_returns_skip() {
         let _restore = env_guard("C2RUST_AUTO_RETRY_ON_MAX_FIX");
         std::env::set_var("C2RUST_AUTO_RETRY_ON_MAX_FIX", "1");
-        assert_eq!(resolve_auto_retry_outcome(true), Some(AutoRetryOutcome::Skip));
+        assert_eq!(
+            resolve_auto_retry_outcome(true),
+            Some(AutoRetryOutcome::Skip)
+        );
     }
 
     /// Accepted truthy values ("true", "yes") also trigger auto-retry.
@@ -1078,8 +1170,16 @@ mod tests {
         let _restore = env_guard("C2RUST_AUTO_RETRY_ON_MAX_FIX");
         for val in &["true", "yes", "TRUE", "YES"] {
             std::env::set_var("C2RUST_AUTO_RETRY_ON_MAX_FIX", val);
-            assert_eq!(resolve_auto_retry_outcome(false), Some(AutoRetryOutcome::Retry), "val={val}");
-            assert_eq!(resolve_auto_retry_outcome(true), Some(AutoRetryOutcome::Skip), "val={val}");
+            assert_eq!(
+                resolve_auto_retry_outcome(false),
+                Some(AutoRetryOutcome::Retry),
+                "val={val}"
+            );
+            assert_eq!(
+                resolve_auto_retry_outcome(true),
+                Some(AutoRetryOutcome::Skip),
+                "val={val}"
+            );
         }
     }
 
