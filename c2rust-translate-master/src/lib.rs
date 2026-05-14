@@ -24,7 +24,7 @@ pub(crate) mod suggestion;
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use quote::ToTokens;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
@@ -69,6 +69,24 @@ enum TranslationWorkItem {
     },
 }
 
+#[derive(Debug, Serialize)]
+struct TranslationPlanPreview {
+    feature: String,
+    work_items: usize,
+    target_files: usize,
+    batch_groups: usize,
+    items: Vec<TranslationPlanPreviewItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct TranslationPlanPreviewItem {
+    index: usize,
+    kind: &'static str,
+    unit_id: Option<String>,
+    reason: Option<String>,
+    files: Vec<String>,
+}
+
 /// Run periodic `git reflog expire` + `git gc` every [`GIT_GC_INTERVAL`] successfully
 /// processed files to keep the `.c2rust/.git` directory from growing unbounded.
 ///
@@ -107,12 +125,13 @@ pub fn translate_feature(
     target_file: Option<&str>,
     target_unit: Option<&str>,
     plan_only: bool,
+    json: bool,
     max_error_fix_attempts: usize,
     max_warning_fix_attempts: usize,
     show_full_output: bool,
 ) -> Result<()> {
     if plan_only {
-        return preview_translation_plan(feature, target_file, target_unit);
+        return preview_translation_plan(feature, target_file, target_unit, json);
     }
 
     print_workflow_header(feature);
@@ -197,13 +216,16 @@ pub fn preview_translation_plan(
     feature: &str,
     target_file: Option<&str>,
     target_unit: Option<&str>,
+    json: bool,
 ) -> Result<()> {
-    println!(
-        "\n{}",
-        format!("Translation Plan Preview (feature: {})", feature)
-            .bright_cyan()
-            .bold()
-    );
+    if !json {
+        println!(
+            "\n{}",
+            format!("Translation Plan Preview (feature: {})", feature)
+                .bright_cyan()
+                .bold()
+        );
+    }
 
     let project_root = util::find_project_root()?;
     let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
@@ -221,20 +243,30 @@ pub fn preview_translation_plan(
             feature
         )
     })?;
-    let target_files = resolve_target_files(feature, target_file, target_unit)?;
+    let target_files = resolve_target_files_with_output(feature, target_file, target_unit, !json)?;
     let selected_files = preview_selected_files(&rust_dir, target_files.as_deref())?;
     let selected_files = sort_files_by_translation_plan(selected_files, &rust_dir, &plan);
 
     if selected_files.is_empty() {
-        println!(
-            "{}",
-            "No empty .rs files selected for translation.".bright_green()
-        );
+        let preview = build_work_item_plan_preview(feature, &[], &rust_dir);
+        if json {
+            print_work_item_plan_json(&preview)?;
+        } else {
+            println!(
+                "{}",
+                "No empty .rs files selected for translation.".bright_green()
+            );
+        }
         return Ok(());
     }
 
     let work_items = build_translation_work_items(selected_files, &rust_dir, Some(&plan));
-    print_work_item_plan(&work_items, &rust_dir);
+    let preview = build_work_item_plan_preview(feature, &work_items, &rust_dir);
+    if json {
+        print_work_item_plan_json(&preview)?;
+    } else {
+        print_work_item_plan(&preview);
+    }
     Ok(())
 }
 
@@ -571,6 +603,15 @@ fn resolve_target_files(
     target_file: Option<&str>,
     target_unit: Option<&str>,
 ) -> Result<Option<Vec<String>>> {
+    resolve_target_files_with_output(feature, target_file, target_unit, true)
+}
+
+fn resolve_target_files_with_output(
+    feature: &str,
+    target_file: Option<&str>,
+    target_unit: Option<&str>,
+    emit_messages: bool,
+) -> Result<Option<Vec<String>>> {
     if target_file.is_some() && target_unit.is_some() {
         bail!("--file and --unit cannot be used together");
     }
@@ -592,15 +633,17 @@ fn resolve_target_files(
             );
         };
 
-        println!(
-            "{}",
-            format!(
-                "Target unit {} resolved to {} file(s)",
-                unit.unit_id,
-                unit.symbols.len()
-            )
-            .bright_cyan()
-        );
+        if emit_messages {
+            println!(
+                "{}",
+                format!(
+                    "Target unit {} resolved to {} file(s)",
+                    unit.unit_id,
+                    unit.symbols.len()
+                )
+                .bright_cyan()
+            );
+        }
         return Ok(Some(unit.symbols.clone()));
     }
 
@@ -634,15 +677,17 @@ fn resolve_target_files(
                         .collect();
                     if rel_group.iter().any(|symbol| symbol == target_file) {
                         if rel_group.len() > 1 {
-                            println!(
-                                "{}",
-                                format!(
-                                    "Target file belongs to sub-batch in large unit {}; expanding targeted run to {} file(s)",
-                                    unit.unit_id,
-                                    rel_group.len()
-                                )
-                                .bright_cyan()
-                            );
+                            if emit_messages {
+                                println!(
+                                    "{}",
+                                    format!(
+                                        "Target file belongs to sub-batch in large unit {}; expanding targeted run to {} file(s)",
+                                        unit.unit_id,
+                                        rel_group.len()
+                                    )
+                                    .bright_cyan()
+                                );
+                            }
                             return Ok(Some(rel_group));
                         }
                         return Ok(Some(vec![target_file.to_string()]));
@@ -653,7 +698,7 @@ fn resolve_target_files(
             if !unit.batch_candidate {
                 return Ok(Some(vec![target_file.to_string()]));
             }
-            if unit.symbols.len() > 1 {
+            if unit.symbols.len() > 1 && emit_messages {
                 println!(
                     "{}",
                     format!(
@@ -2111,7 +2156,11 @@ fn print_work_item_summary(work_items: &[TranslationWorkItem]) {
     }
 }
 
-fn print_work_item_plan(work_items: &[TranslationWorkItem], rust_dir: &Path) {
+fn build_work_item_plan_preview(
+    feature: &str,
+    work_items: &[TranslationWorkItem],
+    rust_dir: &Path,
+) -> TranslationPlanPreview {
     let total_files: usize = work_items
         .iter()
         .map(|item| match item {
@@ -2123,38 +2172,73 @@ fn print_work_item_plan(work_items: &[TranslationWorkItem], rust_dir: &Path) {
         .iter()
         .filter(|item| matches!(item, TranslationWorkItem::BatchCandidateGroup { .. }))
         .count();
-
-    println!("work_items = {}", work_items.len());
-    println!("target_files = {}", total_files);
-    println!("batch_groups = {}", batch_groups);
-
-    for (idx, item) in work_items.iter().enumerate() {
-        match item {
-            TranslationWorkItem::Single(path) => {
-                println!(
-                    "item {} = single {}",
-                    idx + 1,
-                    display_relative_to(path, rust_dir)
-                );
-            }
+    let items = work_items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| match item {
+            TranslationWorkItem::Single(path) => TranslationPlanPreviewItem {
+                index: idx + 1,
+                kind: "single",
+                unit_id: None,
+                reason: None,
+                files: vec![display_relative_to(path, rust_dir)],
+            },
             TranslationWorkItem::BatchCandidateGroup {
                 unit_id,
                 reason,
                 files,
-            } => {
-                println!(
-                    "item {} = batch unit:{} files:{} reason:{}",
-                    idx + 1,
-                    unit_id,
-                    files.len(),
-                    reason
-                );
-                for file in files {
-                    println!("  file = {}", display_relative_to(file, rust_dir));
-                }
+            } => TranslationPlanPreviewItem {
+                index: idx + 1,
+                kind: "batch",
+                unit_id: Some(unit_id.clone()),
+                reason: Some(reason.clone()),
+                files: files
+                    .iter()
+                    .map(|file| display_relative_to(file, rust_dir))
+                    .collect(),
+            },
+        })
+        .collect();
+
+    TranslationPlanPreview {
+        feature: feature.to_string(),
+        work_items: work_items.len(),
+        target_files: total_files,
+        batch_groups,
+        items,
+    }
+}
+
+fn print_work_item_plan(preview: &TranslationPlanPreview) {
+    println!("work_items = {}", preview.work_items);
+    println!("target_files = {}", preview.target_files);
+    println!("batch_groups = {}", preview.batch_groups);
+
+    for item in &preview.items {
+        if item.kind == "single" {
+            if let Some(file) = item.files.first() {
+                println!("item {} = single {}", item.index, file);
             }
+            continue;
+        }
+
+        println!(
+            "item {} = batch unit:{} files:{} reason:{}",
+            item.index,
+            item.unit_id.as_deref().unwrap_or(""),
+            item.files.len(),
+            item.reason.as_deref().unwrap_or("")
+        );
+        for file in &item.files {
+            println!("  file = {}", file);
         }
     }
+}
+
+fn print_work_item_plan_json(preview: &TranslationPlanPreview) -> Result<()> {
+    let json = serde_json::to_string_pretty(preview)?;
+    println!("{}", json);
+    Ok(())
 }
 
 fn display_relative_to(path: &Path, base: &Path) -> String {
@@ -4619,6 +4703,36 @@ found fn pointer"#;
     }
 
     #[test]
+    fn test_build_work_item_plan_preview_serializes_batch_items() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src").join("mod_a");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let a = src_dir.join("fun_a.rs");
+        let b = src_dir.join("fun_b.rs");
+        fs::write(&a, "").unwrap();
+        fs::write(&b, "").unwrap();
+
+        let items = vec![TranslationWorkItem::BatchCandidateGroup {
+            unit_id: "mod_a".to_string(),
+            reason: "small unit".to_string(),
+            files: vec![a.clone(), b.clone()],
+        }];
+        let preview = build_work_item_plan_preview("default", &items, &rust_dir);
+        let json = serde_json::to_value(&preview).unwrap();
+
+        assert_eq!(json["feature"], "default");
+        assert_eq!(json["work_items"], 1);
+        assert_eq!(json["target_files"], 2);
+        assert_eq!(json["batch_groups"], 1);
+        assert_eq!(json["items"][0]["kind"], "batch");
+        assert_eq!(json["items"][0]["unit_id"], "mod_a");
+        assert_eq!(json["items"][0]["files"][0], "src/mod_a/fun_a.rs");
+        assert_eq!(json["items"][0]["files"][1], "src/mod_a/fun_b.rs");
+    }
+
+    #[test]
     fn test_write_batch_c_unit_file_aggregates_all_sidecar_sources() {
         let dir = tempdir().unwrap();
         let rust_dir = dir.path().join("rust");
@@ -4676,6 +4790,50 @@ found fn pointer"#;
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(project_root).unwrap();
         let expanded = resolve_target_files("default", Some("src/mod_a/fun_a1.rs"), None).unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(
+            expanded.unwrap(),
+            vec![
+                "src/mod_a/fun_a1.rs".to_string(),
+                "src/mod_a/fun_a2.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_target_files_with_output_can_be_silent() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path();
+        let feature_dir = project_root.join(".c2rust").join("default");
+        fs::create_dir_all(&feature_dir).unwrap();
+
+        fs::write(
+            feature_dir.join("translation_plan.json"),
+            r#"{
+  "unit_edges": [],
+  "unit_scc_groups": [],
+  "unit_order": ["mod_a"],
+  "units": [
+    {
+      "unit_id": "mod_a",
+      "symbols": ["src/mod_a/fun_a1.rs", "src/mod_a/fun_a2.rs"],
+      "edges": [],
+      "scc_groups": [],
+      "batch_candidate": true,
+      "batch_reason": "small unit"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_root).unwrap();
+        let expanded =
+            resolve_target_files_with_output("default", Some("src/mod_a/fun_a1.rs"), None, false)
+                .unwrap();
         std::env::set_current_dir(cwd).unwrap();
 
         assert_eq!(

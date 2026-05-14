@@ -98,6 +98,9 @@ enum Commands {
         plan_only: bool,
 
         #[arg(long)]
+        json: bool,
+
+        #[arg(long)]
         show_full_output: bool,
     },
 
@@ -1947,6 +1950,7 @@ fn main() {
             file,
             unit,
             plan_only,
+            json,
             show_full_output,
         } => {
             let feature_name = feature.clone().unwrap_or_else(|| "default".to_string());
@@ -1976,6 +1980,10 @@ fn main() {
 
                 if plan_only {
                     args.push("--plan-only".to_string());
+                }
+
+                if json {
+                    args.push("--json".to_string());
                 }
 
                 if let Some(attempts) = max_error_fix_attempts {

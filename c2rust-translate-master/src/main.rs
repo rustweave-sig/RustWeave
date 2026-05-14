@@ -47,6 +47,10 @@ enum Commands {
         #[arg(long)]
         plan_only: bool,
 
+        /// 配合 --plan-only 输出结构化 JSON
+        #[arg(long)]
+        json: bool,
+
         /// 构建错误的最大修复尝试次数（必须 > 0，默认为 5）
         #[arg(long, default_value = "5", value_parser = parse_positive_usize)]
         max_error_fix_attempts: usize,
@@ -82,6 +86,7 @@ fn main() {
             file,
             unit,
             plan_only,
+            json,
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,
@@ -91,6 +96,7 @@ fn main() {
             file.as_deref(),
             unit.as_deref(),
             plan_only,
+            json,
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,
