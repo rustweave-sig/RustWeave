@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use quote::ToTokens;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
@@ -550,7 +550,7 @@ fn resolve_target_files(
                     .iter()
                     .map(|symbol| rust_dir.join(symbol))
                     .collect();
-                for group in sub_batch_file_groups(&unit_files) {
+                for group in plan_sub_batch_file_groups(unit, &unit_files, &rust_dir) {
                     let rel_group: Vec<String> = group
                         .iter()
                         .filter_map(|path| {
@@ -691,7 +691,7 @@ fn build_translation_work_items(
         }
 
         if should_use_translation_sub_batches() {
-            append_sub_batch_work_items(&mut result, unit, &unit_files);
+            append_sub_batch_work_items(&mut result, unit, &unit_files, rust_dir);
         } else {
             result.extend(unit_files.into_iter().map(TranslationWorkItem::Single));
         }
@@ -738,8 +738,9 @@ fn append_sub_batch_work_items(
     result: &mut Vec<TranslationWorkItem>,
     unit: &TranslationUnitPlan,
     unit_files: &[PathBuf],
+    rust_dir: &Path,
 ) {
-    for files in sub_batch_file_groups(unit_files) {
+    for files in plan_sub_batch_file_groups(unit, unit_files, rust_dir) {
         if files.len() > 1 {
             let line_count = files
                 .iter()
@@ -748,10 +749,10 @@ fn append_sub_batch_work_items(
             result.push(TranslationWorkItem::BatchCandidateGroup {
                 unit_id: unit.unit_id.clone(),
                 reason: format!(
-                    "sub-batch from large unit: line_count {} <= {}, symbol_count {} <= {}",
+                    "sub-batch from large unit: line_count {}, symbol_count {}, thresholds: lines {}, symbols {}",
                     line_count,
-                    translation_batch_max_c_lines(),
                     files.len(),
+                    translation_batch_max_c_lines(),
                     translation_batch_max_symbols()
                 ),
                 files,
@@ -760,6 +761,96 @@ fn append_sub_batch_work_items(
             result.push(TranslationWorkItem::Single(files[0].clone()));
         }
     }
+}
+
+fn plan_sub_batch_file_groups(
+    unit: &TranslationUnitPlan,
+    unit_files: &[PathBuf],
+    rust_dir: &Path,
+) -> Vec<Vec<PathBuf>> {
+    if unit.scc_groups.is_empty() {
+        return sub_batch_file_groups(unit_files);
+    }
+
+    let selected: HashMap<String, PathBuf> = unit_files
+        .iter()
+        .filter_map(|file| {
+            file.strip_prefix(rust_dir)
+                .ok()
+                .and_then(|path| path.to_str())
+                .map(|rel| (rel.to_string(), file.clone()))
+        })
+        .collect();
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let max_lines = translation_batch_max_c_lines();
+    let max_symbols = translation_batch_max_symbols();
+    let mut groups = Vec::<Vec<PathBuf>>::new();
+    let mut current_files = Vec::<PathBuf>::new();
+    let mut current_lines = 0usize;
+    let mut emitted = HashSet::<String>::new();
+
+    let flush = |groups: &mut Vec<Vec<PathBuf>>,
+                 current_files: &mut Vec<PathBuf>,
+                 current_lines: &mut usize| {
+        if current_files.is_empty() {
+            return;
+        }
+        groups.push(std::mem::take(current_files));
+        *current_lines = 0;
+    };
+
+    for scc_group in &unit.scc_groups {
+        let mut scc_files = Vec::<PathBuf>::new();
+        for symbol in scc_group {
+            if let Some(file) = selected.get(symbol) {
+                emitted.insert(symbol.clone());
+                scc_files.push(file.clone());
+            }
+        }
+        if scc_files.is_empty() {
+            continue;
+        }
+
+        let scc_lines = scc_files.iter().fold(0usize, |acc, file| {
+            acc.saturating_add(sidecar_c_line_count(file).unwrap_or(max_lines.saturating_add(1)))
+        });
+        let scc_symbols = scc_files.len();
+        let oversized_scc = scc_lines > max_lines || scc_symbols > max_symbols;
+        let cycle_scc = scc_symbols > 1;
+
+        if oversized_scc || cycle_scc {
+            flush(&mut groups, &mut current_files, &mut current_lines);
+            groups.push(scc_files);
+            continue;
+        }
+
+        let would_exceed_symbols = current_files.len().saturating_add(scc_symbols) > max_symbols;
+        let would_exceed_lines = current_lines.saturating_add(scc_lines) > max_lines;
+        if would_exceed_symbols || would_exceed_lines {
+            flush(&mut groups, &mut current_files, &mut current_lines);
+        }
+
+        current_files.extend(scc_files);
+        current_lines = current_lines.saturating_add(scc_lines);
+    }
+
+    flush(&mut groups, &mut current_files, &mut current_lines);
+
+    let remaining: Vec<PathBuf> = unit_files
+        .iter()
+        .filter_map(|file| {
+            let rel = file
+                .strip_prefix(rust_dir)
+                .ok()
+                .and_then(|path| path.to_str())?;
+            (!emitted.contains(rel)).then_some(file.clone())
+        })
+        .collect();
+    groups.extend(sub_batch_file_groups(&remaining));
+    groups
 }
 
 fn sub_batch_file_groups(unit_files: &[PathBuf]) -> Vec<Vec<PathBuf>> {
@@ -4213,6 +4304,7 @@ found fn pointer"#;
     }
 
     #[test]
+    #[serial]
     fn test_build_translation_work_items_splits_large_unit_into_sub_batches() {
         let dir = tempdir().unwrap();
         let rust_dir = dir.path().join("rust");
@@ -4280,6 +4372,123 @@ found fn pointer"#;
             TranslationWorkItem::Single(path) => assert_eq!(path, &d),
             TranslationWorkItem::BatchCandidateGroup { .. } => {
                 panic!("expected one trailing symbol to stay single")
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_sub_batches_keep_scc_groups_together() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src").join("mod_big");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let a = src_dir.join("fun_a.rs");
+        let b = src_dir.join("fun_b.rs");
+        let c = src_dir.join("fun_c.rs");
+        for file in [&a, &b, &c] {
+            fs::write(file, "").unwrap();
+            fs::write(file.with_extension("c"), "int f(void) {\n return 1;\n}\n").unwrap();
+        }
+
+        let unit = TranslationUnitPlan {
+            unit_id: "mod_big".to_string(),
+            symbols: vec![
+                "src/mod_big/fun_a.rs".to_string(),
+                "src/mod_big/fun_b.rs".to_string(),
+                "src/mod_big/fun_c.rs".to_string(),
+            ],
+            edges: vec![
+                [
+                    "src/mod_big/fun_a.rs".to_string(),
+                    "src/mod_big/fun_b.rs".to_string(),
+                ],
+                [
+                    "src/mod_big/fun_b.rs".to_string(),
+                    "src/mod_big/fun_a.rs".to_string(),
+                ],
+            ],
+            scc_groups: vec![
+                vec![
+                    "src/mod_big/fun_a.rs".to_string(),
+                    "src/mod_big/fun_b.rs".to_string(),
+                ],
+                vec!["src/mod_big/fun_c.rs".to_string()],
+            ],
+            batch_candidate: false,
+            batch_reason: "line_count exceeds threshold".to_string(),
+        };
+
+        let _max_lines = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", "6");
+        let _max_symbols = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS", "1");
+        let groups =
+            plan_sub_batch_file_groups(&unit, &[a.clone(), b.clone(), c.clone()], &rust_dir);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec![a.clone(), b.clone()]);
+        assert_eq!(groups[1], vec![c.clone()]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_build_translation_work_items_uses_plan_scc_sub_batches() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src").join("mod_big");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let a = src_dir.join("fun_a.rs");
+        let b = src_dir.join("fun_b.rs");
+        let c = src_dir.join("fun_c.rs");
+        for file in [&a, &b, &c] {
+            fs::write(file, "").unwrap();
+            fs::write(file.with_extension("c"), "int f(void) {\n return 1;\n}\n").unwrap();
+        }
+
+        let plan = TranslationPlan {
+            unit_edges: vec![],
+            unit_scc_groups: vec![],
+            unit_order: vec!["mod_big".to_string()],
+            units: vec![TranslationUnitPlan {
+                unit_id: "mod_big".to_string(),
+                symbols: vec![
+                    "src/mod_big/fun_a.rs".to_string(),
+                    "src/mod_big/fun_b.rs".to_string(),
+                    "src/mod_big/fun_c.rs".to_string(),
+                ],
+                edges: vec![],
+                scc_groups: vec![
+                    vec![
+                        "src/mod_big/fun_a.rs".to_string(),
+                        "src/mod_big/fun_b.rs".to_string(),
+                    ],
+                    vec!["src/mod_big/fun_c.rs".to_string()],
+                ],
+                batch_candidate: false,
+                batch_reason: "line_count exceeds threshold".to_string(),
+            }],
+        };
+
+        let _max_lines = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_C_LINES", "6");
+        let _max_symbols = EnvGuard::set("C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS", "1");
+        let items = build_translation_work_items(
+            vec![a.clone(), b.clone(), c.clone()],
+            &rust_dir,
+            Some(&plan),
+        );
+
+        assert_eq!(items.len(), 2);
+        match &items[0] {
+            TranslationWorkItem::BatchCandidateGroup { files, .. } => {
+                assert_eq!(files, &vec![a.clone(), b.clone()]);
+            }
+            TranslationWorkItem::Single(_) => panic!("expected SCC sub-batch"),
+        }
+        match &items[1] {
+            TranslationWorkItem::Single(path) => assert_eq!(path, &c),
+            TranslationWorkItem::BatchCandidateGroup { .. } => {
+                panic!("expected single trailing symbol")
             }
         }
     }
@@ -4427,7 +4636,10 @@ found fn pointer"#;
       "unit_id": "mod_big",
       "symbols": ["src/mod_big/fun_a.rs", "src/mod_big/fun_b.rs", "src/mod_big/fun_c.rs"],
       "edges": [],
-      "scc_groups": [],
+      "scc_groups": [
+        ["src/mod_big/fun_a.rs", "src/mod_big/fun_b.rs"],
+        ["src/mod_big/fun_c.rs"]
+      ],
       "batch_candidate": false,
       "batch_reason": "line_count exceeds threshold"
     }
