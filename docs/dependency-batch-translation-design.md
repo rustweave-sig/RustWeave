@@ -166,7 +166,7 @@
 
 当前已落地的第一阶段在这一层完成：
 
-1. 统计每个现有 `.c2rust` unit / module 下的待翻译符号集合
+1. 统计每个现有 `.c2rust` unit / module 下真实落盘的待翻译符号集合，即已有 `rust/src/<mod>/fun_*.rs` / `var_*.rs` sidecar 的目标
 2. 基于符号 C 代码正文做同 unit 内部依赖提取，提取前会剥离 C 注释、字符串字面量和字符字面量，避免注释或日志文本中的函数名生成假依赖边
 3. 生成 unit 内部的 `edges`、`scc_groups` 与稳定符号顺序
 4. 基于符号引用生成轻量跨 unit 的 `unit_edges`、`unit_scc_groups` 与 `unit_order`
@@ -176,6 +176,7 @@
 说明：
 
 - 这里的 `unit` 当前仍然等价于现有工作区中的一个 `mod_xxx`
+- plan 不直接使用 AST 中所有定义节点作为 symbol 列表，因为预处理和 inline/intrinsic 展开可能产生大量未落盘节点；调度计划必须以真实存在的翻译目标文件为准
 - 当前跨 unit 分析是基于符号正文 identifier 引用的调度辅助，不是完整 C 编译级依赖图
 - 因此当前阶段的目标是先把“同 unit 与轻量跨 unit 调度更合理”落地，再逐步扩展到 include/macro/类型依赖/函数指针等完整项目级分析
 
@@ -224,6 +225,17 @@
   "version": 1,
   "generated_by": "code_analyse",
   "feature": "default",
+  "summary": {
+    "unit_count": 2,
+    "symbol_count": 4,
+    "batch_candidate_count": 1,
+    "unit_edge_count": 1,
+    "unit_scc_group_count": 2,
+    "unit_cycle_group_count": 0,
+    "symbol_edge_count": 1,
+    "symbol_scc_group_count": 4,
+    "symbol_cycle_group_count": 0
+  },
   "unit_edges": [
     [
       "mod_cli_xsum_arch",
@@ -281,12 +293,15 @@
 
 - `unit`
   当前阶段表示一个现有 `mod_xxx` 对应的待翻译定义集合
+- `summary`
+  表示该 plan 的结构化摘要，包含 unit 数、symbol 数、batch candidate 数、跨 unit 边/SCC 数、unit 循环组数、symbol 边/SCC 数和 symbol 循环组数
+  该字段用于测试系统和人工排查快速判断计划规模与调度复杂度，不替代 `units` 中的明细信息
 - `unit_edges`
   表示轻量跨 unit 依赖边，方向同样为“被依赖 unit -> 依赖它的 unit”
 - `unit_order`
   表示按 `unit_edges` 拓扑排序后的建议 unit 调度顺序；如果存在环，会按稳定顺序保留剩余节点
 - `symbols`
-  当前会按同 unit 内部依赖顺序稳定排序，不再只是路径字典序
+  当前会按同 unit 内部依赖顺序稳定排序，不再只是路径字典序；列表只包含真实存在的 `fun_*.rs` / `var_*.rs` 翻译目标
 - `edges`
   表示同一 unit 内部依赖边，方向为“被依赖目标 -> 依赖它的目标”
   例如 `caller()` 调用 `helper()` 时，边记录为 `helper -> caller`，从而保证 helper 优先翻译
@@ -559,6 +574,7 @@ batch 模式的 prompt 不应要求模型输出一个“完整 Rust 模块”，
 当前状态：
 
 - 部分具备
+- `translation_plan.json` 已包含 `summary` 结构化摘要，可直接读取计划规模、batch candidate 数、依赖边数量和 SCC/循环组数量
 - 当前主要依赖日志中的 batch attempt、fallback、check successful、hybrid build passed 等计数
 - 后续应把这些字段沉淀进结构化 stats，便于和逐符号翻译做同口径比较
 

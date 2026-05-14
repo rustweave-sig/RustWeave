@@ -33,10 +33,24 @@ struct TranslationPlan {
     version: u32,
     generated_by: String,
     feature: String,
+    summary: TranslationPlanSummary,
     unit_edges: Vec<[String; 2]>,
     unit_scc_groups: Vec<Vec<String>>,
     unit_order: Vec<String>,
     units: Vec<TranslationUnitPlan>,
+}
+
+#[derive(Serialize)]
+struct TranslationPlanSummary {
+    unit_count: usize,
+    symbol_count: usize,
+    batch_candidate_count: usize,
+    unit_edge_count: usize,
+    unit_scc_group_count: usize,
+    unit_cycle_group_count: usize,
+    symbol_edge_count: usize,
+    symbol_scc_group_count: usize,
+    symbol_cycle_group_count: usize,
 }
 
 #[derive(Serialize)]
@@ -997,20 +1011,6 @@ impl Feature {
             .to_string()
     }
 
-    fn symbol_paths_for_plan(&self, file: &File, mod_name: &str) -> Result<Vec<String>> {
-        let mut symbols = Vec::new();
-        for node in file.iter() {
-            if !Self::is_node_definition(node) || node.kind.is_variadic() {
-                continue;
-            }
-            let prefixed_name = Self::prefixed_filename(node)?;
-            symbols.push(format!("src/{mod_name}/{prefixed_name}.rs"));
-        }
-        symbols.sort();
-        symbols.dedup();
-        Ok(symbols)
-    }
-
     fn symbol_code_map_for_plan(
         &self,
         file: &File,
@@ -1027,22 +1027,15 @@ impl Feature {
             };
             let prefixed_name = Self::prefixed_filename(node)?;
             let symbol_path = format!("src/{mod_name}/{prefixed_name}.rs");
+            if !self.root.join("rust").join(&symbol_path).is_file() {
+                continue;
+            }
             let c_code = Self::normalize_c_code(node, &c_root)?;
             entries.push((Self::normalize_name(name).to_string(), symbol_path, c_code));
         }
         entries.sort_by(|left, right| left.1.cmp(&right.1));
         entries.dedup_by(|left, right| left.1 == right.1);
         Ok(entries)
-    }
-
-    fn unit_line_count_for_plan(&self, file: &File) -> usize {
-        let c_root = self.root.join("c");
-        file.iter()
-            .iter()
-            .filter(|node| Self::is_node_definition(node) && !node.kind.is_variadic())
-            .filter_map(|node| node.kind.c_code(&c_root).ok())
-            .map(|code| code.lines().count())
-            .sum()
     }
 
     fn batch_decision_reason(line_count: usize, symbol_count: usize) -> (bool, String) {
@@ -1380,8 +1373,14 @@ impl Feature {
     fn build_translation_unit_analysis(&self, file: &File) -> Result<TranslationUnitAnalysis> {
         let mod_name = Self::get_mod_name_for_file(&self.prefix, file)?;
         let symbol_entries = self.symbol_code_map_for_plan(file, &mod_name)?;
-        let symbols = self.symbol_paths_for_plan(file, &mod_name)?;
-        let line_count = self.unit_line_count_for_plan(file);
+        let symbols: Vec<String> = symbol_entries
+            .iter()
+            .map(|(_, symbol_path, _)| symbol_path.clone())
+            .collect();
+        let line_count = symbol_entries
+            .iter()
+            .map(|(_, _, c_code)| c_code.lines().count())
+            .sum();
         let edges = Self::build_unit_edges(&symbol_entries);
         let symbols = Self::topo_sort_with_cycles(&symbols, &edges);
         let scc_groups = Self::scc_groups_for_symbols(&symbols, &edges);
@@ -1444,6 +1443,36 @@ impl Feature {
         Self::scc_groups_for_symbols(unit_ids, edges)
     }
 
+    fn translation_plan_summary(
+        units: &[TranslationUnitPlan],
+        unit_edges: &[[String; 2]],
+        unit_scc_groups: &[Vec<String>],
+    ) -> TranslationPlanSummary {
+        let symbol_count = units.iter().map(|unit| unit.symbols.len()).sum();
+        let batch_candidate_count = units.iter().filter(|unit| unit.batch_candidate).count();
+        let symbol_edge_count = units.iter().map(|unit| unit.edges.len()).sum();
+        let symbol_scc_group_count = units.iter().map(|unit| unit.scc_groups.len()).sum();
+        let symbol_cycle_group_count = units
+            .iter()
+            .flat_map(|unit| unit.scc_groups.iter())
+            .filter(|group| group.len() > 1)
+            .count();
+        TranslationPlanSummary {
+            unit_count: units.len(),
+            symbol_count,
+            batch_candidate_count,
+            unit_edge_count: unit_edges.len(),
+            unit_scc_group_count: unit_scc_groups.len(),
+            unit_cycle_group_count: unit_scc_groups
+                .iter()
+                .filter(|group| group.len() > 1)
+                .count(),
+            symbol_edge_count,
+            symbol_scc_group_count,
+            symbol_cycle_group_count,
+        }
+    }
+
     fn generate_translation_plan(&self) -> Result<()> {
         let mut analyses = Vec::with_capacity(self.files.len());
         for file in &self.files {
@@ -1468,10 +1497,12 @@ impl Feature {
         let unit_edges = Self::build_cross_unit_edges(&analyses);
         let unit_order = Self::topo_sort_units_with_cycles(&unit_ids, &unit_edges);
         let unit_scc_groups = Self::unit_scc_groups(&unit_ids, &unit_edges);
+        let summary = Self::translation_plan_summary(&units, &unit_edges, &unit_scc_groups);
         let plan = TranslationPlan {
             version: 1,
             generated_by: "code_analyse".to_string(),
             feature: self.name.clone(),
+            summary,
             unit_edges,
             unit_scc_groups,
             unit_order,
@@ -1481,6 +1512,16 @@ impl Feature {
         let content = serde_json::to_string_pretty(&plan).map_err(|_| Error::nomem())?;
         fs::write(&path, content.as_bytes()).log_err(&format!("write {}", path.display()))?;
         println!("Generated translation plan: {}", path.display());
+        println!(
+            "Translation plan summary: units={}, symbols={}, batch_candidates={}, unit_edges={}, symbol_edges={}, unit_cycles={}, symbol_cycles={}",
+            plan.summary.unit_count,
+            plan.summary.symbol_count,
+            plan.summary.batch_candidate_count,
+            plan.summary.unit_edge_count,
+            plan.summary.symbol_edge_count,
+            plan.summary.unit_cycle_group_count,
+            plan.summary.symbol_cycle_group_count
+        );
         Ok(())
     }
 
@@ -2389,6 +2430,72 @@ mod tests {
 
         let edges = Feature::build_cross_unit_edges(&analyses);
         assert_eq!(edges, vec![["mod_b".to_string(), "mod_a".to_string()]]);
+    }
+
+    #[test]
+    fn test_translation_plan_summary_counts_observable_fields() {
+        let units = vec![
+            TranslationUnitPlan {
+                unit_id: "mod_a".to_string(),
+                source: "a.c".to_string(),
+                module: "mod_a".to_string(),
+                line_count: 10,
+                symbols: vec![
+                    "src/mod_a/fun_a.rs".to_string(),
+                    "src/mod_a/fun_b.rs".to_string(),
+                ],
+                edges: vec![[
+                    "src/mod_a/fun_b.rs".to_string(),
+                    "src/mod_a/fun_a.rs".to_string(),
+                ]],
+                scc_groups: vec![
+                    vec!["src/mod_a/fun_a.rs".to_string()],
+                    vec!["src/mod_a/fun_b.rs".to_string()],
+                ],
+                batch_candidate: true,
+                batch_reason: "eligible".to_string(),
+            },
+            TranslationUnitPlan {
+                unit_id: "mod_b".to_string(),
+                source: "b.c".to_string(),
+                module: "mod_b".to_string(),
+                line_count: 20,
+                symbols: vec![
+                    "src/mod_b/fun_c.rs".to_string(),
+                    "src/mod_b/fun_d.rs".to_string(),
+                ],
+                edges: vec![
+                    [
+                        "src/mod_b/fun_c.rs".to_string(),
+                        "src/mod_b/fun_d.rs".to_string(),
+                    ],
+                    [
+                        "src/mod_b/fun_d.rs".to_string(),
+                        "src/mod_b/fun_c.rs".to_string(),
+                    ],
+                ],
+                scc_groups: vec![vec![
+                    "src/mod_b/fun_c.rs".to_string(),
+                    "src/mod_b/fun_d.rs".to_string(),
+                ]],
+                batch_candidate: false,
+                batch_reason: "too large".to_string(),
+            },
+        ];
+        let unit_edges = vec![["mod_a".to_string(), "mod_b".to_string()]];
+        let unit_scc_groups = vec![vec!["mod_a".to_string()], vec!["mod_b".to_string()]];
+
+        let summary = Feature::translation_plan_summary(&units, &unit_edges, &unit_scc_groups);
+
+        assert_eq!(summary.unit_count, 2);
+        assert_eq!(summary.symbol_count, 4);
+        assert_eq!(summary.batch_candidate_count, 1);
+        assert_eq!(summary.unit_edge_count, 1);
+        assert_eq!(summary.unit_scc_group_count, 2);
+        assert_eq!(summary.unit_cycle_group_count, 0);
+        assert_eq!(summary.symbol_edge_count, 3);
+        assert_eq!(summary.symbol_scc_group_count, 3);
+        assert_eq!(summary.symbol_cycle_group_count, 1);
     }
 
     #[test]
