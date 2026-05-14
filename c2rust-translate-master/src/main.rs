@@ -43,6 +43,10 @@ enum Commands {
         #[arg(long)]
         unit: Option<String>,
 
+        /// 只打印 plan 驱动后的执行分组，不进入翻译/修复流程
+        #[arg(long)]
+        plan_only: bool,
+
         /// 构建错误的最大修复尝试次数（必须 > 0，默认为 5）
         #[arg(long, default_value = "5", value_parser = parse_positive_usize)]
         max_error_fix_attempts: usize,
@@ -77,6 +81,7 @@ fn main() {
             allow_all,
             file,
             unit,
+            plan_only,
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,
@@ -85,6 +90,7 @@ fn main() {
             allow_all,
             file.as_deref(),
             unit.as_deref(),
+            plan_only,
             max_error_fix_attempts,
             max_warning_fix_attempts,
             show_full_output,

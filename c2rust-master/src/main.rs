@@ -95,6 +95,9 @@ enum Commands {
         unit: Option<String>,
 
         #[arg(long)]
+        plan_only: bool,
+
+        #[arg(long)]
         show_full_output: bool,
     },
 
@@ -1943,6 +1946,7 @@ fn main() {
             max_warning_fix_attempts,
             file,
             unit,
+            plan_only,
             show_full_output,
         } => {
             let feature_name = feature.clone().unwrap_or_else(|| "default".to_string());
@@ -1968,6 +1972,10 @@ fn main() {
                 if let Some(unit) = unit {
                     args.push("--unit".to_string());
                     args.push(unit);
+                }
+
+                if plan_only {
+                    args.push("--plan-only".to_string());
                 }
 
                 if let Some(attempts) = max_error_fix_attempts {

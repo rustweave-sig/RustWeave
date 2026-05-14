@@ -106,10 +106,15 @@ pub fn translate_feature(
     allow_all: bool,
     target_file: Option<&str>,
     target_unit: Option<&str>,
+    plan_only: bool,
     max_error_fix_attempts: usize,
     max_warning_fix_attempts: usize,
     show_full_output: bool,
 ) -> Result<()> {
+    if plan_only {
+        return preview_translation_plan(feature, target_file, target_unit);
+    }
+
     print_workflow_header(feature);
 
     // Step 1: Initialize feature directory
@@ -186,6 +191,73 @@ pub fn translate_feature(
     git::git_gc(true);
     stats.print_summary();
     Ok(())
+}
+
+pub fn preview_translation_plan(
+    feature: &str,
+    target_file: Option<&str>,
+    target_unit: Option<&str>,
+) -> Result<()> {
+    println!(
+        "\n{}",
+        format!("Translation Plan Preview (feature: {})", feature)
+            .bright_cyan()
+            .bold()
+    );
+
+    let project_root = util::find_project_root()?;
+    let rust_dir = project_root.join(".c2rust").join(feature).join("rust");
+    if !rust_dir.is_dir() {
+        bail!(
+            "Rust workspace does not exist for feature `{}`: {}",
+            feature,
+            rust_dir.display()
+        );
+    }
+
+    let plan = load_translation_plan(feature)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Translation plan not found: .c2rust/{}/translation_plan.json; run feature reinit/update first",
+            feature
+        )
+    })?;
+    let target_files = resolve_target_files(feature, target_file, target_unit)?;
+    let selected_files = preview_selected_files(&rust_dir, target_files.as_deref())?;
+    let selected_files = sort_files_by_translation_plan(selected_files, &rust_dir, &plan);
+
+    if selected_files.is_empty() {
+        println!(
+            "{}",
+            "No empty .rs files selected for translation.".bright_green()
+        );
+        return Ok(());
+    }
+
+    let work_items = build_translation_work_items(selected_files, &rust_dir, Some(&plan));
+    print_work_item_plan(&work_items, &rust_dir);
+    Ok(())
+}
+
+fn preview_selected_files(
+    rust_dir: &Path,
+    target_files: Option<&[String]>,
+) -> Result<Vec<PathBuf>> {
+    let Some(target_files) = target_files else {
+        return file_scanner::find_empty_rs_files(rust_dir);
+    };
+
+    let mut selected = Vec::with_capacity(target_files.len());
+    for target_file in target_files {
+        let target_path = rust_dir.join(target_file);
+        if !target_path.exists() {
+            bail!(
+                "Target Rust file not found under feature workspace: {}",
+                target_file
+            );
+        }
+        selected.push(target_path);
+    }
+    Ok(selected)
 }
 
 /// Run feature initialization and project-level verification without entering
@@ -2037,6 +2109,59 @@ fn print_work_item_summary(work_items: &[TranslationWorkItem]) {
             );
         }
     }
+}
+
+fn print_work_item_plan(work_items: &[TranslationWorkItem], rust_dir: &Path) {
+    let total_files: usize = work_items
+        .iter()
+        .map(|item| match item {
+            TranslationWorkItem::Single(_) => 1,
+            TranslationWorkItem::BatchCandidateGroup { files, .. } => files.len(),
+        })
+        .sum();
+    let batch_groups = work_items
+        .iter()
+        .filter(|item| matches!(item, TranslationWorkItem::BatchCandidateGroup { .. }))
+        .count();
+
+    println!("work_items = {}", work_items.len());
+    println!("target_files = {}", total_files);
+    println!("batch_groups = {}", batch_groups);
+
+    for (idx, item) in work_items.iter().enumerate() {
+        match item {
+            TranslationWorkItem::Single(path) => {
+                println!(
+                    "item {} = single {}",
+                    idx + 1,
+                    display_relative_to(path, rust_dir)
+                );
+            }
+            TranslationWorkItem::BatchCandidateGroup {
+                unit_id,
+                reason,
+                files,
+            } => {
+                println!(
+                    "item {} = batch unit:{} files:{} reason:{}",
+                    idx + 1,
+                    unit_id,
+                    files.len(),
+                    reason
+                );
+                for file in files {
+                    println!("  file = {}", display_relative_to(file, rust_dir));
+                }
+            }
+        }
+    }
+}
+
+fn display_relative_to(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Print file processing header
@@ -4713,6 +4838,30 @@ found fn pointer"#;
                 "src/mod_a/fun_a2.rs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_preview_selected_files_keeps_non_empty_target_files() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src").join("mod_a");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let empty = src_dir.join("fun_empty.rs");
+        let done = src_dir.join("fun_done.rs");
+        fs::write(&empty, "").unwrap();
+        fs::write(&done, "pub fn done() {}\n").unwrap();
+
+        let selected = preview_selected_files(
+            &rust_dir,
+            Some(&[
+                "src/mod_a/fun_empty.rs".to_string(),
+                "src/mod_a/fun_done.rs".to_string(),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![empty, done]);
     }
 
     #[test]
