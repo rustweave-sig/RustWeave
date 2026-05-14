@@ -561,3 +561,19 @@
   - `/tmp/xxhash-bench-subbatch-findmaxmem-prompt3.log`
   - `/tmp/xxhash-batch-pointer-prompt-20260509.log`
 - batch 写回后的 warning 归因已收窄：复用 batch 输出逐目标验证时，只修当前目标 warning，不再被同 batch sibling 的 warning 反复牵引。
+
+## 2026-05-14 plan 预览与结构化观测
+
+- `translate --plan-only` 已可只读预览 plan 驱动后的执行分组。
+- `translate --plan-only --json` 已可输出结构化 work item，便于测试系统直接采集。
+- 该模式不调用大模型，不进入 verify/fix/hybrid/test，不清空已有 Rust 目标文件，也不写入 `translation_stats.json`。
+- 对 `xxHash` 当前工作区执行：
+  - `c2rust-translate translate --feature default --plan-only --json --file src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs`
+- `jq` 验证结果：
+  - `feature = "default"`
+  - `work_items = 1`
+  - `target_files = 6`
+  - `batch_groups = 1`
+  - `items[0].kind = "batch"`
+  - `items[0].files | length = 6`
+- 这使后续测试系统可以在真正调用 LLM 前记录“本轮准备翻译哪些目标、是否 batch、batch 包含哪些文件”，避免只依赖日志文本反推调度行为。

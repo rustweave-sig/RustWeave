@@ -105,9 +105,42 @@ c2rust-translate translate --feature myfeature
 # 自动处理所有文件（不提示）
 c2rust-translate translate --feature myfeature --allow-all
 
+# 只预览 plan 驱动后的执行分组，不调用大模型
+c2rust-translate translate --feature myfeature --plan-only
+
+# 预览指定文件命中的 unit / 子 batch 分组
+c2rust-translate translate --feature myfeature --plan-only --file src/mod_a/fun_example.rs
+
+# 输出结构化 JSON，供测试系统或 CI 消费
+c2rust-translate translate --feature myfeature --plan-only --json --file src/mod_a/fun_example.rs
+
 # 显示完整输出
 c2rust-translate translate --feature myfeature --show-full-output
 ```
+
+### 计划预览模式
+
+`--plan-only` 是只读预览模式：
+
+- 依赖 `.c2rust/<feature>/translation_plan.json`
+- 展示当前将要执行的 `single` / `batch` work item
+- `--file` 命中 batch candidate 时展示扩展后的 unit
+- `--file` 命中大 unit 子 batch 时只展示所属子 batch
+- 不进入初始验证、翻译、修复、hybrid build 或测试流程
+- 不调用大模型
+- 不清空已有 Rust 目标文件
+- 不写入 `translation_stats.json`
+
+`--plan-only --json` 输出结构化结果，字段包括：
+
+- `feature`
+- `work_items`
+- `target_files`
+- `batch_groups`
+- `items[].kind`
+- `items[].unit_id`
+- `items[].reason`
+- `items[].files`
 
 ### 工作流程
 1. 工具会自动查找项目根目录（包含 `.c2rust` 目录）

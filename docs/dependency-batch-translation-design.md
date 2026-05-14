@@ -9,6 +9,8 @@
 - 外层 `c2rust-xw translate` 已默认为内部翻译器注入 `C2RUST_TRANSLATE_DEP_ORDER=1`
 - `translate --file <path>` 在命中 batch candidate 时，会自动扩展到对应 unit 做批量翻译
 - `translate --unit <unit_id>` 已落地，可直接指定一个 translation unit 做批量翻译
+- `translate --plan-only` 已落地，可只读预览 plan 驱动后的执行分组
+- `translate --plan-only --json` 已落地，可输出结构化 work item，供测试系统和质量评估脚本消费
 - 批量翻译的状态单位仍然是 `fun_*.rs / var_*.rs`，不会改变后续 stats、scrub、hybrid build 的粒度
 
 在 `xxHash` 样例上的当前验证结果：
@@ -211,6 +213,14 @@
 - `c2rust-xw translate --unit <unit_id>`
   - 外层 CLI 已透传到内部 `translate`
   - 外层默认开启依赖计划调度，不要求用户手工设置 `C2RUST_TRANSLATE_DEP_ORDER=1`
+- `translate --plan-only`
+  - 只读预览当前 plan 驱动后的 `single` / `batch` work item
+  - 不进入初始验证、翻译、修复、hybrid build 或测试流程
+  - 不调用大模型，不清空已有 Rust 目标文件，不写入 `translation_stats.json`
+- `translate --plan-only --json`
+  - 输出结构化 JSON，包含 `feature`、`work_items`、`target_files`、`batch_groups` 和 `items`
+  - `items` 中包含 `kind`、`unit_id`、`reason`、`files`
+  - JSON 模式会静默目标扩展提示，保证 stdout 可直接被 `jq` / CI / 测试系统解析
 
 ## 6. 新增产物
 
@@ -558,6 +568,8 @@ batch 模式的 prompt 不应要求模型输出一个“完整 Rust 模块”，
 - `translate --unit` 已支持直接指定 unit
 - `xxHash` 上已有 `mod_cli_xsum_arch`、`mod_cli_xsum_output`、`mod_cli_xsum_os_specific` 三个通过样例
 - `batch_candidate=false` 的大 unit 已支持按 sidecar 行数切成子 batch
+- 大 unit 子 batch 已改为优先按 `translation_plan.json` 中的 `scc_groups` 保持依赖闭包，避免循环依赖目标被阈值拆散
+- `translate --plan-only` 与 `translate --plan-only --json` 已支持预览最终 work item 分组
 - 下一步不建议直接 batch `mod_cli_xsum_bench` 整体，因为该 unit 当前约 `321` 行、`28` 个 symbol，已经超过当前小文件 batch 的安全边界
 - 更合理的验证方式是用子 batch 调度逐步扩大 `mod_cli_xsum_bench`，而不是一次性把 28 个 symbol 输入给模型
 
@@ -575,6 +587,7 @@ batch 模式的 prompt 不应要求模型输出一个“完整 Rust 模块”，
 
 - 部分具备
 - `translation_plan.json` 已包含 `summary` 结构化摘要，可直接读取计划规模、batch candidate 数、依赖边数量和 SCC/循环组数量
+- `translate --plan-only --json` 已可输出本次实际将执行的 work item 分组，可直接统计 `batch_groups`、`target_files` 和每个 batch 的目标列表
 - 当前主要依赖日志中的 batch attempt、fallback、check successful、hybrid build passed 等计数
 - 后续应把这些字段沉淀进结构化 stats，便于和逐符号翻译做同口径比较
 
@@ -681,10 +694,22 @@ batch 模式的 prompt 不应要求模型输出一个“完整 Rust 模块”，
 - 如果 cargo check 只报告同 batch sibling 的 warning，当前目标不会再触发 fallback 修复
 - 该修复避免了同一个 batch 内后续变量文件反复修前面函数 warning 的噪声
 
+`2026-05-14` 进一步补齐了 plan 调度可观测性：
+
+- `translate --plan-only` 可在翻译前只读预览执行分组
+- `translate --plan-only --json` 可输出纯 JSON，供 `jq`、CI、测试系统和质量评估脚本消费
+- 对 `src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs` 的 JSON 预览显示：
+  - `work_items = 1`
+  - `target_files = 6`
+  - `batch_groups = 1`
+  - `items[0].kind = "batch"`
+  - `items[0].files` 包含 `6` 个目标
+- 该预览模式不调用大模型，不进入 verify/fix/hybrid/test，不清空已有 Rust 目标文件，也不写入 `translation_stats.json`
+
 当前仍未完成：
 
 - 这还不是完整 C 编译级项目依赖图
 - 现有 unit 边界仍主要来自当前拆分后的 `mod_xxx`
 - 当前跨 unit 顺序主要来自符号正文引用，尚未覆盖 include/macro/类型依赖/函数指针等隐式关系
-- batch 统计仍主要依赖日志，需要沉淀到结构化 stats
+- batch 成功率、fallback 率、check/hybrid/test 结果仍主要依赖日志，需要继续沉淀到结构化 stats
 - 大 unit 子 batch 的最优切分策略仍需要更多样例验证

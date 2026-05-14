@@ -56,7 +56,15 @@ c2rust-xw clean -- make clean
    - 推荐在 `C2RUST_HOME/bin/python` 提供一个可直接运行翻译脚本的 Python 3 入口，避免不同系统下 `python` / `python3` 命名差异导致的行为不一致
    - 若检测到已有翻译进度，`translate` 在选择“继续上次进度”时，只会根据“进入本次翻译命令前 `.c2rust` 是否已有未提交改动”决定是否先做快照提交；初始化验证阶段新产生的分析/构建副作用不会再单独触发这次 resume 快照
    - `translate --file <relative-rs-path>` 已恢复，可用于只处理某一个 Rust 目标文件
+   - `translate --unit <unit_id>` 可直接处理 `.c2rust/<feature>/translation_plan.json` 中的 translation unit
+   - `translate --plan-only` 只打印 plan 驱动后的执行分组，不进入翻译/修复流程，不调用大模型，不清空已有目标文件
+   - `translate --plan-only --json` 输出结构化分组结果，适合测试系统、CI 和质量评估脚本消费
    - 该能力更适合开发者调试、质量探针和定点修复验证，不应替代常规整工作区翻译主路径
+   - 示例：
+```shell
+c2rust-xw translate --feature default --plan-only --file src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs
+c2rust-xw translate --feature default --plan-only --json --file src/mod_cli_xsum_bench/fun_XSUM_findMaxMem.rs
+```
 9. 查看 feature 工作区诊断信息
 ```shell
 c2rust-xw feature status --feature default
