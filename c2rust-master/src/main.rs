@@ -182,6 +182,24 @@ struct UserEnvConfig {
     model: toml::map::Map<String, toml::Value>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TranslationPlanSummary {
+    unit_count: usize,
+    symbol_count: usize,
+    batch_candidate_count: usize,
+    unit_edge_count: usize,
+    unit_scc_group_count: usize,
+    unit_cycle_group_count: usize,
+    symbol_edge_count: usize,
+    symbol_scc_group_count: usize,
+    symbol_cycle_group_count: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TranslationPlanStatus {
+    summary: Option<TranslationPlanSummary>,
+}
+
 #[derive(Debug, Default, Serialize)]
 struct FeatureStatus {
     feature: String,
@@ -198,6 +216,9 @@ struct FeatureStatus {
     env_exists: bool,
     selected_files_exists: bool,
     stats_exists: bool,
+    translation_plan_exists: bool,
+    translation_plan_summary: Option<TranslationPlanSummary>,
+    translation_plan_summary_error: Option<String>,
     build_cmd_configured: bool,
     build_dir_configured: bool,
     clean_cmd_configured: bool,
@@ -400,6 +421,7 @@ fn load_feature_status(feature: &str) -> Result<FeatureStatus, String> {
     let env_path = get_user_env_config_path()?;
     let selected_files_path = feature_root.join("selected_files.json");
     let stats_path = feature_root.join("translation_stats.json");
+    let translation_plan_path = feature_root.join("translation_plan.json");
 
     let mut status = FeatureStatus {
         feature: feature.to_string(),
@@ -419,6 +441,22 @@ fn load_feature_status(feature: &str) -> Result<FeatureStatus, String> {
     status.env_exists = status.env_path.is_file();
     status.selected_files_exists = selected_files_path.is_file();
     status.stats_exists = stats_path.is_file();
+    status.translation_plan_exists = translation_plan_path.is_file();
+
+    if status.translation_plan_exists {
+        match fs::read_to_string(&translation_plan_path)
+            .map_err(|e| e.to_string())
+            .and_then(|content| {
+                serde_json::from_str::<TranslationPlanStatus>(&content).map_err(|e| e.to_string())
+            }) {
+            Ok(plan) => {
+                status.translation_plan_summary = plan.summary;
+            }
+            Err(e) => {
+                status.translation_plan_summary_error = Some(e);
+            }
+        }
+    }
 
     if status.config_exists {
         let config = read_toml_from_path(&status.config_path)?;
@@ -571,6 +609,29 @@ fn print_feature_status(status: &FeatureStatus) {
             "missing"
         }
     );
+    println!(
+        "translation_plan = {}",
+        if status.translation_plan_exists {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    if let Some(summary) = &status.translation_plan_summary {
+        println!(
+            "translation_plan_summary = units:{} symbols:{} batch_candidates:{} unit_edges:{} symbol_edges:{} unit_cycles:{} symbol_cycles:{}",
+            summary.unit_count,
+            summary.symbol_count,
+            summary.batch_candidate_count,
+            summary.unit_edge_count,
+            summary.symbol_edge_count,
+            summary.unit_cycle_group_count,
+            summary.symbol_cycle_group_count
+        );
+    }
+    if let Some(error) = &status.translation_plan_summary_error {
+        println!("translation_plan_summary_error = {}", error);
+    }
     println!(
         "build_config = cmd:{} dir:{}",
         if status.build_cmd_configured {
@@ -729,6 +790,11 @@ fn build_feature_phase_report(status: &FeatureStatus) -> FeaturePhaseReport {
     }
     if !status.stats_exists {
         report.warnings.push("translation_stats_missing");
+    }
+    if !status.translation_plan_exists {
+        report.warnings.push("translation_plan_missing");
+    } else if status.translation_plan_summary.is_none() {
+        report.warnings.push("translation_plan_summary_missing");
     }
     if !(status.test_cmd_configured && status.test_dir_configured) {
         report.warnings.push("test_config_incomplete");
@@ -912,11 +978,12 @@ fn print_doctor_summary(status: &FeatureStatus, report: &FeaturePhaseReport) {
 fn overall_status(report: &FeaturePhaseReport) -> &'static str {
     if !report.blocking.is_empty() {
         "blocked"
-    } else if report
-        .warnings
-        .iter()
-        .any(|warning| *warning != "translation_stats_missing")
-    {
+    } else if report.warnings.iter().any(|warning| {
+        !matches!(
+            *warning,
+            "translation_stats_missing" | "translation_plan_missing"
+        )
+    }) {
         "degraded"
     } else {
         "ready"
@@ -2138,6 +2205,18 @@ mod tests {
             python_available: true,
             python_interpreter: Some("/tmp/bin/python".to_string()),
             python_interpreter_source: Some("c2rust_home"),
+            translation_plan_exists: true,
+            translation_plan_summary: Some(TranslationPlanSummary {
+                unit_count: 8,
+                symbol_count: 446,
+                batch_candidate_count: 2,
+                unit_edge_count: 17,
+                unit_scc_group_count: 5,
+                unit_cycle_group_count: 2,
+                symbol_edge_count: 707,
+                symbol_scc_group_count: 446,
+                symbol_cycle_group_count: 0,
+            }),
             ..FeatureStatus::default()
         };
         let report = FeaturePhaseReport {
@@ -2165,6 +2244,10 @@ mod tests {
         assert!(json.contains("\"translate_dir_source\": \"c2rust_home\""));
         assert!(json.contains("\"hybrid_build_lib_source\": \"env\""));
         assert!(json.contains("\"python_interpreter_source\": \"c2rust_home\""));
+        assert!(json.contains("\"translation_plan_exists\": true"));
+        assert!(json.contains("\"translation_plan_summary\""));
+        assert!(json.contains("\"symbol_count\": 446"));
+        assert!(json.contains("\"symbol_edge_count\": 707"));
     }
 
     #[test]
@@ -2318,6 +2401,40 @@ mod tests {
         assert!(report.verify_blockers.is_empty());
         assert!(report.warnings.contains(&"recoverable_with_scrub"));
         assert!(report.warnings.contains(&"translation_stats_missing"));
+        assert!(report.warnings.contains(&"translation_plan_missing"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_feature_phase_report_marks_plan_summary_missing_as_warning() {
+        let status = FeatureStatus {
+            feature: "default".to_string(),
+            feature_root_exists: true,
+            rust_dir_exists: true,
+            c_dir_exists: true,
+            config_exists: true,
+            user_model_present: true,
+            build_cmd_configured: true,
+            build_dir_configured: true,
+            clean_cmd_configured: true,
+            clean_dir_configured: true,
+            c2rust_home_ok: true,
+            code_analyse_available: true,
+            c2rust_config_available: true,
+            translate_dir_ready: true,
+            python_available: true,
+            bindgen_available: true,
+            hybrid_build_lib_ready: true,
+            stats_exists: true,
+            translation_plan_exists: true,
+            ..FeatureStatus::default()
+        };
+        let report = build_feature_phase_report(&status);
+
+        assert!(report.blocking.is_empty());
+        assert!(report
+            .warnings
+            .contains(&"translation_plan_summary_missing"));
     }
 
     #[test]
@@ -2328,6 +2445,26 @@ mod tests {
         };
 
         assert_eq!(overall_status(&report), "ready");
+    }
+
+    #[test]
+    fn test_overall_status_keeps_translation_plan_missing_as_ready() {
+        let report = FeaturePhaseReport {
+            warnings: vec!["translation_plan_missing"],
+            ..FeaturePhaseReport::default()
+        };
+
+        assert_eq!(overall_status(&report), "ready");
+    }
+
+    #[test]
+    fn test_overall_status_marks_translation_plan_summary_missing_as_degraded() {
+        let report = FeaturePhaseReport {
+            warnings: vec!["translation_plan_summary_missing"],
+            ..FeaturePhaseReport::default()
+        };
+
+        assert_eq!(overall_status(&report), "degraded");
     }
 
     #[test]
