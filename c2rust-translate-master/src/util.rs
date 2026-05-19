@@ -29,6 +29,40 @@ pub struct FileAttemptStat {
     pub fix_attempts: usize,
     /// 是否使用了"重来"功能
     pub had_restart: bool,
+    /// 该文件完成时是否执行了 hybrid test 阶段。
+    #[serde(default)]
+    pub tests_ran: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BatchAttemptStatus {
+    Success,
+    Failed,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchAttemptStat {
+    pub unit_id: String,
+    pub batch_reason: String,
+    pub files: Vec<String>,
+    pub input_c_lines: usize,
+    pub sub_batch: bool,
+    #[serde(default)]
+    pub completed_files: usize,
+    #[serde(default)]
+    pub skipped_files: usize,
+    #[serde(default)]
+    pub translation_failed_files: usize,
+    #[serde(default)]
+    pub total_translation_attempts: usize,
+    #[serde(default)]
+    pub total_fix_attempts: usize,
+    #[serde(default)]
+    pub tests_ran_files: usize,
+    pub status: BatchAttemptStatus,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -53,6 +87,9 @@ pub struct TranslationStats {
     /// 与 `skipped_files`（用户主动/自动跳过）不同，此列表仅记录翻译命令非零退出的情况。
     #[serde(default)]
     pub translation_failed_files: Vec<String>,
+    /// 批量翻译尝试的结构化记录。
+    #[serde(default)]
+    pub batch_attempts: Vec<BatchAttemptStat>,
 }
 
 impl TranslationStats {
@@ -67,6 +104,7 @@ impl TranslationStats {
         attempts: usize,
         had_restart: bool,
         fix_attempts: usize,
+        tests_ran: bool,
     ) {
         let file_name = canonicalize_stats_file_key(&file_name);
         self.total_files += 1;
@@ -93,6 +131,7 @@ impl TranslationStats {
                 translation_attempts: attempts,
                 fix_attempts,
                 had_restart,
+                tests_ran,
             },
         );
     }
@@ -111,6 +150,69 @@ impl TranslationStats {
         if !self.translation_failed_files.contains(&file_name) {
             self.translation_failed_files.push(file_name);
         }
+    }
+
+    pub fn record_batch_attempt(
+        &mut self,
+        unit_id: String,
+        batch_reason: String,
+        files: Vec<String>,
+        input_c_lines: usize,
+        sub_batch: bool,
+        status: BatchAttemptStatus,
+        error: Option<String>,
+    ) {
+        let files: Vec<String> = files
+            .into_iter()
+            .map(|file| canonicalize_stats_file_key(&file))
+            .collect();
+        let completed_files = files
+            .iter()
+            .filter(|file| self.file_attempts.contains_key(*file))
+            .count();
+        let skipped_files = files
+            .iter()
+            .filter(|file| self.skipped_files.iter().any(|item| item == *file))
+            .count();
+        let translation_failed_files = files
+            .iter()
+            .filter(|file| {
+                self.translation_failed_files
+                    .iter()
+                    .any(|item| item == *file)
+            })
+            .count();
+        let total_translation_attempts = files
+            .iter()
+            .filter_map(|file| self.file_attempts.get(file))
+            .map(|stat| stat.translation_attempts)
+            .sum();
+        let total_fix_attempts = files
+            .iter()
+            .filter_map(|file| self.file_attempts.get(file))
+            .map(|stat| stat.fix_attempts)
+            .sum();
+        let tests_ran_files = files
+            .iter()
+            .filter_map(|file| self.file_attempts.get(file))
+            .filter(|stat| stat.tests_ran)
+            .count();
+
+        self.batch_attempts.push(BatchAttemptStat {
+            unit_id,
+            batch_reason,
+            files,
+            input_c_lines,
+            sub_batch,
+            completed_files,
+            skipped_files,
+            translation_failed_files,
+            total_translation_attempts,
+            total_fix_attempts,
+            tests_ran_files,
+            status,
+            error,
+        });
     }
 
     /// 为定点重跑清理单个目标的历史状态。
@@ -151,7 +253,10 @@ impl TranslationStats {
 
         if self.total_files == 0 {
             println!("\n{}", "No files were successfully translated.".yellow());
-            if self.skipped_files.is_empty() && self.translation_failed_files.is_empty() {
+            if self.skipped_files.is_empty()
+                && self.translation_failed_files.is_empty()
+                && self.batch_attempts.is_empty()
+            {
                 println!("\n{}", "═".repeat(80).bright_cyan());
                 return;
             }
@@ -176,6 +281,15 @@ impl TranslationStats {
             println!(
                 "  Total retries:               {}",
                 total_retries.to_string().bright_yellow()
+            );
+            let files_with_tests = self
+                .file_attempts
+                .values()
+                .filter(|stat| stat.tests_ran)
+                .count();
+            println!(
+                "  Files with hybrid tests run: {}",
+                files_with_tests.to_string().bright_green()
             );
 
             // 按重试次数分类
@@ -223,10 +337,11 @@ impl TranslationStats {
                         String::new()
                     };
                     println!(
-                        "  {} - {} translation attempt(s), {} fix attempt(s){}",
+                        "  {} - {} translation attempt(s), {} fix attempt(s), tests_ran={}{}",
                         file_name.bright_white(),
                         stat.translation_attempts.to_string().bright_cyan(),
                         stat.fix_attempts.to_string().bright_yellow(),
+                        stat.tests_ran,
                         restart_indicator
                     );
                 }
@@ -263,6 +378,60 @@ impl TranslationStats {
                 )
                 .bright_red()
             );
+        }
+
+        if !self.batch_attempts.is_empty() {
+            println!("\n{}", "Batch Attempts:".bright_magenta().bold());
+            let success = self
+                .batch_attempts
+                .iter()
+                .filter(|item| matches!(item.status, BatchAttemptStatus::Success))
+                .count();
+            let failed = self
+                .batch_attempts
+                .iter()
+                .filter(|item| matches!(item.status, BatchAttemptStatus::Failed))
+                .count();
+            let fallback = self
+                .batch_attempts
+                .iter()
+                .filter(|item| matches!(item.status, BatchAttemptStatus::Fallback))
+                .count();
+            println!(
+                "  success: {}, failed: {}, fallback: {}",
+                success.to_string().bright_green(),
+                failed.to_string().bright_red(),
+                fallback.to_string().bright_yellow()
+            );
+            for (idx, attempt) in self.batch_attempts.iter().enumerate().take(10) {
+                let status = match attempt.status {
+                    BatchAttemptStatus::Success => "success".bright_green(),
+                    BatchAttemptStatus::Failed => "failed".bright_red(),
+                    BatchAttemptStatus::Fallback => "fallback".bright_yellow(),
+                };
+                println!(
+                    "  {}. [{}] {} files={} completed={} skipped={} failed={} attempts={} fixes={} tests_ran={} lines={} sub_batch={} reason={}",
+                    idx + 1,
+                    status,
+                    attempt.unit_id,
+                    attempt.files.len(),
+                    attempt.completed_files,
+                    attempt.skipped_files,
+                    attempt.translation_failed_files,
+                    attempt.total_translation_attempts,
+                    attempt.total_fix_attempts,
+                    attempt.tests_ran_files,
+                    attempt.input_c_lines,
+                    attempt.sub_batch,
+                    attempt.batch_reason
+                );
+            }
+            if self.batch_attempts.len() > 10 {
+                println!(
+                    "  ... and {} more batch attempts",
+                    self.batch_attempts.len() - 10
+                );
+            }
         }
 
         println!("\n{}", "═".repeat(80).bright_cyan());
@@ -374,7 +543,7 @@ impl TranslationStats {
             {
                 continue;
             }
-            self.record_file_completion(file_name, 1, false, 0);
+            self.record_file_completion(file_name, 1, false, 0, false);
             changed = true;
         }
         Ok(changed)
@@ -407,6 +576,7 @@ impl TranslationStats {
         let previous_attempts = std::mem::take(&mut self.file_attempts);
         let previous_skipped = std::mem::take(&mut self.skipped_files);
         let previous_failed = std::mem::take(&mut self.translation_failed_files);
+        let previous_batch_attempts = std::mem::take(&mut self.batch_attempts);
 
         self.total_files = 0;
         self.success_first_try = 0;
@@ -431,6 +601,7 @@ impl TranslationStats {
                         existing.fix_attempts = stat.fix_attempts;
                     }
                     existing.had_restart |= stat.had_restart;
+                    existing.tests_ran |= stat.tests_ran;
                 }
             }
         }
@@ -453,6 +624,17 @@ impl TranslationStats {
         }
         for file_name in previous_failed {
             self.record_file_translation_failed(file_name);
+        }
+        for attempt in previous_batch_attempts {
+            self.record_batch_attempt(
+                attempt.unit_id,
+                attempt.batch_reason,
+                attempt.files,
+                attempt.input_c_lines,
+                attempt.sub_batch,
+                attempt.status,
+                attempt.error,
+            );
         }
 
         let after = serde_json::to_string(self).ok();
@@ -810,6 +992,7 @@ mod tests {
         assert_eq!(stats.restart_count, 0);
         assert!(stats.file_attempts.is_empty());
         assert!(stats.skipped_files.is_empty());
+        assert!(stats.batch_attempts.is_empty());
     }
 
     #[test]
@@ -822,7 +1005,7 @@ mod tests {
     #[test]
     fn test_record_file_completion_first_try() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("foo.rs".to_string(), 1, false, 0);
+        stats.record_file_completion("foo.rs".to_string(), 1, false, 0, false);
 
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.success_first_try, 1);
@@ -838,7 +1021,7 @@ mod tests {
     #[test]
     fn test_record_file_completion_retry_1() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("bar.rs".to_string(), 2, false, 3);
+        stats.record_file_completion("bar.rs".to_string(), 2, false, 3, false);
 
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.success_first_try, 0);
@@ -852,7 +1035,7 @@ mod tests {
     #[test]
     fn test_record_file_completion_retry_2() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("baz.rs".to_string(), 3, false, 5);
+        stats.record_file_completion("baz.rs".to_string(), 3, false, 5, false);
 
         assert_eq!(stats.success_retry_2, 1);
     }
@@ -860,7 +1043,7 @@ mod tests {
     #[test]
     fn test_record_file_completion_retry_3_plus() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("qux.rs".to_string(), 4, false, 8);
+        stats.record_file_completion("qux.rs".to_string(), 4, false, 8, false);
 
         assert_eq!(stats.success_retry_3_plus, 1);
     }
@@ -868,7 +1051,7 @@ mod tests {
     #[test]
     fn test_record_file_completion_with_restart() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("restart.rs".to_string(), 2, true, 2);
+        stats.record_file_completion("restart.rs".to_string(), 2, true, 2, false);
 
         assert_eq!(stats.restart_count, 1);
 
@@ -879,10 +1062,10 @@ mod tests {
     #[test]
     fn test_translation_stats_percentage() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("a.rs".to_string(), 1, false, 0);
-        stats.record_file_completion("b.rs".to_string(), 1, false, 0);
-        stats.record_file_completion("c.rs".to_string(), 1, false, 0);
-        stats.record_file_completion("d.rs".to_string(), 2, false, 1);
+        stats.record_file_completion("a.rs".to_string(), 1, false, 0, false);
+        stats.record_file_completion("b.rs".to_string(), 1, false, 0, false);
+        stats.record_file_completion("c.rs".to_string(), 1, false, 0, false);
+        stats.record_file_completion("d.rs".to_string(), 2, false, 1, false);
 
         assert_eq!(stats.total_files, 4);
         assert!((stats.percentage(3) - 75.0).abs() < f64::EPSILON);
@@ -892,9 +1075,9 @@ mod tests {
     #[test]
     fn test_translation_stats_multiple_files() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("a.rs".to_string(), 1, false, 0);
-        stats.record_file_completion("b.rs".to_string(), 2, true, 3);
-        stats.record_file_completion("c.rs".to_string(), 3, false, 5);
+        stats.record_file_completion("a.rs".to_string(), 1, false, 0, false);
+        stats.record_file_completion("b.rs".to_string(), 2, true, 3, false);
+        stats.record_file_completion("c.rs".to_string(), 3, false, 5, false);
 
         assert_eq!(stats.total_files, 3);
         assert_eq!(stats.success_first_try, 1);
@@ -940,6 +1123,37 @@ mod tests {
         assert!(stats.skipped_files.is_empty());
     }
 
+    #[test]
+    fn test_record_batch_attempt() {
+        let mut stats = TranslationStats::new();
+        stats.record_file_completion("fun_a.rs".to_string(), 2, false, 3, true);
+        stats.record_file_skipped("var_b.rs".to_string());
+        stats.record_batch_attempt(
+            "mod_a".to_string(),
+            "small unit".to_string(),
+            vec!["fun_a.rs".to_string(), "var_b.rs".to_string()],
+            42,
+            true,
+            BatchAttemptStatus::Success,
+            None,
+        );
+
+        assert_eq!(stats.batch_attempts.len(), 1);
+        let attempt = &stats.batch_attempts[0];
+        assert_eq!(attempt.unit_id, "mod_a");
+        assert_eq!(attempt.files, vec!["src/fun_a.rs", "src/var_b.rs"]);
+        assert_eq!(attempt.input_c_lines, 42);
+        assert!(attempt.sub_batch);
+        assert_eq!(attempt.completed_files, 1);
+        assert_eq!(attempt.skipped_files, 1);
+        assert_eq!(attempt.translation_failed_files, 0);
+        assert_eq!(attempt.total_translation_attempts, 2);
+        assert_eq!(attempt.total_fix_attempts, 3);
+        assert_eq!(attempt.tests_ran_files, 1);
+        assert_eq!(attempt.status, BatchAttemptStatus::Success);
+        assert!(attempt.error.is_none());
+    }
+
     // ========================================================================
     // TranslationStats Persistence Tests
     // ========================================================================
@@ -949,8 +1163,8 @@ mod tests {
         let mut stats = TranslationStats::new();
         assert!(stats.get_completed_files().is_empty());
 
-        stats.record_file_completion("a.rs".to_string(), 1, false, 0);
-        stats.record_file_completion("b.rs".to_string(), 2, true, 3);
+        stats.record_file_completion("a.rs".to_string(), 1, false, 0, false);
+        stats.record_file_completion("b.rs".to_string(), 2, true, 3, false);
 
         let mut completed = stats.get_completed_files();
         completed.sort();
@@ -967,8 +1181,8 @@ mod tests {
 
         // Build stats
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("src/foo.rs".to_string(), 1, false, 0);
-        stats.record_file_completion("src/bar.rs".to_string(), 2, true, 5);
+        stats.record_file_completion("src/foo.rs".to_string(), 1, false, 0, false);
+        stats.record_file_completion("src/bar.rs".to_string(), 2, true, 5, false);
         stats.record_file_skipped("src/skip.rs".to_string());
 
         // Save directly to the expected path (bypassing find_project_root)
@@ -992,9 +1206,18 @@ mod tests {
     #[test]
     fn test_stats_json_roundtrip() {
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("x.rs".to_string(), 3, true, 7);
+        stats.record_file_completion("x.rs".to_string(), 3, true, 7, false);
         stats.record_file_skipped("y.rs".to_string());
         stats.record_file_translation_failed("z.rs".to_string());
+        stats.record_batch_attempt(
+            "mod_a".to_string(),
+            "batch".to_string(),
+            vec!["fun_x.rs".to_string()],
+            10,
+            false,
+            BatchAttemptStatus::Fallback,
+            Some("fallback".to_string()),
+        );
 
         let json = serde_json::to_string(&stats).unwrap();
         let restored: TranslationStats = serde_json::from_str(&json).unwrap();
@@ -1004,11 +1227,17 @@ mod tests {
         assert_eq!(restored.restart_count, 1);
         assert_eq!(restored.skipped_files, vec!["src/y.rs"]);
         assert_eq!(restored.translation_failed_files, vec!["src/z.rs"]);
+        assert_eq!(restored.batch_attempts.len(), 1);
+        assert_eq!(
+            restored.batch_attempts[0].status,
+            BatchAttemptStatus::Fallback
+        );
 
         let entry = restored.file_attempts.get("src/x.rs").unwrap();
         assert_eq!(entry.translation_attempts, 3);
         assert_eq!(entry.fix_attempts, 7);
         assert!(entry.had_restart);
+        assert!(!entry.tests_ran);
     }
 
     #[test]
@@ -1057,7 +1286,7 @@ mod tests {
         .unwrap();
 
         let mut stats = TranslationStats::new();
-        stats.record_file_completion("src/mod_a/fun_done.rs".to_string(), 2, true, 3);
+        stats.record_file_completion("src/mod_a/fun_done.rs".to_string(), 2, true, 3, false);
 
         let changed = stats.reconcile_with_workspace(&rust_dir).unwrap();
 
@@ -1088,6 +1317,7 @@ mod tests {
                 translation_attempts: 2,
                 fix_attempts: 3,
                 had_restart: true,
+                tests_ran: false,
             },
         );
         stats.normalize_file_keys();
@@ -1109,6 +1339,7 @@ mod tests {
                 translation_attempts: 1,
                 fix_attempts: 0,
                 had_restart: false,
+                tests_ran: false,
             },
         );
         stats.skipped_files.push("mod_a/fun_done.rs".to_string());

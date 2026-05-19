@@ -553,9 +553,9 @@ fn build_progress_state(
 }
 
 fn should_use_translation_plan_order() -> bool {
-    matches!(
+    !matches!(
         std::env::var("C2RUST_TRANSLATE_DEP_ORDER").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
+        Ok("0") | Ok("false") | Ok("FALSE")
     )
 }
 
@@ -1865,6 +1865,8 @@ fn process_selected_files(
             );
             if let Err(err) = process_batch_candidate_group(
                 feature,
+                unit_id,
+                reason,
                 files,
                 rust_dir,
                 progress_state,
@@ -1883,6 +1885,16 @@ fn process_selected_files(
                     )
                     .bright_yellow()
                 );
+                stats.record_batch_attempt(
+                    unit_id.clone(),
+                    reason.clone(),
+                    batch_relative_file_names(files, rust_dir),
+                    batch_input_c_line_count(files),
+                    files.len() > 1,
+                    util::BatchAttemptStatus::Fallback,
+                    Some(err.to_string()),
+                );
+                save_stats_or_warn(stats, feature);
                 for rs_file in files {
                     process_single_selected_file(
                         feature,
@@ -2011,6 +2023,8 @@ fn process_single_selected_file_with_mode(
 
 fn process_batch_candidate_group(
     feature: &str,
+    unit_id: &str,
+    batch_reason: &str,
     rs_files: &[PathBuf],
     rust_dir: &Path,
     progress_state: &mut util::ProgressState,
@@ -2066,6 +2080,41 @@ fn process_batch_candidate_group(
             TranslationInputMode::ReuseExistingRust,
         )?;
     }
+
+    let files = batch_relative_file_names(rs_files, rust_dir);
+    let failed_files: Vec<String> = files
+        .iter()
+        .filter(|file| {
+            stats.skipped_files.iter().any(|item| item == *file)
+                || stats
+                    .translation_failed_files
+                    .iter()
+                    .any(|item| item == *file)
+        })
+        .cloned()
+        .collect();
+    let (status, error) = if failed_files.is_empty() {
+        (util::BatchAttemptStatus::Success, None)
+    } else {
+        (
+            util::BatchAttemptStatus::Failed,
+            Some(format!(
+                "symbol-level validation did not complete for: {}",
+                failed_files.join(", ")
+            )),
+        )
+    };
+
+    stats.record_batch_attempt(
+        unit_id.to_string(),
+        batch_reason.to_string(),
+        files,
+        batch_input_c_line_count(rs_files),
+        rs_files.len() > 1,
+        status,
+        error,
+    );
+    save_stats_or_warn(stats, feature);
     Ok(())
 }
 
@@ -2103,6 +2152,34 @@ fn write_batch_c_unit_file(batch_root: &Path, rs_files: &[PathBuf]) -> Result<Pa
         )
     })?;
     Ok(c_file)
+}
+
+fn batch_input_c_line_count(rs_files: &[PathBuf]) -> usize {
+    rs_files
+        .iter()
+        .map(|file| {
+            std::fs::read_to_string(file.with_extension("c"))
+                .map(|source| source.lines().count())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn batch_relative_file_names(rs_files: &[PathBuf], rust_dir: &Path) -> Vec<String> {
+    rs_files
+        .iter()
+        .map(|file| {
+            file.strip_prefix(rust_dir)
+                .ok()
+                .and_then(|path| path.to_str())
+                .unwrap_or_else(|| {
+                    file.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("<unknown>")
+                })
+                .to_string()
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -2463,6 +2540,7 @@ fn process_rs_file(
                     attempt_number,
                     had_restart,
                     total_fix_attempts,
+                    tests_ran,
                 );
                 return Ok(tests_ran);
             }
@@ -3699,6 +3777,20 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_translation_plan_order_enabled_by_default() {
+        let _guard = EnvGuard::remove("C2RUST_TRANSLATE_DEP_ORDER");
+        assert!(should_use_translation_plan_order());
+    }
+
+    #[test]
+    #[serial]
+    fn test_translation_plan_order_can_be_disabled() {
+        let _guard = EnvGuard::set("C2RUST_TRANSLATE_DEP_ORDER", "0");
+        assert!(!should_use_translation_plan_order());
     }
 
     struct CurrentDirGuard {
