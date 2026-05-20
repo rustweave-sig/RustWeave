@@ -211,6 +211,26 @@ where
             }
         }
     } else {
+        if is_warning {
+            let all_diagnostic_files =
+                crate::error_handler::parse_all_error_for_files(message, feature).unwrap_or_default();
+            let current_file_in_diagnostics = all_diagnostic_files
+                .iter()
+                .any(|msg_file| same_file_path(msg_file, rs_file));
+            let other_diagnostic_files_exist = all_diagnostic_files
+                .iter()
+                .any(|msg_file| !same_file_path(msg_file, rs_file));
+
+            if !current_file_in_diagnostics && other_diagnostic_files_exist {
+                println!(
+                    "│ {}",
+                    "Diagnostics belong to non-translatable sibling file(s); skipping fallback warning fix for current file."
+                        .bright_yellow()
+                );
+                return Ok(0);
+            }
+        }
+
         // Fall back to single-file fix
         if is_warning {
             match crate::apply_warning_fix(
@@ -934,6 +954,52 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    /// AllFiles scope should also avoid falling back to the current translatable file
+    /// when diagnostics only point at a non-translatable sibling such as `mod.rs`.
+    #[test]
+    #[serial_test::serial]
+    fn test_apply_fixes_for_messages_all_files_scope_ignores_non_translatable_sibling_warning() {
+        use std::env;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let orig_dir = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+        let _restore = scopeguard::guard(orig_dir, |dir| {
+            let _ = env::set_current_dir(dir);
+        });
+
+        let feature = "test_feature";
+        let feature_src_dir = tmp
+            .path()
+            .join(".c2rust")
+            .join(feature)
+            .join("rust")
+            .join("src");
+        std::fs::create_dir_all(&feature_src_dir).unwrap();
+
+        let current_rs = feature_src_dir.join("fun_current.rs");
+        let sibling_mod = feature_src_dir.join("mod.rs");
+        std::fs::write(&current_rs, "use super::*;\n").unwrap();
+        std::fs::write(&sibling_mod, "pub fn helper() {}\n").unwrap();
+
+        let result = apply_fixes_for_messages(
+            "warning: unnecessary transmute\n  --> src/mod.rs:5:18",
+            &anyhow::anyhow!("dummy"),
+            feature,
+            "fun",
+            &current_rs,
+            &|op: &str| op.to_string(),
+            false,
+            true,
+            FixMessageScope::AllFiles,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&current_rs).unwrap(), "use super::*;\n");
     }
 
     /// Test that execute_code_warning_check_with_fix_loop returns Ok(0) when the build fails
