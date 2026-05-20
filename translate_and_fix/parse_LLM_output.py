@@ -27,6 +27,27 @@ def normalize_pretty_function_identifier(text):
     replacement = f'b"{fn_name}\\\\0".as_ptr() as *const ::core::ffi::c_char'
     return re.sub(r'\b__PRETTY_FUNCTION__\b', replacement, text)
 
+
+def strip_trailing_translation_markers(text):
+    """
+    删除模型偶发附带在代码末尾的结束标记，避免污染 Rust 文件。
+
+    典型样式：
+    - Rust翻译结果结束
+    - 翻译结果结束
+    """
+    end_marker_pattern = re.compile(
+        r'^\s*(?:Rust翻译结果结束|翻译结果结束)\s*[：:，,。.!！?？]*\s*$'
+    )
+
+    kept_lines = []
+    for line in text.split('\n'):
+        if end_marker_pattern.match(line):
+            break
+        kept_lines.append(line)
+
+    return '\n'.join(kept_lines).rstrip()
+
 def filter_model_response(response):
     """
     过滤大模型回复中开头的额外内容，保留符合prompt要求的输出格式，并移除'Rust翻译结果:'前缀
@@ -141,6 +162,12 @@ def filter_model_response(response):
         final_response = re.sub(r'```\s*', '', final_response)
     except Exception as e:
         raise RuntimeError(f"ERROR - 过滤大模型输出-删除代码块标记符出错: {e}") from e
+
+    # 移除尾部“Rust翻译结果结束”等结束标记
+    try:
+        final_response = strip_trailing_translation_markers(final_response)
+    except Exception as e:
+        raise RuntimeError(f"ERROR - 过滤大模型输出-删除尾部翻译结束标记出错: {e}") from e
 
     # 规范化 Rust 2024 下需要 unsafe 包裹的属性
     try:

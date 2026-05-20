@@ -10,9 +10,9 @@ use crate::{builder, file_scanner, interaction, suggestion, translator, util};
 /// 从错误消息中按出现顺序提取文件路径字符串
 /// 只提取 error 和 warning 级别诊断中引用的文件路径
 /// 过滤掉 note、help、suggestion 等辅助级别的文件路径引用
-/// 仅提取文件名以 fun_ 或 var_ 开头的文件
+/// 当 `translatable_only` 为 true 时，仅提取文件名以 fun_ 或 var_ 开头的文件
 /// 返回去重后的路径列表（按首次出现顺序排列），确保同一文件不会被多次处理
-fn collect_error_level_file_paths(error_msg: &str) -> Vec<String> {
+fn collect_error_level_file_paths_impl(error_msg: &str, translatable_only: bool) -> Vec<String> {
     lazy_static::lazy_static! {
         static ref ERROR_WARNING_LEVEL_RE: regex::Regex =
             regex::Regex::new(r"^(?:error|warning)(?:\[.*?\])?[:\s]")
@@ -41,13 +41,15 @@ fn collect_error_level_file_paths(error_msg: &str) -> Vec<String> {
             if let Some(cap) = FILE_PATH_LINE_RE.captures(line) {
                 if let Some(path_match) = cap.get(1) {
                     let path_str = path_match.as_str().to_string();
-                    // 只提取文件名以 fun_ 或 var_ 开头的文件
-                    let file_stem = std::path::Path::new(&path_str)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    if !file_stem.starts_with("fun_") && !file_stem.starts_with("var_") {
-                        continue;
+                    if translatable_only {
+                        // 仅提取文件名以 fun_ 或 var_ 开头的可翻译文件
+                        let file_stem = std::path::Path::new(&path_str)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("");
+                        if !file_stem.starts_with("fun_") && !file_stem.starts_with("var_") {
+                            continue;
+                        }
                     }
                     if seen.insert(path_str.clone()) {
                         paths.push(path_str);
@@ -60,10 +62,24 @@ fn collect_error_level_file_paths(error_msg: &str) -> Vec<String> {
     paths
 }
 
+/// 提取错误/警告级别中、且文件名以 fun_ 或 var_ 开头的路径。
+fn collect_error_level_file_paths(error_msg: &str) -> Vec<String> {
+    collect_error_level_file_paths_impl(error_msg, true)
+}
+
+/// 提取错误/警告级别中出现的全部 Rust 文件路径，不限制 fun_/var_ 前缀。
+pub(crate) fn collect_all_error_level_file_paths(error_msg: &str) -> Vec<String> {
+    collect_error_level_file_paths_impl(error_msg, false)
+}
+
 /// 解析错误消息以提取 Rust 文件路径
 /// 返回在错误消息中找到的文件路径列表
 /// 过滤为仅包含项目内的文件
-pub(crate) fn parse_error_for_files(error_msg: &str, feature: &str) -> Result<Vec<PathBuf>> {
+fn parse_error_for_files_impl(
+    error_msg: &str,
+    feature: &str,
+    translatable_only: bool,
+) -> Result<Vec<PathBuf>> {
     // 验证特性名称以防止路径遍历
     util::validate_feature_name(feature)?;
 
@@ -73,7 +89,13 @@ pub(crate) fn parse_error_for_files(error_msg: &str, feature: &str) -> Result<Ve
 
     let mut file_paths = HashSet::new();
 
-    for path_str in collect_error_level_file_paths(error_msg) {
+    let diagnostic_paths = if translatable_only {
+        collect_error_level_file_paths(error_msg)
+    } else {
+        collect_all_error_level_file_paths(error_msg)
+    };
+
+    for path_str in diagnostic_paths {
         let path = PathBuf::from(&path_str);
 
         // 尝试原样路径和相对于 rust_dir 的路径
@@ -100,6 +122,16 @@ pub(crate) fn parse_error_for_files(error_msg: &str, feature: &str) -> Result<Ve
     result.sort();
 
     Ok(result)
+}
+
+/// 解析错误消息以提取可翻译 Rust 文件路径（fun_/var_）。
+pub(crate) fn parse_error_for_files(error_msg: &str, feature: &str) -> Result<Vec<PathBuf>> {
+    parse_error_for_files_impl(error_msg, feature, true)
+}
+
+/// 解析错误消息以提取项目内所有被诊断引用的 Rust 文件路径，不限制 fun_/var_ 前缀。
+pub(crate) fn parse_all_error_for_files(error_msg: &str, feature: &str) -> Result<Vec<PathBuf>> {
+    parse_error_for_files_impl(error_msg, feature, false)
 }
 
 /// 从错误消息中提取特定文件的错误块
