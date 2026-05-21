@@ -5,8 +5,8 @@
 当前设计已经从方案推进到可验证实现，核心状态如下：
 
 - `code_analyse` 已能在 feature 工作区生成真实的 `.c2rust/<feature>/translation_plan.json`
-- `translate` 已能消费该计划，并在 `C2RUST_TRANSLATE_DEP_ORDER=1` 时按 plan 调度
-- 外层 `c2rust-xw translate` 已默认为内部翻译器注入 `C2RUST_TRANSLATE_DEP_ORDER=1`
+- `translate` 已默认消费该计划并按 plan 调度
+- 可通过 `C2RUST_TRANSLATE_DEP_ORDER=0/false` 显式关闭 plan 调度以回退旧行为
 - `translate --file <path>` 在命中 batch candidate 时，会自动扩展到对应 unit 做批量翻译
 - `translate --unit <unit_id>` 已落地，可直接指定一个 translation unit 做批量翻译
 - `translate --plan-only` 已落地，可只读预览 plan 驱动后的执行分组
@@ -323,9 +323,9 @@
 
 ## 7. 批量候选判定
 
-建议引入环境变量：
+当前相关配置项：
 
-- `C2RUST_TRANSLATE_DEP_ORDER=1`
+- `C2RUST_TRANSLATE_DEP_ORDER=0/false`：显式关闭 plan 调度；未设置时默认启用
 - `C2RUST_TRANSLATE_BATCH_ENABLE=1`
 - `C2RUST_TRANSLATE_BATCH_MAX_C_LINES=100`
 - `C2RUST_TRANSLATE_BATCH_MAX_SYMBOLS=6`
@@ -355,7 +355,7 @@
 
 当前已落地部分：
 
-- `translate` 在 `C2RUST_TRANSLATE_DEP_ORDER=1` 时，会优先使用 plan 中的 `symbols` 顺序
+- `translate` 默认会优先使用 plan 中的 `symbols` 顺序；仅在 `C2RUST_TRANSLATE_DEP_ORDER=0/false` 时关闭
 - 这意味着同一个 unit 内部，不再单纯按空文件路径排序
 - plan 中的 `symbols` 顺序应是依赖优先顺序，即被调用 helper/wrapper 在调用者之前
 
@@ -585,11 +585,15 @@ batch 模式的 prompt 不应要求模型输出一个“完整 Rust 模块”，
 
 当前状态：
 
-- 部分具备
+- 已具备第一版结构化记录
 - `translation_plan.json` 已包含 `summary` 结构化摘要，可直接读取计划规模、batch candidate 数、依赖边数量和 SCC/循环组数量
 - `translate --plan-only --json` 已可输出本次实际将执行的 work item 分组，可直接统计 `batch_groups`、`target_files` 和每个 batch 的目标列表
-- 当前主要依赖日志中的 batch attempt、fallback、check successful、hybrid build passed 等计数
-- 后续应把这些字段沉淀进结构化 stats，便于和逐符号翻译做同口径比较
+- `translation_stats.json` 已新增 `batch_attempts`，用于记录 batch/sub-batch 的 `unit_id`、`batch_reason`、目标文件列表、输入 C 行数、是否 sub-batch、状态和错误信息
+- batch 状态当前分为 `Success`、`Failed`、`Fallback`
+- `Success` 只在 batch 输出写回且该组所有目标完成后续符号级验证后记录
+- `Fallback` 表示 batch 路径未能闭环，随后回退到逐符号流程
+- `Failed` 表示 batch 输出写回后进入符号级验证，但该组内存在未完成、skip 或 translation_failed 目标
+- 后续仍需把 check / fix / hybrid / test 的分阶段结果细化为每个 batch attempt 内的子字段，便于和逐符号翻译做同口径比较
 
 ## 14. 推荐的首个验证对象
 
@@ -706,10 +710,22 @@ batch 模式的 prompt 不应要求模型输出一个“完整 Rust 模块”，
   - `items[0].files` 包含 `6` 个目标
 - 该预览模式不调用大模型，不进入 verify/fix/hybrid/test，不清空已有 Rust 目标文件，也不写入 `translation_stats.json`
 
+最新验证结果：
+
+- 在临时探针副本 `xxHash-batch-stats-probe2-20260519` 中，`translate --file src/mod_cli_xsum_arch/fun_XSUM_autox86.rs --allow-all` 已实际进入 batch 路径
+- `translation_stats.json` 已落盘一条 `batch_attempts` 记录，状态为 `Success`
+- 该条记录显示：
+  - `unit_id = mod_cli_xsum_arch`
+  - `files = 2`
+  - `completed_files = 2`
+  - `total_translation_attempts = 2`
+  - `total_fix_attempts = 0`
+  - `tests_ran_files = 0`
+
 当前仍未完成：
 
 - 这还不是完整 C 编译级项目依赖图
 - 现有 unit 边界仍主要来自当前拆分后的 `mod_xxx`
 - 当前跨 unit 顺序主要来自符号正文引用，尚未覆盖 include/macro/类型依赖/函数指针等隐式关系
-- batch 成功率、fallback 率、check/hybrid/test 结果仍主要依赖日志，需要继续沉淀到结构化 stats
+- batch 成功率、fallback 率已具备基础结构化来源，但 check/fix/hybrid/test 分阶段结果仍需要继续细化到 `batch_attempts`
 - 大 unit 子 batch 的最优切分策略仍需要更多样例验证
