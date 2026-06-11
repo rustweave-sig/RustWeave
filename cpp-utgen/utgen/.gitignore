@@ -1,0 +1,14 @@
+.vscode/
+__pycache__/
+test/
+*.txt
+*.cpp
+*.json
+*.xml
+*.yaml
+*.csv
+*.bak
+chat.py
+test.py
+scripts.py
+config_private.py

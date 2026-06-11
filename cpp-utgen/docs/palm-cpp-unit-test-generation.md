@@ -1,0 +1,929 @@
+# 基于大模型的 C/C++ 单元测试生成说明与运行指南
+
+本文说明本项目面向 C/C++ 项目的 PALM 单元测试生成流程，包括技术路线、核心概念、模块职责、数据流、输出产物和运行步骤。
+
+## 1. 项目目标
+
+本项目面向 C/C++ 项目自动生成 GoogleTest/GoogleMock 单元测试。核心目标是：在给定被测函数的路径约束、上下文代码和必要 Mock 需求后，利用大语言模型生成更容易通过编译、覆盖更多路径的单元测试用例，并通过编译错误反馈对失败测试进行迭代修复。
+
+C/C++ 单元测试生成相比只给源码片段的普通代码生成有几个典型难点：
+
+- 编译环境复杂：头文件、宏、编译选项、链接目标、CMake 构建目录和编译数据库都会影响测试是否可编译。
+- 依赖上下文复杂：被测函数可能依赖类成员、构造函数、析构函数、继承关系、模板实例、全局变量、别名、命名空间和其他函数。
+- 路径约束隐含：模型只看函数源码时，容易遗漏复杂分支、循环、`switch`、短路逻辑和返回值路径。
+- Mock 需求难判断：路径上的函数调用可能决定分支条件，模型需要知道哪些类方法或自由函数要用 gMock 构造期望行为。
+- 结果统计依赖构建系统：测试生成后需要逐个编译、运行并收集行覆盖率和分支覆盖率。
+
+PALM 的整体思路是把程序分析结果纳入 Prompt 构建过程：先用 Clang Tooling 提取条件链和 Mock 需求，再构建被测函数上下文，随后让 LLM 按路径生成测试，并用 CMake/CTest/覆盖率工具验证生成结果。
+
+## 2. 总体技术路线
+
+![PALM C/C++ 技术路线图](assets/palm-cpp-tech-route.png)
+
+整体流程可以概括为四步：
+
+1. 测试需求提取：`brinfo` 基于 Clang AST 构建被测函数 CFG，遍历分支和循环路径，提取路径条件链、返回值和 Mock 需求，输出 `llm_reqs/*_req.json`。
+2. 上下文构建：`focxt` 分析项目中的类型、函数、宏、include、全局变量、构造函数、方法和调用依赖，输出 `project_cxt.json`。
+3. Prompt 设计与生成：`utgen` 读取条件链和上下文，将其填充到 Prompt 模板中，形成无需求、上下文增强、需求增强、需求+上下文增强四类生成配置。
+4. 单元测试生成与修复：`utgen` 调用 LLM 生成 GoogleTest 测试文件，写入 `llm_tests*` 目录，生成 CMake 目标，编译、运行、统计覆盖率；可选地用 `chattester.py` 或 `rust_assistant.py` 进行编译错误修复。
+
+```mermaid
+flowchart LR
+    A["目标 C/C++ 项目"] --> B["CMake 配置"]
+    B --> C["compile_commands.json"]
+    C --> D["include-finder: 项目内头文件"]
+    C --> E["brinfo: AST + CFG 路径分析"]
+    C --> F["focxt: 定义与上下文分析"]
+    D --> G["includes.json"]
+    E --> H["llm_reqs/*_req.json"]
+    F --> I["project_cxt.json"]
+    H --> J["utgen: Prompt 构建"]
+    I --> J
+    G --> J
+    J --> K["LLM 生成 GoogleTest"]
+    K --> L["llm_tests / llm_tests_cxt / llm_tests_req / llm_tests_req_cxt"]
+    L --> M["CMake 编译筛选"]
+    M --> N["CTest + Coverage"]
+    M --> O["LLM 编译错误修复"]
+    O --> M
+    N --> P["result*.csv"]
+```
+
+## 3. 核心概念
+
+### 3.1 条件链
+
+条件链是被测函数某一条执行路径上的约束集合。`brinfo` 通过 Clang CFG 遍历路径，在遇到 `if`、三目表达式、逻辑二元表达式、`switch/case/default`、`for/while/do while/range-for` 等控制流节点时记录路径条件；当到达出口基本块时，将沿途条件按顺序组合成一条条件链。
+
+![CFG 与条件链示意](assets/palm-cpp-cfg-condition-chain.png)
+
+![条件链表示示意](assets/palm-cpp-condition-chain-table.png)
+
+`llm_reqs/<file>_req.json` 中每个函数会包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 函数或方法名。 |
+| `namespace` | 函数所在命名空间，后续用于生成 `using namespace`。 |
+| `operator` | 是否为重载运算符；主流程会跳过重载运算符。 |
+| `decl_file` | 函数声明或定义所在文件的真实路径。 |
+| `class` | 所属类名；自由函数为空字符串。 |
+| `loc` | 函数在源文件中的起止行号。 |
+| `input` | 参数名和参数类型描述。 |
+| `chains` | 条件链集合。 |
+
+每条条件链通常包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `preconditions` | 路径上的前置条件列表。每个条件包含 `condition`、`value` 和 `last_def`。 |
+| `mock` | 路径上与条件相关的函数调用及其 Mock 需求。 |
+| `result` | 路径返回值提示，例如 `a bool value: true`。 |
+| `mincover` | 是否属于最小覆盖路径集合。 |
+| `incatch` | 是否来自 try/catch 相关路径。 |
+
+### 3.2 路径最小化
+
+一个函数的路径数量会随分支数量增长而快速膨胀。`brinfo` 使用贪心集合覆盖近似算法选择代表路径：
+
+1. 收集所有非矛盾条件链覆盖到的条件集合。
+2. 每轮选择能覆盖最多未覆盖条件的路径。
+3. 将该路径加入最小覆盖集合，并移除它覆盖的条件。
+4. 重复直到所有条件都被覆盖，或没有可继续选择的路径。
+
+![路径集合最小化算法](assets/palm-cpp-path-minimization.png)
+
+在 Python 主流程中，只有 `mincover = true` 的条件链会被用于按路径生成测试。为了控制成本和噪音，当前实现还会跳过条件链过少或最小覆盖路径过多的函数：
+
+```python
+MIN_CHAIN_NUM = 2
+MAX_MIN_COVER = 20
+```
+
+也就是说，主流程只处理非重载运算符、条件链数量大于 2、最小覆盖路径数量不超过 20 的函数。
+
+### 3.3 Mock 需求
+
+Mock 需求来自条件链路径上的函数调用。`brinfo` 会记录路径中出现的 `CallExpr` 和 `CXXMemberCallExpr`，并判断该调用是否直接影响某个条件约束或变量定义。
+
+对每个需要 Mock 的调用，JSON 中会记录：
+
+| 字段 | 说明 |
+| --- | --- |
+| `function` | 被调用函数名。 |
+| `return` | 返回类型；`void` 时为空。 |
+| `return_ref` | 返回值是否为引用类型，用于提示 `testing::ReturnRef()`。 |
+| `static` | 是否为静态函数。 |
+| `virtual` | 是否为虚函数。 |
+| `user` | 被调用函数是否来自项目源码。 |
+| `actions` | 该调用需要满足的条件效果，例如某次调用后某个条件为真。 |
+
+`utgen/condchain.py` 会把这些结构转成自然语言测试需求。例如：
+
+```text
+// Mock SomeClass::foo which returns a int.
+// It is a non-static function, you should mock it like Example A.
+// It should be called 1 time(s) with the following effect(s): ...
+```
+
+目前生成侧主要支持对项目内虚成员函数生成 gMock mock class；自由函数和静态函数的 Mock 提示保留在 Prompt 设计中，但生成质量依赖模型和具体项目结构。
+
+### 3.4 上下文
+
+上下文用于让 LLM 知道如何构造可编译的测试。`focxt` 会从 AST 中提取被测函数及其依赖的代码片段，并输出到 `project_cxt.json`。
+
+![上下文构建示意](assets/palm-cpp-context-construction.png)
+
+上下文主要包括：
+
+- 当前文件中的 `#include`。
+- 项目内定义的宏。
+- 全局变量和命名空间。
+- 类型别名。
+- 类、结构体、union、enum 的定义。
+- 字段、基类、构造函数、析构函数和成员方法。
+- 自由函数定义或声明。
+- 模板参数和已有特化参数提示。
+- 被测函数直接或间接使用的类型和函数依赖。
+- 已有测试宏，可选用于 ChatTester 或测试上下文增强。
+
+`utgen/context.py` 会进一步把 JSON 结构转成 Prompt 中可读的 C/C++ 代码片段，例如：
+
+- `FocalCxt`：被测函数上下文，包括 include、define、namespace、类型、函数和方法。
+- `TestCxt`：已有测试上下文，包含可能可复用的 `TEST` 宏片段。
+- `RecordCxt`、`EnumCxt`、`NameSpaceCxt`：分别负责格式化类/结构体/枚举/命名空间中的内容。
+
+### 3.5 Prompt 结构
+
+![Prompt 结构示意](assets/palm-cpp-prompt-structure.png)
+
+主流程会生成四类测试目录，对应四种 Prompt 配置：
+
+| 测试类型 | 目录 | 条件链需求 | 上下文 |
+| --- | --- | --- | --- |
+| 原始 GPT | `llm_tests` | 否 | 否 |
+| 上下文增强 | `llm_tests_cxt` | 否 | 是 |
+| 需求增强 | `llm_tests_req` | 是 | 否 |
+| 需求+上下文增强 | `llm_tests_req_cxt` | 是 | 是 |
+
+对 `*_req*` 类型，`Function.gen_req_list()` 会为每条 `mincover` 条件链生成一个测试签名和需求块，例如：
+
+```cpp
+TEST(SomeClassTest, bool_SomeClass_find_int_int_001)
+// Input parameter: x is a int, h is a int
+// Precondition: this->head[h] is True.
+// Precondition: temp->data == x is True.
+// Expected result: a bool value: true.
+```
+
+对不含 `req` 的类型，模型会被要求尽可能生成覆盖行和分支的多个测试；随后 `utgen` 会用 libclang 解析模型返回内容，将多个 `TEST` 函数拆分成多个独立 `.cpp` 文件。
+
+### 3.6 编译错误修复
+
+![编译错误修复流程](assets/palm-cpp-fix-flow.png)
+
+项目中有两套编译修复相关实现：
+
+- `chattester.py`：借鉴 ChatTester 思路，先让模型推断函数意图并生成基础测试，再用编译错误中的 `<Buggy Line>` 迭代生成完整修复版测试文件。
+- `rust_assistant.py`：名称是历史遗留，实际用于 C/C++ GoogleTest 编译错误修复。它读取编译器 JSON 错误、抽取相关源码片段，要求模型返回 `ChangeLog`，再验证并应用修改。
+
+`rust_assistant.py` 需要目标项目启用编译错误 JSON 输出：
+
+```cmake
+add_compile_options(-fdiagnostics-format=json-file)
+```
+
+该配置会影响 ChatTester，因为 ChatTester 的错误解析依赖标准输出中的编译错误文本。
+
+## 4. Workspace 结构
+
+| 路径 | 作用 |
+| --- | --- |
+| `README.md` | 项目顶层使用流程概述。 |
+| `基于大模型的C_C++单元测试生成v2.pptx` | 技术方案和实验汇报 PPT；本文只抽取技术方案图片。 |
+| `docs/` | 本次生成的中文说明文档和图片资产。 |
+| `llvm-project/` | LLVM 17.0.6 中 `clang-tools-extra` 的局部工具源码，需要合入完整 LLVM 源码后构建。 |
+| `llvm-project/clang-tools-extra/brinfo/` | 条件链、路径约束、返回值和 Mock 需求提取工具。 |
+| `llvm-project/clang-tools-extra/focxt/` | 上下文构建工具，提取类型、函数、宏、include 和依赖代码。 |
+| `llvm-project/clang-tools-extra/include-finder/` | 项目内 include 提取工具，输出 `includes.json`。 |
+| `utgen/` | Python 编排层，负责项目预处理、分析调用、Prompt 构建、测试生成、CMake 写入、编译和覆盖率统计。 |
+| `utgen/main.py` | 项目级主入口。 |
+| `utgen/decldef.py` | 基于 `clang-scan-deps` 和 `clangd-indexer` 构建源文件依赖关系。 |
+| `utgen/utgen.py` | 核心 Project/SourceFile/Function 对象和测试生成逻辑。 |
+| `utgen/condchain.py` | 将 `brinfo` JSON 条件链和 Mock 需求转成 Prompt 文本。 |
+| `utgen/context.py` | 将 `focxt` JSON 上下文转成 C/C++ 上下文片段。 |
+| `utgen/expt.py` | 编译通过率、运行通过率、行覆盖率、分支覆盖率统计。 |
+| `utgen/chattester.py` | ChatTester 风格基线和简单编译修复流程。 |
+| `utgen/rust_assistant.py` | 基于编译器 JSON 错误和 ChangeLog 的编译修复助手。 |
+| `utgen/prompt.py` | 测试生成、ChatTester 和编译修复 Prompt 模板。 |
+| `utgen/config.py` | 默认配置项；实际使用建议创建 `config_private.py`。 |
+| `utgen/CodeCoverage.cmake` | 覆盖率 CMake 辅助脚本，应复制到目标项目的 `cmake/` 目录。 |
+
+## 5. `brinfo` 模块说明
+
+`brinfo` 是测试需求提取模块，构建在 Clang LibTooling 之上。它读取 `compile_commands.json`，对指定源文件中的函数或方法构建 CFG，并输出条件链 JSON。
+
+### 5.1 入口和命令行
+
+入口文件是 `llvm-project/clang-tools-extra/brinfo/BrInfo.cpp`。主要参数包括：
+
+```text
+brinfo --project <project-path> -p <build-path> [--cfg] [-f <function>] [-c <class>] <source>
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `--project` | 目标项目根目录，用于写入 `llm_reqs/` 和 CFG dot 文件。 |
+| `-p` | CMake build 目录，要求其中存在 `compile_commands.json`。 |
+| `<source>` | 要分析的源文件。当前入口要求一次只指定一个源文件。 |
+| `-f` | 只分析指定函数或方法。 |
+| `-c` | 与 `-f` 搭配，限定所属类。 |
+| `--cfg` | 输出 CFG dot 图。 |
+
+### 5.2 函数筛选
+
+`Matcher.h` 中的 `FuncAnalysis` 使用 AST Matcher 查找函数定义。项目级分析时会：
+
+- 跳过名称为空的函数。
+- 跳过名称中包含 `main` 或 `test` 的函数。
+- 只处理正在分析的源文件中的函数。
+- 跳过构造函数、析构函数和 lambda。
+- 为每个函数构建 `CFG::buildCFG`，并设置 `PruneTriviallyFalseEdges = true`。
+
+当指定 `-f` 时，工具可以只分析自由函数；当同时指定 `-c` 时，可以只分析某个类中的方法。
+
+### 5.3 CFG 路径遍历
+
+核心实现在 `Analysis.cpp`：
+
+1. `Analysis::init` 去重函数位置，初始化入口块的空条件链。
+2. `extractCondChains` 从 CFG 入口块开始遍历，并额外处理 try block。
+3. `dfsTraverseCFGLoop` 维护显式栈，避免递归过深。
+4. 遇到条件终结符时，根据后继边记录条件取值。
+5. 遇到出口基本块时，将路径和条件序列保存为 `CondChainInfo`。
+
+支持的控制流包括：
+
+- `if`、二元逻辑表达式、三目表达式。
+- `switch`、`case`、`default`。
+- `for`、`while`、`do while`、range-for。
+- `break`、`continue`、`goto`。
+- try block 入口路径。
+
+为了避免路径爆炸，`MaxChains` 限制为 1000。超过限制的函数不会继续生成需求。
+
+### 5.4 条件规范化与矛盾检查
+
+`Condition.cpp` 和 `CondChain.cpp` 负责把 AST 条件转为 Prompt 中可读的条件：
+
+- 将 `a != b` 规范化为 `a == b` 并翻转布尔含义。
+- 将 `!expr` 规范化为 `expr` 并翻转布尔含义。
+- 对逻辑 `&&` 和 `||` 做局部条件化简。
+- 对 `switch case` 生成 `cond == case`。
+- 对 `default` 生成不等于所有 case 的条件组合。
+- 回溯局部变量最后一次定义，记录 `last_def`。
+- 将直接参数引用记录为输入参数约束。
+- 检查同一条件在同一路径中是否出现相互矛盾的取值。
+
+### 5.5 Mock 需求生成
+
+`CondChainInfo::findCallExprs` 会遍历路径上所有 CFG 语句，收集直接调用。随后 `findContra` 会判断调用是否与条件、变量初始化或赋值有关，并将约束写入 `FuncCallInfo`。
+
+最终 `toTestReqs` 会把函数调用转成 JSON 中的 `mock` 节点，包含函数名、类名、所在文件、是否虚函数、是否静态函数、是否项目内函数、返回类型、返回引用类型和调用效果。
+
+### 5.6 输出产物
+
+项目级运行后，`brinfo` 在目标项目中生成：
+
+| 输出 | 说明 |
+| --- | --- |
+| `llm_reqs/<file>_req.json` | 指定源文件内所有可分析函数的条件链和 Mock 需求。 |
+| `llm_reqs/<class>_<function>_req.json` | 指定函数/方法模式下的输出文件名。 |
+| `*.dot` | 使用 `--cfg` 时生成的 CFG dot 图。 |
+
+## 6. `focxt` 模块说明
+
+`focxt` 是上下文构建模块。它同样基于 Clang LibTooling，但关注的是源码定义和依赖，而不是路径约束。
+
+### 6.1 入口流程
+
+入口文件是 `llvm-project/clang-tools-extra/focxt/Focxt.cpp`。主要参数包括：
+
+```text
+focxt --project <project-path> --build <build-path> [--file <source>] [--class <class>] [--function <function>] [--may-test] [--must-test <test-name>]
+```
+
+项目级运行流程：
+
+1. 解析 `--project` 和 `--build` 的真实路径。
+2. 遍历项目目录下的 C/C++ 源文件和头文件。
+3. 排除 `build`、`llm_tests`、`llm_coverage`、`leetcode` 等目录。
+4. `GetClassesAndFunctions` 扫描项目内类、结构体、枚举、函数、模板和调用依赖。
+5. `GetFileContext` 为每个文件构造函数级上下文。
+6. 输出 `project_cxt.json`。
+
+### 6.2 定义扫描
+
+`GetAllDefinition.h/.cpp` 中的 `ClassesAndFunctions` 保存项目全局定义信息，包括：
+
+- `Class`：class/struct/union/enum 的统一表示。
+- `Function`：自由函数。
+- `Constructor`、`Destructor`、`Method`：类相关函数。
+- `Alias`：类型别名。
+- `Application`：某个类型或函数依赖的其他类型和函数。
+
+定义扫描会提取：
+
+- 类名、结构体名、union 名、枚举名。
+- 基类、字段、别名、枚举常量。
+- 模板参数和特化参数。
+- 构造函数、析构函数、成员方法和自由函数的签名与函数体。
+- 函数体中调用的函数和使用的变量类型。
+
+`GetSignature.cpp` 提供统一的函数签名生成逻辑。签名会包含返回类型、类名、函数名和参数类型，用作 `brinfo` 和 `focxt` 与 Python 层对齐的关键标识。
+
+### 6.3 文件上下文构建
+
+`GetAllContext.cpp` 中的 `FileContext` 对单个文件收集上下文：
+
+- `get_includes`：读取源文件中的 `#include`。
+- `get_defines`：通过 `PPCallbacks` 收集项目内宏定义。
+- `get_global_vars`：收集全局变量及其命名空间和类型依赖。
+- `get_test_macros`：可选收集已有 `TEST` 宏。
+- `get_context`：找出文件内函数和方法。
+- `get_j`：为每个函数构造 `focal` 上下文 JSON。
+
+最终 `project_cxt.json` 的顶层结构是源文件绝对路径，每个源文件下按函数或 `Class::method` 分组，每个分组下包含 `focal` 字段：
+
+```json
+{
+  "/path/to/source.cpp": {
+    "ClassName::method": {
+      "focal": {
+        "return_type ClassName::method(params)": {
+          "includes": [],
+          "defines": {},
+          "function_body": "...",
+          "namespace": {
+            "class": {},
+            "struct": {},
+            "enum": {},
+            "function": {}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 6.4 输出产物
+
+| 输出 | 说明 |
+| --- | --- |
+| `project_cxt.json` | 项目级上下文信息，供 Python 主流程加载。 |
+| `<file>_cxt.json` | 旧 README 中提到的文件级输出形式；当前项目级代码主要使用 `project_cxt.json`。 |
+
+## 7. `include-finder` 模块说明
+
+`include-finder` 通过 Clang 预处理器回调收集项目内 include 文件。
+
+入口文件是 `llvm-project/clang-tools-extra/include-finder/IncludeFinder.cpp`。它监听 `InclusionDirective`，当 include 文件真实路径位于目标项目根目录下时，将其加入集合并输出：
+
+```text
+<project>/includes.json
+```
+
+Python 层的 `utils.collect_includes` 会在 `Project.__get_source_files` 中调用它。这样即使某些项目头文件没有直接出现在 `compile_commands.json` 中，也能被加入后续分析候选文件。
+
+## 8. `utgen` 模块说明
+
+`utgen` 是项目级编排层，负责从分析结果到测试文件、CMake 目标和 CSV 结果的完整流程。
+
+### 8.1 主入口
+
+`utgen/main.py` 支持：
+
+```text
+python main.py -p <project-path> -b <build-path> [--no-analysis] [--post-analysis] [-s <source>] [-c <class>] [-f <function>]
+```
+
+当前项目级主流程实际使用的是 `-p`、`-b`、`--no-analysis` 和 `--post-analysis`。`-s/-c/-f` 会进入参数对象，但当前 `main.py` 没有基于它们切换单文件或单函数流程；单函数分析应直接调用底层 `brinfo` 和 `focxt`。
+
+主流程中的四类测试类型固定为：
+
+```python
+test_types = ["", "_cxt", "_req", "_req_cxt"]
+```
+
+正常运行时流程如下：
+
+1. `project.prepare(test_types, just_load=False)`
+2. 如未指定 `--no-analysis`，执行 `project.analyze()`
+3. `project.init_data()`
+4. 对四类测试类型分别 `gen_unit_test_concurrent`
+5. 对四类测试类型分别 `write_cmake_file`
+6. `project.post_analysis(test_types)`
+
+指定 `--post-analysis` 时，只加载已有产物并重新统计结果，不重新分析和生成测试。
+
+### 8.2 项目准备
+
+`Project.prepare` 会：
+
+- 创建 `llm_coverage`。
+- 创建 `llm_tests`、`llm_tests_cxt`、`llm_tests_req`、`llm_tests_req_cxt`。
+- 运行 CMake 配置，生成或刷新 `compile_commands.json`。
+- 从 `compile_commands.json` 和 `file_list.json` 收集源文件。
+- 调用 `comment_out` 注释源文件中的 `main`、`test`、`tests` 函数。
+
+`funccommenter.py` 会先生成 `<source>.bak` 备份，再逐行用 `//` 注释函数体。因此建议在干净 git 工作树、临时副本或容器中运行。
+
+### 8.3 数据加载
+
+`Project.init_data` 会：
+
+1. 对每个 `SourceFile` 调用 `load_req_file`，读取 `llm_reqs/<file>_req.json`。
+2. 去掉没有函数数据的源文件。
+3. 建立实验统计所需的文件和函数索引。
+4. 调用 `__load_cxt_file`，读取 `project_cxt.json` 并把上下文挂到函数对象上。
+
+`SourceFile.load_req_file` 会为每个函数创建 `Function` 对象，并加载条件链。`SourceFile.load_cxt_data` 会把 `focxt` 的 `focal` 上下文和可选测试上下文绑定到对应函数。
+
+### 8.4 Prompt 和测试生成
+
+核心实现在 `Function.gen_unit_test`：
+
+- 如果测试类型包含 `req`，则按每条 `mincover` 条件链生成一个 Prompt，并让 LLM 一次返回 2 个候选测试。
+- 如果测试类型不包含 `req`，则构造一个面向全函数覆盖的 Prompt，并让 LLM 一次返回完整测试集合。
+- 如果测试类型包含 `cxt`，则在 Prompt 中加入 `FocalCxt`。
+- 如果路径需求中包含 Mock，则加入 `TEST_CXT` 中的 gMock 示例。
+- LLM 返回结果会去掉 Markdown 代码块标记。
+- 使用 libclang 解析返回代码，提取 `TEST` 函数并拆分为单独文件。
+
+每个函数目录下会生成：
+
+| 文件或目录 | 说明 |
+| --- | --- |
+| `include.h` | 通用测试头，包含 gtest/gmock、`#define private public`、`#define protected public`、依赖 include 和命名空间。 |
+| `prompt/` | 每条条件链或无需求配置对应的 Prompt 文本。 |
+| `origin.cpp` | 无需求模式下模型原始返回内容。 |
+| `test_*.cpp` | 拆分后的单个测试文件。 |
+| `CMakeLists.txt` | 该函数对应的测试目标。 |
+| `.generated` | 已生成标记，避免重复请求 LLM。 |
+| `.notest` | 没有有效测试时的标记。 |
+
+### 8.5 CMake 目标生成
+
+`Function.write_cmake_file` 会为每个函数目录写入 CMake 目标：
+
+```cmake
+set(SOURCE_FILES "")
+set(SOURCE_FILES ${SOURCE_FILES} test_001_1.cpp)
+add_executable(llm_test_req_cxt_<inode>_<function_sig> ${SOURCE_FILES} <source_file_if_needed>)
+target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
+```
+
+如果被测函数声明在头文件中，但需要链接对应 `.cpp` 定义文件，代码会根据情况追加相对源文件路径。外层源文件目录和测试类型目录也会写入 `add_subdirectory`。
+
+### 8.6 编译、运行和覆盖率统计
+
+`expt.py` 负责统计：
+
+- 生成测试数量。
+- 生成测试代码行数。
+- 编译通过数量。
+- 运行测试数量。
+- 运行通过数量。
+- 函数行数。
+- 行覆盖数和行覆盖率。
+- 分支数、分支覆盖数和分支覆盖率。
+
+统计流程：
+
+1. `Expt.init` 扫描 `llm_tests*` 目录，建立文件和函数数据。
+2. `gen_compile_result_concurrent` 从 `compile_commands.json` 中找测试文件的编译命令，并逐个编译测试文件。
+3. `gen_covtest_result` 把可编译测试复制到 `llm_coverage`，为每个测试文件生成单独 `add_executable`，运行覆盖率目标。
+4. `load_test_result` 解析 CTest JUnit XML。
+5. `load_coverage` 解析 SonarQube XML 中的行和分支覆盖率。
+6. `dump_to_csv` 输出 `result*.csv`。
+
+输出 CSV 包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `file` | 源文件名。 |
+| `function` | 函数签名。 |
+| `tests_gen` | 生成测试数量。 |
+| `tests_lines` | 每个测试文件的有效代码行数。 |
+| `compile` | 编译通过测试数量。 |
+| `compile_files` | 编译通过的测试文件列表。 |
+| `tests_run` | 实际运行测试数量。 |
+| `tests_pass` | 运行通过测试数量。 |
+| `real` | 是否使用真实生成测试跑出了覆盖率。 |
+| `lines` / `lines_covered` / `line_cov` | 行覆盖统计。 |
+| `branches` / `branches_covered` / `branch_cov` | 分支覆盖统计。 |
+
+### 8.7 依赖关系预处理
+
+`decldef.py` 用于构建源文件之间的依赖关系，帮助覆盖率阶段把头文件函数对应的实现文件一起编译。
+
+它会：
+
+1. 调用 `clang-scan-deps` 生成 `project_info/deps.json`。
+2. 调用 `clangd-indexer` 生成 `project_info/decl_def.yaml`。
+3. 拆分每个 symbol 的 YAML 到 `project_info/decl_def/`。
+4. 生成声明文件到定义文件的映射。
+5. 结合 include 依赖生成 `project_info/deps_dict.json`。
+
+如果已经生成过 `deps.json` 和 `decl_def.yaml`，可使用 `--no-preprocess` 跳过工具调用，只重新生成字典：
+
+```sh
+python decldef.py -p <project-path> -b <build-path> --no-preprocess
+```
+
+## 9. 数据流与目录依赖
+
+运行测试生成前，目标项目至少需要：
+
+```text
+<project>/llm_reqs/<file>_req.json
+<project>/project_cxt.json
+<project>/includes.json              # 可选，但建议生成
+<project>/project_info/deps_dict.json # 覆盖率阶段建议生成
+```
+
+主流程会在目标项目下创建或更新：
+
+```text
+llm_coverage/
+llm_tests/
+llm_tests_cxt/
+llm_tests_req/
+llm_tests_req_cxt/
+result.csv
+result_cxt.csv
+result_req.csv
+result_req_cxt.csv
+```
+
+典型函数级测试目录结构如下：
+
+```text
+llm_tests_req_cxt/
+  source.cpp/
+    bool_Class_find_int_int/
+      include.h
+      prompt/
+        001.txt
+        002.txt
+      test_001_1.cpp
+      test_001_2.cpp
+      CMakeLists.txt
+      .generated
+      compile_err.log
+      result.xml
+      coverage.xml
+      coverage/
+      cov_cmake.txt
+```
+
+## 10. 运行说明
+
+### 10.1 准备 Python 环境
+
+可以用 `uv` 创建虚拟环境：
+
+```sh
+uv venv .venv
+source .venv/bin/activate
+uv pip install requests libclang lxml pyyaml xmltodict matplotlib numpy
+```
+
+注意：
+
+- `argparse` 是标准库，不需要安装。
+- 如果使用 conda，可安装 `python-clang`；如果使用 pip，通常安装 `libclang` 包。
+- `libclang.so` 和 Python clang 绑定版本需要一致，否则 `clang.cindex` 解析可能失败。
+
+### 10.2 配置 `config_private.py`
+
+建议在 `utgen/` 下创建 `config_private.py`，覆盖 `config.py` 中的空配置：
+
+```python
+import os
+
+URL = "https://your-llm-endpoint/v1/chat/completions"
+API_KEY = "sk-..."
+LIBCLANG_PATH = "/path/to/libclang.so"
+BRINFO_PATH = "/path/to/brinfo"
+FOCXT_PATH = "/path/to/focxt"
+CPU_COUNT = os.cpu_count() or 4
+CLANG_SCAN_DEPS_PATH = "/path/to/clang-scan-deps-17"
+CLANGD_INDEXER_PATH = "/path/to/clangd-indexer"
+```
+
+`utgen/.gitignore` 已经忽略 `config_private.py`。如果把配置文件放到其他目录，仍需确认不会把 API key、本机工具路径等敏感信息提交到版本库。
+
+### 10.3 构建 Clang Tooling 工具
+
+`llvm-project/` 目录只包含 LLVM 17.0.6 中需要新增或修改的一小部分文件。构建时需要先下载完整 LLVM 17.0.6 源码，再把本仓库中的工具目录合入 `clang-tools-extra`。
+
+示例流程：
+
+```sh
+git clone https://github.com/llvm/llvm-project.git
+cd llvm-project
+git checkout llvmorg-17.0.6
+```
+
+将本仓库中的以下目录复制到完整 LLVM 源码对应位置：
+
+```text
+clang-tools-extra/brinfo/
+clang-tools-extra/focxt/
+clang-tools-extra/include-finder/
+clang-tools-extra/CMakeLists.txt
+```
+
+配置和构建：
+
+```sh
+cmake -S llvm -B build -G Ninja \
+  -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_TARGETS_TO_BUILD=host \
+  -DLLVM_ENABLE_DUMP=ON
+
+cmake --build build --target brinfo
+cmake --build build --target focxt
+cmake --build build --target include-finder
+```
+
+安装：
+
+```sh
+cmake --install build --component brinfo
+cmake --install build --component focxt
+cmake --install build --component include-finder
+cmake --install build --component clang-resource-headers
+```
+
+安装后确认：
+
+```sh
+brinfo --help
+focxt --help
+include-finder --help
+```
+
+### 10.4 准备目标 C/C++ 项目
+
+目标项目需要能用 CMake 配置出 `compile_commands.json`：
+
+```sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+```
+
+如果项目本身不使用 CMake，可以考虑用 Bear 生成编译数据库；如果是头文件为主的库，可能需要在项目根目录创建 `file_list.json`，写入需要分析文件的绝对路径：
+
+```json
+[
+  "/path/to/project/include/foo.hpp",
+  "/path/to/project/src/foo.cpp"
+]
+```
+
+目标项目的 `CMakeLists.txt` 需要支持 CTest 和 GoogleTest，并包含覆盖率配置。参考配置：
+
+```cmake
+include(CTest)
+enable_testing()
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-exceptions")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
+
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  URL https://github.com/google/googletest/archive/main.zip
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+include(GoogleTest)
+
+set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+include(CodeCoverage)
+append_coverage_compiler_flags()
+
+add_subdirectory(llm_coverage)
+add_subdirectory(llm_tests)
+add_subdirectory(llm_tests_req)
+add_subdirectory(llm_tests_cxt)
+add_subdirectory(llm_tests_req_cxt)
+```
+
+把本仓库的 `utgen/CodeCoverage.cmake` 复制到目标项目：
+
+```text
+<target-project>/cmake/CodeCoverage.cmake
+```
+
+覆盖率阶段需要一个不会因测试失败而让覆盖率流程中断的 `ctest.sh`：
+
+```sh
+#!/bin/sh
+ctest "$@"
+exit 0
+```
+
+将该脚本放到 `PATH` 可找到的位置，并授予执行权限。
+
+### 10.5 生成文件依赖关系
+
+在本仓库 `utgen/` 目录下运行：
+
+```sh
+python decldef.py -p <target-project> -b <target-project>/build
+```
+
+生成结果位于：
+
+```text
+<target-project>/project_info/deps.json
+<target-project>/project_info/decl_def.yaml
+<target-project>/project_info/decl_def/
+<target-project>/project_info/deps_dict.json
+```
+
+这一步不是生成 Prompt 的硬性前置，但会影响覆盖率阶段对头文件函数和跨文件依赖的处理，建议先执行。
+
+### 10.6 运行项目级分析、生成和统计
+
+在本仓库 `utgen/` 目录下运行：
+
+```sh
+python main.py -p <target-project> -b <target-project>/build
+```
+
+该命令会：
+
+1. 创建 `llm_coverage` 和四类 `llm_tests*` 目录。
+2. 运行 CMake 配置。
+3. 注释目标项目中的 `main`、`test`、`tests` 函数并生成 `.bak`。
+4. 调用 `focxt` 生成 `project_cxt.json`。
+5. 并发调用 `brinfo` 为每个源文件生成 `llm_reqs/*_req.json`。
+6. 加载需求和上下文。
+7. 生成四类测试。
+8. 写入 CMakeLists。
+9. 编译、运行、收集覆盖率。
+10. 输出 `result*.csv`。
+
+如果已经有 `llm_reqs/` 和 `project_cxt.json`，只想重新生成测试和统计：
+
+```sh
+python main.py -p <target-project> -b <target-project>/build --no-analysis
+```
+
+如果测试已经生成，只想重新统计编译、运行和覆盖率：
+
+```sh
+python main.py -p <target-project> -b <target-project>/build --post-analysis
+```
+
+### 10.7 单独运行底层分析工具
+
+分析单个源文件所有函数：
+
+```sh
+brinfo --project <target-project> -p <target-project>/build <source-file>
+focxt --project <target-project> --build <target-project>/build --file <source-file>
+```
+
+分析单个自由函数：
+
+```sh
+brinfo --project <target-project> -p <target-project>/build <source-file> -f <function-name>
+```
+
+分析单个类方法：
+
+```sh
+brinfo --project <target-project> -p <target-project>/build <source-file> -c <class-name> -f <method-name>
+```
+
+收集项目内 include：
+
+```sh
+include-finder --project <target-project> -p <target-project>/build <source-file-1> <source-file-2>
+```
+
+### 10.8 使用编译修复助手
+
+`rust_assistant.py` 不是 `main.py` 默认调用的步骤，需要在 Python 中初始化项目对象后调用。
+
+目标项目先加入：
+
+```cmake
+add_compile_options(-fdiagnostics-format=json-file)
+```
+
+示例调用：
+
+```python
+from pathlib import Path
+from utgen import Project
+from rust_assistant import compilation_fix_assistant
+
+project_path = str(Path("<target-project>").resolve())
+build_path = str(Path("<target-project>/build").resolve())
+project_name = Path(project_path).name
+
+project = Project(project_name, project_path, build_path)
+project.prepare(["_req_cxt"], just_load=True)
+project.init_data()
+compilation_fix_assistant(project, test_type="_req_cxt")
+```
+
+修复后可重新运行：
+
+```sh
+python main.py -p <target-project> -b <target-project>/build --post-analysis
+```
+
+## 11. 常见问题与注意事项
+
+### 11.1 生成过程会修改目标项目
+
+`prepare` 会注释 `main`、`test`、`tests` 函数，并生成 `.bak`。建议在临时副本、容器或干净 git 工作树中运行。
+
+### 11.2 `compile_commands.json` 是核心依赖
+
+三个 Clang 工具和 Python 统计流程都依赖编译数据库。若缺少 `compile_commands.json`，`brinfo`、`focxt`、`include-finder` 和测试编译命令提取都会失败。
+
+### 11.3 `libclang` 版本需要一致
+
+Python 层使用 `clang.cindex` 解析模型返回的测试和目标源码。`LIBCLANG_PATH` 指向的 `libclang.so` 应与 Python binding 版本一致。
+
+### 11.4 LLM 调用成本较高
+
+项目级生成会对许多函数和路径请求模型。`Function.gen_unit_test` 会通过 `.generated` 避免重复生成，但删除该文件或更换目录后会重新请求。
+
+### 11.5 不是所有函数都会生成测试
+
+当前主流程会跳过：
+
+- 重载运算符。
+- 条件链数量不大于 2 的函数。
+- 最小覆盖路径数量大于 20 的函数。
+- 缺少 `focxt` 上下文的函数。
+- 生成目录或测试文件为空的函数。
+
+### 11.6 CMake 配置可能需要按项目调整
+
+README 中建议加入 `-fno-exceptions` 和覆盖率配置，但某些项目依赖异常机制或特殊编译选项，可能需要按项目修改 CMakeLists。
+
+### 11.7 覆盖率统计依赖 `ctest.sh`
+
+为了在测试失败时仍收集覆盖率，`CodeCoverage.cmake` 使用 `ctest.sh` 包装 CTest，并让脚本始终返回 0。如果 `ctest.sh` 不在 `PATH` 中，覆盖率目标可能失败。
+
+### 11.8 配置和生成产物需要按目录保护
+
+`utgen/.gitignore` 已经忽略 `config_private.py`、`*.json`、`*.xml`、`*.yaml`、`*.csv`、`*.bak` 等常见本地文件。目标项目中的 `llm_tests*`、`llm_coverage`、`project_info`、`result*.csv` 等生成产物是否提交，仍取决于目标项目自己的版本控制策略。
+
+## 12. 推荐运行顺序
+
+最小完整流程如下：
+
+```sh
+# 1. 准备 Python 环境
+uv venv .venv
+source .venv/bin/activate
+uv pip install requests libclang lxml pyyaml xmltodict matplotlib numpy
+
+# 2. 配置目标项目
+cmake -B <target-project>/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+# 3. 生成跨文件依赖
+cd /path/to/cpp-utgen/utgen
+python decldef.py -p <target-project> -b <target-project>/build
+
+# 4. 分析、生成、统计
+python main.py -p <target-project> -b <target-project>/build
+
+# 5. 如只重新统计
+python main.py -p <target-project> -b <target-project>/build --post-analysis
+```
+
+推荐优先查看最终四个 CSV：
+
+```text
+result.csv
+result_cxt.csv
+result_req.csv
+result_req_cxt.csv
+```
+
+一般来说，`result_req_cxt.csv` 对应 PALM 的完整配置，即同时使用路径测试需求和上下文信息。
