@@ -1,10 +1,13 @@
 import csv
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import xmltodict
 
@@ -42,13 +45,63 @@ def get_deps_set(file_path: str, deps_dict: dict[str, list[str]]) -> set[str]:
     return res_set
 
 
+def safe_target_name(prefix: str, key: str) -> str:
+    stem = Path(key).stem
+    safe_stem = "".join(ch if ch.isalnum() else "_" for ch in stem)
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{digest}_{safe_stem}"
+
+
+def write_text_file(file_path: str, content: str) -> None:
+    with open(file_path, "w") as file:
+        file.write(content)
+
+
+def classify_failure(output: str, returncode: int, timeout: bool = False) -> str:
+    if timeout:
+        return "timeout_failure"
+    lower_output = output.lower()
+    if (
+        "unexpected mock function call" in lower_output
+        or "unsatisfied and active" in lower_output
+        or "expect_call" in lower_output
+    ):
+        return "mock_failure"
+    if (
+        "c++ exception" in lower_output
+        or "thrown in the test body" in lower_output
+        or "unknown file: failure" in lower_output
+    ):
+        return "exception_failure"
+    if (
+        "segmentation fault" in lower_output
+        or "addresssanitizer" in lower_output
+        or "sigabrt" in lower_output
+        or "sigsegv" in lower_output
+        or returncode < 0
+    ):
+        return "crash_failure"
+    if "failure" in lower_output and (
+        "expected equality" in lower_output
+        or "which is:" in lower_output
+        or "expected:" in lower_output
+        or "actual:" in lower_output
+        or "value of:" in lower_output
+    ):
+        return "assertion_failure"
+    return "unknown_failure"
+
+
 class CompileResult:
     def __init__(self, success: int, failed: int):
         self.success = success
         self.failed = failed
 
     def pass_rate(self) -> float:
-        return self.success / (self.success + self.failed)
+        total = self.success + self.failed
+        if total == 0:
+            return 0.0
+        return self.success / total
 
 
 class LineCov:
@@ -132,10 +185,32 @@ class FunctionData:
         self.__test_dir_path = f"{parent_dir_path}/{format_sig(sig)}"
         self.__loc = loc
         self.__file_line = file_line
-        self.__tests_num = 0
+        self.__tests_num = len(file_line)
         self.__can_compile: list[str] = []
         self.__coverage: CovResult = CovResult()
         self.__test_result: TestResult | None = None
+        self.__test_records: dict[str, dict[str, Any]] = {}
+        self.__init_test_records()
+
+    def __init_test_records(self) -> None:
+        for test_file_name, lines_of_code in self.__file_line.items():
+            self.__test_records[test_file_name] = {
+                "test_file": test_file_name,
+                "test_path": f"{self.__test_dir_path}/{test_file_name}",
+                "lines": lines_of_code,
+                "compile": "not_run",
+                "coverage_build": "not_run",
+                "run": "not_run",
+                "kept": False,
+                "failure_type": "",
+                "compile_log": "",
+                "build_log": "",
+                "run_log": "",
+                "repair_status": "not_attempted",
+                "repair_rounds": 0,
+                "repair_log": "",
+                "exported": False,
+            }
 
     def get_sig(self) -> str:
         return self.__sig
@@ -154,9 +229,121 @@ class FunctionData:
 
     def set_can_compile_list(self, can_compile: list[str]) -> None:
         self.__can_compile = can_compile
+        can_compile_set = set(can_compile)
+        compile_log = f"{self.__test_dir_path}/compile_err.log"
+        for test_file_name, record in self.__test_records.items():
+            if test_file_name in can_compile_set:
+                record["compile"] = "pass"
+                record["compile_log"] = ""
+            else:
+                record["compile"] = "fail"
+                record["compile_log"] = compile_log
+            record["coverage_build"] = "not_run"
+            record["run"] = "not_run"
+            record["kept"] = False
+            record["failure_type"] = ""
+            record["build_log"] = ""
+            record["run_log"] = ""
 
     def get_can_compile_list(self) -> list[str]:
         return self.__can_compile
+
+    def get_kept_list(self) -> list[str]:
+        return [
+            test_file_name
+            for test_file_name, record in self.__test_records.items()
+            if record["kept"]
+        ]
+
+    def get_run_fail_list(self) -> list[str]:
+        return [
+            test_file_name
+            for test_file_name, record in self.__test_records.items()
+            if record["run"] in {"fail", "timeout"}
+        ]
+
+    def get_test_records(self) -> dict[str, dict[str, Any]]:
+        return self.__test_records
+
+    def load_manifest_records(self, records_by_path: dict[str, dict[str, Any]]) -> None:
+        can_compile = []
+        for test_file_name, record in self.__test_records.items():
+            old_record = records_by_path.get(record["test_path"])
+            if old_record is None:
+                continue
+            for key in (
+                "compile",
+                "coverage_build",
+                "run",
+                "kept",
+                "failure_type",
+                "compile_log",
+                "build_log",
+                "run_log",
+                "repair_status",
+                "repair_rounds",
+                "repair_log",
+                "repair_failure_type",
+                "exported",
+            ):
+                if key in old_record:
+                    record[key] = old_record[key]
+            if record["compile"] == "pass":
+                can_compile.append(test_file_name)
+        self.__can_compile = can_compile
+
+    def gen_manifest_records(
+        self, source_name: str, source_path: str, test_root: str
+    ) -> list[dict[str, Any]]:
+        records = []
+        for test_file_name in sorted(self.__test_records):
+            record = dict(self.__test_records[test_file_name])
+            record.update(
+                {
+                    "source_file": source_name,
+                    "source_path": source_path,
+                    "function": self.__sig,
+                    "function_dir": self.__test_dir_path,
+                    "function_dir_rel": os.path.relpath(
+                        self.__test_dir_path, test_root
+                    ),
+                    "relative_path": os.path.relpath(record["test_path"], test_root),
+                    "decl_in_header": self.__decl_in_header,
+                    "loc": self.__loc,
+                }
+            )
+            records.append(record)
+        return records
+
+    def export_filtered_tests(self, project: str, export_parent_dir: str) -> bool:
+        for record in self.__test_records.values():
+            record["exported"] = False
+        kept_files = self.get_kept_list()
+        if len(kept_files) == 0:
+            return False
+        export_dir = f"{export_parent_dir}/{Path(self.__test_dir_path).name}"
+        os.makedirs(export_dir, exist_ok=True)
+        shutil.copy(f"{self.__test_dir_path}/include.h", f"{export_dir}/include.h")
+        for test_file_name in kept_files:
+            shutil.copy(
+                f"{self.__test_dir_path}/{test_file_name}",
+                f"{export_dir}/{test_file_name}",
+            )
+            self.__test_records[test_file_name]["exported"] = True
+        rela_path, deps_list = self.__get_relative_source_and_deps(project, export_dir)
+        deps = " ".join(deps_list)
+        target_name = safe_target_name("filtered_test", self.__test_dir_path)
+        with open(f"{export_dir}/CMakeLists.txt", "w") as cmake_file:
+            cmake_file.write('set(SOURCE_FILES "")\n')
+            for test_file_name in kept_files:
+                cmake_file.write(
+                    f"set(SOURCE_FILES ${{SOURCE_FILES}} {test_file_name})\n"
+                )
+            cmake_file.write(
+                f"add_executable({target_name} ${{SOURCE_FILES}} {rela_path} {deps})\n"
+            )
+            cmake_file.write(f"target_link_libraries({target_name} gmock_main)\n")
+        return True
 
     def get_test_result(self) -> TestResult | None:
         return self.__test_result
@@ -200,6 +387,8 @@ class FunctionData:
         success = 0
         failed = 0
         can_compile = []
+        if len(compile_cmds) == 0:
+            return 0, len(self.__test_records), []
         if os.path.exists(f"{self.__test_dir_path}/compile_err.log"):
             os.remove(f"{self.__test_dir_path}/compile_err.log")
         for test_file_name in compile_cmds:
@@ -355,6 +544,144 @@ class FunctionData:
                 shutil.copy(f"{build}/coverage_sonarqube.xml", cov_xml_file)
                 self.load_coverage(project, cov_xml_file)
 
+    def __get_relative_source_and_deps(
+        self, project: str, base_dir: str
+    ) -> tuple[str, list[str]]:
+        rela_path = ""
+        if not is_header(self.__file_path) and self.__decl_in_header:
+            rela_path = os.path.relpath(self.__file_path, base_dir)
+        deps_set = set()
+        deps_file_path = f"{project}/project_info/deps_dict.json"
+        if os.path.exists(deps_file_path):
+            with open(deps_file_path, "r") as deps_file:
+                deps_dict = json.load(deps_file)
+                deps_set = get_deps_set(self.__file_path, deps_dict)
+        deps_list = [os.path.relpath(dep, base_dir) for dep in deps_set]
+        return rela_path, deps_list
+
+    def __write_coverage_cmake(
+        self, project: str, llm_cov_dir: str, test_file_list: list[str]
+    ) -> list[tuple[str, str]]:
+        rela_path, deps_list = self.__get_relative_source_and_deps(
+            project, llm_cov_dir
+        )
+        deps = " ".join(deps_list)
+        target_list = []
+        with open(f"{llm_cov_dir}/CMakeLists.txt", "w") as cmake_file:
+            for test_file_name in test_file_list:
+                target_name = safe_target_name(
+                    "llm_test", f"{self.__test_dir_path}/{test_file_name}"
+                )
+                target_list.append((test_file_name, target_name))
+                cmake_file.write(
+                    f"add_executable({target_name} {test_file_name} {rela_path} {deps})\n"
+                )
+                cmake_file.write(f"target_link_libraries({target_name} gmock_main)\n")
+                cmake_file.write(
+                    f'gtest_discover_tests({target_name} TEST_PREFIX "llm_test.")\n\n'
+                )
+            cmake_file.write(SETUP_COV)
+        return target_list
+
+    def __prepare_coverage_dir(
+        self, project: str, build: str, llm_cov_dir: str, test_file_list: list[str]
+    ) -> list[tuple[str, str]]:
+        clear_directory(llm_cov_dir)
+        target_list = self.__write_coverage_cmake(project, llm_cov_dir, test_file_list)
+        shutil.copy(f"{llm_cov_dir}/CMakeLists.txt", f"{self.__test_dir_path}/cov_cmake.txt")
+        shutil.copy(f"{self.__test_dir_path}/include.h", f"{llm_cov_dir}/include.h")
+        for test_file_name in test_file_list:
+            shutil.copy(
+                f"{self.__test_dir_path}/{test_file_name}",
+                f"{llm_cov_dir}/{test_file_name}",
+            )
+        clear_directory(build, exclude_dirs=["_deps"])
+        cmake_config(project, build)
+        return target_list
+
+    def __build_test_target(self, build: str, test_file_name: str, target: str) -> bool:
+        target_build_cmd = ["cmake", "--build", build, "--target", target]
+        res = run_command(target_build_cmd)
+        record = self.__test_records[test_file_name]
+        if res.returncode != 0:
+            log_path = f"{self.__test_dir_path}/build_{target}.log"
+            log_content = (
+                f"Command: {' '.join(target_build_cmd)}\n"
+                f"Failed to build {target}:\n"
+                f"{res.stdout}{res.stderr}\n"
+            )
+            write_text_file(log_path, log_content)
+            with open(f"{self.__test_dir_path}/build_test_err.log", "a") as log_file:
+                log_file.write(log_content)
+                log_file.write("\n------------------------------------------------------------\n")
+            record["coverage_build"] = "fail"
+            record["build_log"] = log_path
+            record["run"] = "not_run"
+            record["kept"] = False
+            record["failure_type"] = "build_failure"
+            return False
+        record["coverage_build"] = "pass"
+        record["build_log"] = ""
+        return True
+
+    def __run_test_target(self, build: str, test_file_name: str, target: str) -> bool:
+        exe_path = f"{build}/llm_coverage/{target}"
+        if os.name == "nt":
+            exe_path += ".exe"
+        record = self.__test_records[test_file_name]
+        log_path = f"{self.__test_dir_path}/run_{target}.log"
+        xml_path = f"{self.__test_dir_path}/result_{Path(test_file_name).stem}.xml"
+        if not os.path.exists(exe_path):
+            write_text_file(log_path, f"Executable not found: {exe_path}\n")
+            record["run"] = "fail"
+            record["run_log"] = log_path
+            record["kept"] = False
+            record["failure_type"] = "build_failure"
+            return False
+        run_cmd = [exe_path, f"--gtest_output=xml:{xml_path}"]
+        try:
+            res = subprocess.run(
+                run_cmd,
+                cwd=build,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="backslashreplace",
+                timeout=600,
+            )
+            output = f"{res.stdout}{res.stderr}"
+            log_content = (
+                f"Command: {' '.join(run_cmd)}\n"
+                f"Return code: {res.returncode}\n\n"
+                f"STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}\n"
+            )
+            write_text_file(log_path, log_content)
+            if res.returncode == 0:
+                record["run"] = "pass"
+                record["run_log"] = log_path
+                record["kept"] = True
+                record["failure_type"] = ""
+                return True
+            record["run"] = "fail"
+            record["run_log"] = log_path
+            record["kept"] = False
+            record["failure_type"] = classify_failure(output, res.returncode)
+            return False
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            log_content = (
+                f"Command: {' '.join(run_cmd)}\n"
+                "Timed out after 600 seconds.\n\n"
+                f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n"
+            )
+            write_text_file(log_path, log_content)
+            record["run"] = "timeout"
+            record["run_log"] = log_path
+            record["kept"] = False
+            record["failure_type"] = "timeout_failure"
+            return False
+
     def gen_covtest_result(self, project: str, build: str, llm_cov_dir: str) -> None:
         # print(f"  Generating coverage and test result for {self.__sig} ...")
         if os.path.exists(f"{self.__test_dir_path}/coverage_failed.log"):
@@ -371,71 +698,52 @@ class FunctionData:
         ]
         if len(test_file_list) == 0:
             self.collect_line_branch(project, build, llm_cov_dir)
-            # load test result
-            result_xml_file = f"{self.__test_dir_path}/result.xml"
-            if os.path.exists(f"{build}/test_result.xml"):
-                shutil.copy(f"{build}/test_result.xml", result_xml_file)
-                self.load_test_result(project, result_xml_file)
+            self.__test_result = TestResult(0, 0)
             return
         build_cov_dir = f"{build}/coverage"
-        rela_path = ""
-        if not is_header(self.__file_path) and self.__decl_in_header:
-            rela_path = os.path.relpath(self.__file_path, llm_cov_dir)
-        work_dir = f"{project}/project_info"
-        deps_set = set()
-        if os.path.exists(f"{work_dir}/deps_dict.json"):
-            with open(f"{work_dir}/deps_dict.json", "r") as deps_file:
-                deps_dict = json.load(deps_file)
-                deps_set = get_deps_set(self.__file_path, deps_dict)
-        deps_list = [os.path.relpath(dep, llm_cov_dir) for dep in deps_set]
-        clear_directory(llm_cov_dir)
-        # one add_executable for one test file to prevent duplicate symbols
-        with open(f"{llm_cov_dir}/CMakeLists.txt", "w") as cmake_file:
-            llm_tests_list = []
-            for test_file_name in test_file_list:
-                test_num = test_file_name.split(".")[0][5:]
-                llm_tests_list.append(f"llm_test_{test_num}")
-                cmake_file.write(
-                    f"add_executable(llm_test_{test_num} {test_file_name} {rela_path} {" ".join(deps_list)})\n"
-                )
-                cmake_file.write(
-                    f"target_link_libraries(llm_test_{test_num} gmock_main)\n"
-                )
-                cmake_file.write(
-                    f'gtest_discover_tests(llm_test_{test_num} TEST_PREFIX "llm_test.")\n\n'
-                )
-            cmake_file.write(SETUP_COV)
-        shutil.copy(f"{llm_cov_dir}/CMakeLists.txt", f"{self.__test_dir_path}/cov_cmake.txt")
-        shutil.copy(f"{self.__test_dir_path}/include.h", f"{llm_cov_dir}/include.h")
-        for test_file_name in test_file_list:
-            shutil.copy(
-                f"{self.__test_dir_path}/{test_file_name}",
-                f"{llm_cov_dir}/{test_file_name}",
-            )
-        clear_directory(build, exclude_dirs=["_deps"])
-        cmake_config(project, build)
-        build_success = False
-        for test_name in llm_tests_list:
-            target_build_cmd = ["cmake", "--build", build, "--target", test_name]
-            res = run_command(target_build_cmd)
-            if res.returncode != 0:
-                with open(f"{self.__test_dir_path}/build_test_err.log", "a") as log_file:
-                    log_file.write(f"Failed to build {test_name}:\n")
-                    log_file.write(res.stdout)
-                    log_file.write(res.stderr)
-                    log_file.write("\n------------------------------------------------------------\n")
-            else:
-                build_success = True
-        if not build_success:
+        target_list = self.__prepare_coverage_dir(
+            project, build, llm_cov_dir, test_file_list
+        )
+        build_pass_targets = []
+        for test_file_name, target_name in target_list:
+            if self.__build_test_target(build, test_file_name, target_name):
+                build_pass_targets.append((test_file_name, target_name))
+        if len(build_pass_targets) == 0:
+            self.__test_result = TestResult(0, 0)
             self.collect_line_branch(project, build, llm_cov_dir)
             return
+        run_pass_files = []
+        run_failed = 0
+        for test_file_name, target_name in build_pass_targets:
+            if self.__run_test_target(build, test_file_name, target_name):
+                run_pass_files.append(test_file_name)
+            else:
+                run_failed += 1
+        self.__test_result = TestResult(len(build_pass_targets), run_failed)
+        if len(run_pass_files) == 0:
+            self.collect_line_branch(project, build, llm_cov_dir)
+            return
+        if set(run_pass_files) != set(test_file_list):
+            target_list = self.__prepare_coverage_dir(
+                project, build, llm_cov_dir, run_pass_files
+            )
+            for test_file_name, target_name in target_list:
+                if not self.__build_test_target(build, test_file_name, target_name):
+                    self.__test_records[test_file_name]["kept"] = False
+            run_pass_files = [
+                test_file_name
+                for test_file_name in run_pass_files
+                if self.__test_records[test_file_name]["coverage_build"] == "pass"
+            ]
+            if len(run_pass_files) == 0:
+                self.collect_line_branch(project, build, llm_cov_dir)
+                return
         cov_cmd = ["cmake", "--build", build, "--target", "coverage"]
         result = run_command(cov_cmd)
-        # load test result
+        # keep the full run result collected above; the coverage target only runs kept tests.
         result_xml_file = f"{self.__test_dir_path}/result.xml"
         if os.path.exists(f"{build}/test_result.xml"):
             shutil.copy(f"{build}/test_result.xml", result_xml_file)
-            self.load_test_result(project, result_xml_file)
         # load coverage result
         if result.returncode == 0:
             shutil.copytree(
@@ -480,6 +788,20 @@ class FileData:
     def get_func_data(self) -> list[FunctionData]:
         return self.__data
 
+    def load_manifest_records(self, records_by_path: dict[str, dict[str, Any]]) -> None:
+        for func_data in self.__data:
+            func_data.load_manifest_records(records_by_path)
+
+    def gen_manifest_records(self, test_root: str) -> list[dict[str, Any]]:
+        records = []
+        for func_data in self.__data:
+            records.extend(
+                func_data.gen_manifest_records(
+                    self.__name, self.__file_path, test_root
+                )
+            )
+        return records
+
     def get_compile_result(
         self, compile_cmds: dict[str, dict[str, list[str]]]
     ) -> tuple[int, int]:
@@ -496,6 +818,20 @@ class FileData:
         for func_data in self.__data:
             func_data.gen_covtest_result(project, build, llm_cov_dir)
 
+    def export_filtered_tests(self, project: str, export_root: str) -> bool:
+        export_file_dir = f"{export_root}/{self.__name}"
+        exported_funcs = []
+        for func_data in self.__data:
+            if func_data.export_filtered_tests(project, export_file_dir):
+                exported_funcs.append(Path(func_data.get_test_dir()).name)
+        if len(exported_funcs) == 0:
+            return False
+        os.makedirs(export_file_dir, exist_ok=True)
+        with open(f"{export_file_dir}/CMakeLists.txt", "w") as cmake_file:
+            for func_dir in exported_funcs:
+                cmake_file.write(f"add_subdirectory({func_dir})\n")
+        return True
+
 
 class Expt:
     def __init__(self, expt_type: str, project: str):
@@ -503,6 +839,7 @@ class Expt:
         self.__test_dir_path = f"{project}/llm_tests{expt_type}"
         # self.__llm_compile_dir = f"{project}/llm_compile"
         self.__llm_cov_dir = f"{project}/llm_coverage"
+        self.__project = project
         self.__compile_result: CompileResult | None = None
         self.__data: list[FileData] = []
         self.__compile_cmds: dict[str, dict[str, list[str]]] = {}
@@ -515,6 +852,65 @@ class Expt:
 
     def add_file_data(self, file_data: FileData) -> None:
         self.__data.append(file_data)
+
+    def get_manifest_path(self) -> str:
+        return f"{self.__test_dir_path}/filter_manifest.json"
+
+    def load_manifest(self) -> None:
+        manifest_path = self.get_manifest_path()
+        if not os.path.exists(manifest_path):
+            return
+        with open(manifest_path, "r") as manifest_file:
+            manifest = json.load(manifest_file)
+        records_by_path = {}
+        for record in manifest.get("tests", []):
+            if "test_path" in record:
+                records_by_path[record["test_path"]] = record
+        for file_data in self.__data:
+            file_data.load_manifest_records(records_by_path)
+
+    def gen_manifest_data(self) -> dict[str, Any]:
+        tests = []
+        for file_data in self.__data:
+            tests.extend(file_data.gen_manifest_records(self.__test_dir_path))
+        summary = {
+            "generated": len(tests),
+            "compile_pass": 0,
+            "compile_fail": 0,
+            "run_pass": 0,
+            "run_fail": 0,
+            "timeout": 0,
+            "kept": 0,
+            "exported": 0,
+        }
+        for record in tests:
+            if record["compile"] == "pass":
+                summary["compile_pass"] += 1
+            elif record["compile"] == "fail":
+                summary["compile_fail"] += 1
+            if record["run"] == "pass":
+                summary["run_pass"] += 1
+            elif record["run"] == "fail":
+                summary["run_fail"] += 1
+            elif record["run"] == "timeout":
+                summary["timeout"] += 1
+            if record["kept"]:
+                summary["kept"] += 1
+            if record["exported"]:
+                summary["exported"] += 1
+        return {
+            "version": 1,
+            "test_type": self.__type,
+            "test_root": self.__test_dir_path,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "summary": summary,
+            "tests": tests,
+        }
+
+    def dump_manifest(self) -> None:
+        os.makedirs(self.__test_dir_path, exist_ok=True)
+        with open(self.get_manifest_path(), "w") as manifest_file:
+            json.dump(self.gen_manifest_data(), manifest_file, indent=2)
 
     def init(self, expt_dict: dict[str, ExptFileData]) -> None:
         path = Path(self.__test_dir_path)
@@ -595,10 +991,10 @@ class Expt:
         params = []
         for file_data in self.__data:
             for func_data in file_data.get_func_data():
-                compile_cmd_dict = self.__compile_cmds[func_data.get_test_dir()]
+                compile_cmd_dict = self.__compile_cmds.get(func_data.get_test_dir(), {})
                 workers.append(func_data)
                 params.append(compile_cmd_dict)
-        with ProcessPoolExecutor(max_workers=CPU_COUNT - 1) as executor:
+        with ProcessPoolExecutor(max_workers=max(1, CPU_COUNT - 1)) as executor:
             results = executor.map(self.run_worker, workers, params)
         for func_data, result in zip(workers, results):
             func_data.set_tests_num(result[0] + result[1])
@@ -614,6 +1010,22 @@ class Expt:
         for file_data in self.__data:
             file_data.gen_covtest_result(project, build, self.__llm_cov_dir)
 
+    def export_filtered_tests(self) -> None:
+        export_root = f"{self.__project}/filtered_tests{self.__type}"
+        if os.path.exists(export_root):
+            shutil.rmtree(export_root)
+        os.makedirs(export_root, exist_ok=True)
+        exported_files = []
+        for file_data in self.__data:
+            if file_data.export_filtered_tests(self.__project, export_root):
+                exported_files.append(file_data.get_name())
+        if len(exported_files) == 0:
+            with open(f"{export_root}/.notest", "w"):
+                pass
+        with open(f"{export_root}/CMakeLists.txt", "w") as cmake_file:
+            for file_name in exported_files:
+                cmake_file.write(f"add_subdirectory({file_name})\n")
+
     def gen_csv_data(self) -> list[dict[str, str]]:
         csv_data: list[dict[str, str]] = []
         for file_data in self.__data:
@@ -624,6 +1036,8 @@ class Expt:
                 file_line = func_data.get_file_line()
                 can_compile_list = func_data.get_can_compile_list()
                 can_compile_num = len(can_compile_list)
+                kept_list = func_data.get_kept_list()
+                kept_num = len(kept_list)
                 test_result = func_data.get_test_result()
                 run_tests_num = None
                 failure = None
@@ -649,6 +1063,8 @@ class Expt:
                     "compile_files": ",".join(can_compile_list),
                     "tests_run": run_tests_num,
                     "tests_pass": test_pass_num,
+                    "tests_kept": kept_num,
+                    "kept_files": ",".join(kept_list),
                     "real": is_real,
                     "lines": line_num,
                     "lines_covered": line_covered,
@@ -672,6 +1088,8 @@ class Expt:
                 "compile_files",
                 "tests_run",
                 "tests_pass",
+                "tests_kept",
+                "kept_files",
                 "real",
                 "lines",
                 "lines_covered",

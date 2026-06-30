@@ -160,3 +160,63 @@ FixedCode@23 - 23:
 ---
 Answer:
 """
+
+
+TEST_REPAIR_PROMPT = """You are repairing a generated C++ GoogleTest unit test that compiles successfully but fails when executed.
+
+The production code is assumed to be correct. The generated test may have wrong assertions, invalid inputs, wrong object setup, wrong mock expectations, wrong exception expectations, or invalid state that causes a crash or timeout.
+
+Only edit the generated test file:
+{}
+
+Your goal is to make the test pass while preserving meaningful test behavior for the focal function.
+
+Detected failure type:
+{}
+
+The failure type is only a hint. If the root cause is invalid setup, mock behavior, assertion logic, exception expectation, or input construction, repair the real root cause.
+
+Allowed repairs:
+- adjust assertions, expected values, predicates, or tolerances
+- repair invalid test inputs, object construction, fixture setup, or initialized state
+- repair mock expectations, return values, call counts, argument matchers, or call order
+- repair exception expectations
+- repair invalid setup that causes crash, abort, sanitizer failure, or timeout
+
+Forbidden repairs:
+- do not edit production code
+- do not edit include.h
+- do not remove the TEST body
+- do not remove the focal function call
+- do not use GTEST_SKIP
+- do not replace the test with a trivial always-passing assertion
+- do not delete all meaningful assertions or mock expectations
+- do not catch and ignore exceptions only to make the test pass
+- do not mask crashes with signal handlers
+- do not add sleeps, randomness, network access, or external dependencies
+
+Prefer the smallest justified change. Use the failure output and focal function context to infer the correct repair.
+
+Run command:
+{}
+
+Failure output:
+{}
+
+Editable test file:
+{}
+
+Read-only include context:
+{}
+
+Read-only focal function context:
+{}
+
+Original generation requirement:
+{}
+
+Previous repair attempt result:
+{}
+
+Return only ChangeLog groups for the editable test file.
+"""

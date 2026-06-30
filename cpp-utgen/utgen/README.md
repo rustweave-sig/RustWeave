@@ -145,3 +145,53 @@ config_private.py和config.py中都定义了如下值：
    > 生成单元测试需要调用GPT API，项目级调用通常耗时和金钱都不少😂，尽量不要重复生成测试用例
 
    最终会在项目目录下生成若干`result*.csv`的文件，为最终结果文件。
+
+## C侧测试筛选与修复流程
+
+生成测试后，可以将后处理拆成编译检查、运行检查和最终导出三个轻量阶段：
+
+```shell
+# 只检查生成测试是否可编译，并写入 llm_tests*/filter_manifest.json
+python main.py -p path/to/project -b /path/to/build --compile-only
+
+# 只运行编译通过的测试，剔除运行失败用例，并只用运行通过用例统计覆盖率
+python main.py -p path/to/project -b /path/to/build --test-only
+
+# 只导出最终可用测试，输出到 filtered_tests*
+python main.py -p path/to/project -b /path/to/build --export-only
+```
+
+其中“剔除”不会删除原始测试文件，而是在`filter_manifest.json`中将失败用例标记为`kept=false`。后续覆盖率统计和`filtered_tests*`导出只使用`compile=pass`且`run=pass`的测试；导出的`filtered_tests*` CMake 目标会同时带上被测源文件及其依赖源文件。
+
+如果需要修复编译失败测试，可以使用：
+
+```shell
+python compile_repair.py -p path/to/project -b /path/to/build -t _req_cxt
+```
+
+`compile_repair.py`会优先读取`filter_manifest.json`，只修复`compile=fail`的测试；如果缺少manifest，则退回到历史脚本`rust_assistant.py`的全量扫描逻辑。脚本会重新执行对应编译命令确认修复是否真实通过，不会只依赖历史`.refined`标记。该能力仍然需要目标项目开启编译错误JSON输出：
+
+```cmake
+add_compile_options(-fdiagnostics-format=json-file)
+```
+
+如果需要修复编译通过但运行失败的测试，可以使用：
+
+```shell
+python test_repair.py -p path/to/project -b /path/to/build -t _req_cxt
+```
+
+`test_repair.py`会读取`filter_manifest.json`中的`run=fail`或`run=timeout`测试，向大模型提供运行失败输出、测试文件、`include.h`和被测函数上下文，要求模型以`ChangeLog`格式只修改当前`test_*.cpp`。每个候选修改都会重新构建并运行，只有`compile pass && run pass`时才会写回原测试并标记为`kept=true`；失败候选或验证异常都会回滚。
+
+推荐的C侧可用测试集闭环如下：
+
+```shell
+python main.py -p path/to/project -b /path/to/build
+python main.py -p path/to/project -b /path/to/build --compile-only
+python compile_repair.py -p path/to/project -b /path/to/build -t _req_cxt
+python main.py -p path/to/project -b /path/to/build --compile-only
+python main.py -p path/to/project -b /path/to/build --test-only
+python test_repair.py -p path/to/project -b /path/to/build -t _req_cxt
+python main.py -p path/to/project -b /path/to/build --test-only
+python main.py -p path/to/project -b /path/to/build --export-only
+```

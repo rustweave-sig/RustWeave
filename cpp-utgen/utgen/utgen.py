@@ -714,7 +714,13 @@ class Project:
             for file_dir in file_name_list:
                 cmake_file.write(f"add_subdirectory({file_dir})\n")
 
-    def post_analysis(self, test_types: list[str]) -> None:
+    def post_analysis(
+        self,
+        test_types: list[str],
+        do_compile: bool = True,
+        do_test: bool = True,
+        do_export: bool = False,
+    ) -> None:
         self.__expts = [
             Expt(test_type, self.__project_path) for test_type in test_types
         ]
@@ -722,9 +728,18 @@ class Project:
         for expt in self.__expts:
             print(f"Running experiment for llm_tests{expt.get_type()} ...")
             expt.init(self.__expt_dict)
-            # expt.gen_compile_result(self.__build_path)
-            expt.gen_compile_result_concurrent(self.__build_path)
-            expt.gen_covtest_result(self.__project_path, self.__build_path)
+            expt.load_manifest()
+            if do_compile:
+                # expt.gen_compile_result(self.__build_path)
+                expt.gen_compile_result_concurrent(self.__build_path)
+                expt.dump_manifest()
+            if do_test:
+                expt.gen_covtest_result(self.__project_path, self.__build_path)
+                expt.dump_manifest()
+            if do_export:
+                expt.export_filtered_tests()
+                expt.dump_manifest()
             # dump result to csv
-            print(f"Dumping result for llm_tests{expt.get_type()} ...")
-            expt.dump_to_csv(self.__project_path)
+            if do_compile or do_test:
+                print(f"Dumping result for llm_tests{expt.get_type()} ...")
+                expt.dump_to_csv(self.__project_path)

@@ -25,7 +25,7 @@ PALM 的整体思路是把程序分析结果纳入 Prompt 构建过程：先用 
 1. 测试需求提取：`brinfo` 基于 Clang AST 构建被测函数 CFG，遍历分支和循环路径，提取路径条件链、返回值和 Mock 需求，输出 `llm_reqs/*_req.json`。
 2. 上下文构建：`focxt` 分析项目中的类型、函数、宏、include、全局变量、构造函数、方法和调用依赖，输出 `project_cxt.json`。
 3. Prompt 设计与生成：`utgen` 读取条件链和上下文，将其填充到 Prompt 模板中，形成无需求、上下文增强、需求增强、需求+上下文增强四类生成配置。
-4. 单元测试生成与修复：`utgen` 调用 LLM 生成 GoogleTest 测试文件，写入 `llm_tests*` 目录，生成 CMake 目标，编译、运行、统计覆盖率；可选地用 `chattester.py` 或 `rust_assistant.py` 进行编译错误修复。
+4. 单元测试生成、筛选与修复：`utgen` 调用 LLM 生成 GoogleTest 测试文件，写入 `llm_tests*` 目录，生成 CMake 目标，编译、运行、统计覆盖率；后处理阶段会记录 `filter_manifest.json`，只保留编译和运行均通过的测试进入覆盖率和 `filtered_tests*` 导出；可选地用 `compile_repair.py` 修复编译错误，用 `test_repair.py` 修复运行失败测试。
 
 ```mermaid
 flowchart LR
@@ -43,10 +43,14 @@ flowchart LR
     J --> K["LLM 生成 GoogleTest"]
     K --> L["llm_tests / llm_tests_cxt / llm_tests_req / llm_tests_req_cxt"]
     L --> M["CMake 编译筛选"]
-    M --> N["CTest + Coverage"]
+    M --> N["运行筛选: run_pass/run_fail"]
     M --> O["LLM 编译错误修复"]
     O --> M
-    N --> P["result*.csv"]
+    N --> Q["LLM 测试失败修复"]
+    Q --> N
+    N --> R["仅 run_pass 覆盖率"]
+    R --> P["result*.csv + filter_manifest.json"]
+    P --> S["filtered_tests*"]
 ```
 
 ## 3. 核心概念
@@ -186,6 +190,7 @@ TEST(SomeClassTest, bool_SomeClass_find_int_int_001)
 
 - `chattester.py`：借鉴 ChatTester 思路，先让模型推断函数意图并生成基础测试，再用编译错误中的 `<Buggy Line>` 迭代生成完整修复版测试文件。
 - `rust_assistant.py`：名称是历史遗留，实际用于 C/C++ GoogleTest 编译错误修复。它读取编译器 JSON 错误、抽取相关源码片段，要求模型返回 `ChangeLog`，再验证并应用修改。
+- `compile_repair.py`：面向当前流程新增的命令行入口，优先读取 `filter_manifest.json` 并只修复 `compile=fail` 的测试；缺少 manifest 时会退回到 `rust_assistant.py` 的全量扫描逻辑。脚本会重新执行编译命令确认结果，避免把历史 `.refined` 标记误当作真实修复成功。
 
 `rust_assistant.py` 需要目标项目启用编译错误 JSON 输出：
 
@@ -194,6 +199,19 @@ add_compile_options(-fdiagnostics-format=json-file)
 ```
 
 该配置会影响 ChatTester，因为 ChatTester 的错误解析依赖标准输出中的编译错误文本。
+
+### 3.7 运行失败修复
+
+`test_repair.py` 用于修复已经通过编译但运行失败的生成测试。它读取 `llm_tests*/filter_manifest.json` 中 `compile=pass` 且 `run=fail` 或 `run=timeout` 的记录，为每个失败测试构造一个诊断式 Prompt，输入包括：
+
+- GoogleTest/运行失败日志。
+- 当前可编辑的 `test_*.cpp`，带行号。
+- 同目录 `include.h`，只读。
+- 被测函数所在源文件的上下文片段，来源于 manifest 中的 `source_path` 和 `loc`。
+- 原测试文件中嵌入的条件链需求注释。
+- 上一轮候选修复失败日志。
+
+Prompt 明确要求模型只修改当前 `test_*.cpp`，并禁止删除 `TEST`、删除被测函数调用、使用 `GTEST_SKIP`、替换为空断言、吞掉异常或屏蔽崩溃。模型仍然使用 `ChangeLog` 格式返回修改；脚本会先确认 ChangeLog 目标文件就是当前测试，再做静态规则检查，然后临时写入候选、重新构建并运行。只有候选满足 `compile pass && run pass` 时才会写回原测试并标记 `kept=true`，失败候选或验证异常会回滚并记录到 `repair_log`。
 
 ## 4. Workspace 结构
 
@@ -215,7 +233,9 @@ add_compile_options(-fdiagnostics-format=json-file)
 | `utgen/expt.py` | 编译通过率、运行通过率、行覆盖率、分支覆盖率统计。 |
 | `utgen/chattester.py` | ChatTester 风格基线和简单编译修复流程。 |
 | `utgen/rust_assistant.py` | 基于编译器 JSON 错误和 ChangeLog 的编译修复助手。 |
-| `utgen/prompt.py` | 测试生成、ChatTester 和编译修复 Prompt 模板。 |
+| `utgen/compile_repair.py` | 编译修复命令行入口，封装历史 `rust_assistant.py` 能力。 |
+| `utgen/test_repair.py` | 运行失败修复命令行入口，针对 `run_fail`/`timeout` 测试做 LLM 修复和机器验证。 |
+| `utgen/prompt.py` | 测试生成、ChatTester、编译修复和运行失败修复 Prompt 模板。 |
 | `utgen/config.py` | 默认配置项；实际使用建议创建 `config_private.py`。 |
 | `utgen/CodeCoverage.cmake` | 覆盖率 CMake 辅助脚本，应复制到目标项目的 `cmake/` 目录。 |
 
@@ -405,10 +425,10 @@ Python 层的 `utils.collect_includes` 会在 `Project.__get_source_files` 中�
 `utgen/main.py` 支持：
 
 ```text
-python main.py -p <project-path> -b <build-path> [--no-analysis] [--post-analysis] [-s <source>] [-c <class>] [-f <function>]
+python main.py -p <project-path> -b <build-path> [--no-analysis] [--post-analysis] [--compile-only] [--test-only] [--export-only] [-s <source>] [-c <class>] [-f <function>]
 ```
 
-当前项目级主流程实际使用的是 `-p`、`-b`、`--no-analysis` 和 `--post-analysis`。`-s/-c/-f` 会进入参数对象，但当前 `main.py` 没有基于它们切换单文件或单函数流程；单函数分析应直接调用底层 `brinfo` 和 `focxt`。
+当前项目级主流程实际使用的是 `-p`、`-b`、`--no-analysis`、`--post-analysis`、`--compile-only`、`--test-only` 和 `--export-only`。`-s/-c/-f` 会进入参数对象，但当前 `main.py` 没有基于它们切换单文件或单函数流程；单函数分析应直接调用底层 `brinfo` 和 `focxt`。
 
 主流程中的四类测试类型固定为：
 
@@ -425,7 +445,7 @@ test_types = ["", "_cxt", "_req", "_req_cxt"]
 5. 对四类测试类型分别 `write_cmake_file`
 6. `project.post_analysis(test_types)`
 
-指定 `--post-analysis` 时，只加载已有产物并重新统计结果，不重新分析和生成测试。
+指定 `--post-analysis` 时，只加载已有产物并重新统计结果，不重新分析和生成测试。指定 `--compile-only`、`--test-only` 或 `--export-only` 时，会自动进入 post-analysis 模式，只执行对应阶段。
 
 ### 8.2 项目准备
 
@@ -495,6 +515,7 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 - 编译通过数量。
 - 运行测试数量。
 - 运行通过数量。
+- 最终保留测试数量。
 - 函数行数。
 - 行覆盖数和行覆盖率。
 - 分支数、分支覆盖数和分支覆盖率。
@@ -503,10 +524,12 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 
 1. `Expt.init` 扫描 `llm_tests*` 目录，建立文件和函数数据。
 2. `gen_compile_result_concurrent` 从 `compile_commands.json` 中找测试文件的编译命令，并逐个编译测试文件。
-3. `gen_covtest_result` 把可编译测试复制到 `llm_coverage`，为每个测试文件生成单独 `add_executable`，运行覆盖率目标。
-4. `load_test_result` 解析 CTest JUnit XML。
-5. `load_coverage` 解析 SonarQube XML 中的行和分支覆盖率。
-6. `dump_to_csv` 输出 `result*.csv`。
+3. `dump_manifest` 将每个测试的 `compile`、`run`、`kept`、日志路径和修复状态写入 `llm_tests*/filter_manifest.json`。
+4. `gen_covtest_result` 把可编译测试复制到 `llm_coverage`，为每个测试文件生成单独 `add_executable`，逐个构建并运行。
+5. 只有 `compile=pass` 且 `run=pass` 的测试会被标记为 `kept=true`，并进入最终 coverage CMake。
+6. `load_coverage` 解析 SonarQube XML 中的行和分支覆盖率。
+7. `dump_to_csv` 输出 `result*.csv`。
+8. `export_filtered_tests` 可将 `kept=true` 的测试复制到 `filtered_tests*`，并在导出的 CMake 目标中带上被测源文件及其依赖源文件。
 
 输出 CSV 包含：
 
@@ -520,6 +543,8 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 | `compile_files` | 编译通过的测试文件列表。 |
 | `tests_run` | 实际运行测试数量。 |
 | `tests_pass` | 运行通过测试数量。 |
+| `tests_kept` | 最终保留测试数量，即编译和运行均通过的测试数量。 |
+| `kept_files` | 最终保留测试文件列表。 |
 | `real` | 是否使用真实生成测试跑出了覆盖率。 |
 | `lines` / `lines_covered` / `line_cov` | 行覆盖统计。 |
 | `branches` / `branches_covered` / `branch_cov` | 分支覆盖统计。 |
@@ -561,6 +586,10 @@ llm_tests/
 llm_tests_cxt/
 llm_tests_req/
 llm_tests_req_cxt/
+filtered_tests/
+filtered_tests_cxt/
+filtered_tests_req/
+filtered_tests_req_cxt/
 result.csv
 result_cxt.csv
 result_req.csv
@@ -571,6 +600,7 @@ result_req_cxt.csv
 
 ```text
 llm_tests_req_cxt/
+  filter_manifest.json
   source.cpp/
     bool_Class_find_int_int/
       include.h
@@ -582,6 +612,7 @@ llm_tests_req_cxt/
       CMakeLists.txt
       .generated
       compile_err.log
+      test_repair_*.log
       result.xml
       coverage.xml
       coverage/
@@ -791,6 +822,21 @@ python main.py -p <target-project> -b <target-project>/build --no-analysis
 python main.py -p <target-project> -b <target-project>/build --post-analysis
 ```
 
+如果希望在编译、修复、运行和导出之间手动插入步骤，可以使用轻量阶段参数：
+
+```sh
+# 只做编译检查并写入 llm_tests*/filter_manifest.json
+python main.py -p <target-project> -b <target-project>/build --compile-only
+
+# 只运行 compile=pass 的测试，只用 run=pass 的测试统计覆盖率
+python main.py -p <target-project> -b <target-project>/build --test-only
+
+# 只导出 kept=true 的测试到 filtered_tests*
+python main.py -p <target-project> -b <target-project>/build --export-only
+```
+
+`--compile-only`、`--test-only` 和 `--export-only` 会自动进入 post-analysis 模式，不会重新调用 LLM 生成测试。
+
 ### 10.7 单独运行底层分析工具
 
 分析单个源文件所有函数：
@@ -818,37 +864,32 @@ brinfo --project <target-project> -p <target-project>/build <source-file> -c <cl
 include-finder --project <target-project> -p <target-project>/build <source-file-1> <source-file-2>
 ```
 
-### 10.8 使用编译修复助手
+### 10.8 使用修复助手
 
-`rust_assistant.py` 不是 `main.py` 默认调用的步骤，需要在 Python 中初始化项目对象后调用。
-
-目标项目先加入：
+编译修复使用 `compile_repair.py`。它优先读取 `filter_manifest.json` 并只修复 `compile=fail` 的测试；缺少 manifest 时会退回到历史 `rust_assistant.py` 的全量扫描逻辑。脚本会重新执行编译命令确认修复是否真实通过。目标项目仍需先加入：
 
 ```cmake
 add_compile_options(-fdiagnostics-format=json-file)
 ```
 
-示例调用：
-
-```python
-from pathlib import Path
-from utgen import Project
-from rust_assistant import compilation_fix_assistant
-
-project_path = str(Path("<target-project>").resolve())
-build_path = str(Path("<target-project>/build").resolve())
-project_name = Path(project_path).name
-
-project = Project(project_name, project_path, build_path)
-project.prepare(["_req_cxt"], just_load=True)
-project.init_data()
-compilation_fix_assistant(project, test_type="_req_cxt")
-```
-
-修复后可重新运行：
+示例命令：
 
 ```sh
-python main.py -p <target-project> -b <target-project>/build --post-analysis
+python compile_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
+```
+
+运行失败修复使用 `test_repair.py`。它读取 `filter_manifest.json`，只处理 `compile=pass` 且 `run=fail` 或 `run=timeout` 的测试：
+
+```sh
+python test_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
+```
+
+修复后建议重新运行对应阶段：
+
+```sh
+python main.py -p <target-project> -b <target-project>/build --compile-only
+python main.py -p <target-project> -b <target-project>/build --test-only
+python main.py -p <target-project> -b <target-project>/build --export-only
 ```
 
 ## 11. 常见问题与注意事项
@@ -913,17 +954,33 @@ python decldef.py -p <target-project> -b <target-project>/build
 # 4. 分析、生成、统计
 python main.py -p <target-project> -b <target-project>/build
 
-# 5. 如只重新统计
-python main.py -p <target-project> -b <target-project>/build --post-analysis
+# 5. 编译检查并写入 manifest
+python main.py -p <target-project> -b <target-project>/build --compile-only
+
+# 6. 可选：修复编译失败测试
+python compile_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
+python main.py -p <target-project> -b <target-project>/build --compile-only
+
+# 7. 运行测试并只用通过测试统计覆盖率
+python main.py -p <target-project> -b <target-project>/build --test-only
+
+# 8. 可选：修复运行失败测试
+python test_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
+python main.py -p <target-project> -b <target-project>/build --test-only
+
+# 9. 导出最终可用 C 测试
+python main.py -p <target-project> -b <target-project>/build --export-only
 ```
 
-推荐优先查看最终四个 CSV：
+推荐优先查看最终四个 CSV 和四类 manifest：
 
 ```text
 result.csv
 result_cxt.csv
 result_req.csv
 result_req_cxt.csv
+llm_tests*/filter_manifest.json
+filtered_tests*
 ```
 
 一般来说，`result_req_cxt.csv` 对应 PALM 的完整配置，即同时使用路径测试需求和上下文信息。

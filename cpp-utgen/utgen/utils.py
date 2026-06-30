@@ -47,6 +47,9 @@ class UtgenArgs:
     function: str
     analysis: bool
     post_analysis: bool
+    compile_only: bool
+    test_only: bool
+    export_only: bool
 
 
 @dataclass

@@ -32,6 +32,24 @@ parser.add_argument(
     dest="post_analysis",
 )
 parser.add_argument(
+    "--compile-only",
+    help="only collect compilation results and write filter manifests",
+    action="store_true",
+    dest="compile_only",
+)
+parser.add_argument(
+    "--test-only",
+    help="only run compile-passed tests, collect coverage, and update filter manifests",
+    action="store_true",
+    dest="test_only",
+)
+parser.add_argument(
+    "--export-only",
+    help="only export kept tests from existing filter manifests",
+    action="store_true",
+    dest="export_only",
+)
+parser.add_argument(
     "-s", "--source", help="the path of the source file", required=False, dest="source"
 )
 parser.add_argument(
@@ -51,6 +69,8 @@ def print_time(start_time: float, end_time: float) -> None:
 
 if __name__ == "__main__":
     raw_args = parser.parse_args()
+    mode_selected = raw_args.compile_only or raw_args.test_only or raw_args.export_only
+    post_analysis = raw_args.post_analysis or mode_selected
     project_path = str(Path(raw_args.project).resolve())
     build = str(Path(raw_args.build).resolve())
     source = str(Path(raw_args.source).resolve()) if raw_args.source else None
@@ -61,7 +81,10 @@ if __name__ == "__main__":
         raw_args.class_name,
         raw_args.function,
         raw_args.analysis,
-        raw_args.post_analysis,
+        post_analysis,
+        raw_args.compile_only,
+        raw_args.test_only,
+        raw_args.export_only,
     )
     project_name = Path(project_path).name
     project = Project(project_name, project_path, build)
@@ -87,4 +110,12 @@ if __name__ == "__main__":
         #         break
         #     else:
         #         print("Invalid input. Please try again.")
-    project.post_analysis(test_types)
+    if mode_selected:
+        project.post_analysis(
+            test_types,
+            do_compile=utgen_args.compile_only,
+            do_test=utgen_args.test_only,
+            do_export=utgen_args.export_only,
+        )
+    else:
+        project.post_analysis(test_types)
