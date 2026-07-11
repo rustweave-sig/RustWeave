@@ -11,6 +11,7 @@ This tool integrates c2rust subcommands into a single CLI interface:
 - **feature** - Inspect, diagnose, verify, and recover feature workspaces
 - **build** - Execute C project build commands
 - **test** - Execute C project test commands
+- **testgen** - Generate, validate, and translate C unit tests
 - **clean** - Clean build artifacts
 - **translate** - Translate C code to Rust
 - **merge** - Merge translated Rust modules (executed after translate)
@@ -120,7 +121,24 @@ c2rust-xw test --feature <name> -- ctest
 
 When executed inside a project workspace that contains `.c2rust/`, `test` now performs a lightweight preflight and blocks early if the feature-level test config is incomplete.
 
-#### 5. Clean
+#### 5. Test Generation
+
+Generate C unit tests one case at a time, validate and repair each case, translate retained cases to Rust, and validate the Rust tests:
+
+```bash
+c2rust-xw testgen
+c2rust-xw testgen --feature default --project . --build build
+c2rust-xw testgen --stage rust --resume --max-repair-attempts 10
+c2rust-xw testgen --json --min-kept 1
+```
+
+`--stage` accepts `all`, `c`, `translate`, or `rust`. The default repair limit is 10 attempts per validation phase. Model settings come from `c2rust-xw env` or the corresponding `C2RUST_*` environment variables; explicit non-empty environment values take precedence.
+
+The installed layout must contain `python/cpp_utgen/test_pipeline.py` and `python/translate_and_fix` under `$C2RUST_HOME`. C generation also requires Python clang bindings and the cpp-utgen analysis tools. `C2RUST_TESTGEN_SCRIPT`, `C2RUST_PYTHON`, and `C2RUST_TRANSLATE_DIR` can override the installed defaults.
+
+Exit code `0` means at least `--min-kept` usable cases remain, `2` means the pipeline completed but retained too few cases, and `1` indicates a setup or infrastructure failure.
+
+#### 6. Clean
 
 Execute clean commands to remove build artifacts:
 
@@ -133,7 +151,7 @@ c2rust-xw clean --feature <name> -- rm -rf build/
 - `--feature <name>` - Specify a feature name
 - `-- <clean_cmd>` - Clean command to execute (required)
 
-#### 6. Translate
+#### 7. Translate
 
 Translate C code to Rust:
 
@@ -170,7 +188,7 @@ When executed inside a project workspace that contains `.c2rust/`, `translate` n
 
 If the current directory is not a c2rust project root, the CLI keeps the previous behavior and does not force this preflight.
 
-#### 7. Feature
+#### 8. Feature
 
 Inspect and manage feature workspaces:
 
@@ -214,7 +232,7 @@ Warning severity notes:
 - but it no longer downgrades `overall_status` by itself
 - this lets a clean-and-runnable workspace stay `ready` even before any translation stats file has been produced
 
-#### 8. Merge
+#### 9. Merge
 
 Merge translated Rust modules (executed after translate):
 

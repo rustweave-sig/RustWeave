@@ -91,3 +91,69 @@ python3 /path/to/C2RustXW-CLI/tools/feature_json_summary.py check default --bin 
 ```shell
 c2rust-xw merge
 ```
+
+## C 单元测试生成与 Rust 用例翻译
+
+完成 C 到 Rust 的项目翻译后，可用 `testgen` 对每个生成用例立即执行
+“C 编译/运行检查与修复 -> Rust 用例翻译 -> Rust 编译/运行检查与修复”：
+
+```shell
+c2rust-xw testgen \
+  --feature default \
+  --project . \
+  --build build \
+  --test-type req-cxt \
+  --max-repair-attempts 10 \
+  --stage all \
+  --resume
+```
+
+`--max-repair-attempts` 默认是 10，分别限制每个 C/Rust 检查阶段的修复次数。
+单个用例在达到上限后会被记录并筛除，不会阻断后续用例。最终是否成功由
+`--min-kept`（默认 1）要求的可用用例数决定。
+
+### 阶段选择
+
+| `--stage` | 行为 | 成功计数 |
+| --- | --- | --- |
+| `all` | 生成 C 用例，并逐例完成 C 检查、翻译和 Rust 检查 | Rust 运行通过用例 |
+| `c` | 只生成、检查和修复 C 用例 | C 编译且运行通过用例 |
+| `translate` | 翻译 manifest 中 C 侧已通过的用例，不运行 Cargo | 翻译成功用例 |
+| `rust` | 检查 manifest 中已有的 Rust 翻译用例 | Rust 运行通过用例 |
+
+`--resume` 会跳过内容未变化的终态用例；`--json` 输出适合 CI 消费的汇总。
+`translate`/`rust` 阶段若发现对应的
+`llm_tests<test-type>/filter_manifest.json`，会将旧版 `cpp-utgen` 的筛选结果
+合并到统一 manifest，因此已有 C 用例不需要重新生成。
+manifest 和逐次检查日志位于
+`.c2rust/<feature>/testgen/manifest.json` 与
+`.c2rust/<feature>/testgen/logs/`，翻译后的 Rust 测试位于
+`.c2rust/<feature>/rust/src/c2rust_generated_tests/`。
+
+Rust 断言值不一致会被标记为 `semantic_mismatch`。该结果表示翻译后的 Rust
+实现与已通过的 C 用例语义不一致，不会通过修改期望值或调用修复模型来掩盖。
+常见的整数、布尔和字符断言还会在翻译后静态核对 C 侧期望值；可识别的
+oracle 被改写时，该翻译用例会直接筛除。
+
+### 环境要求
+
+- 先执行 `./install.sh`，并配置 `C2RUST_HOME`、`PATH` 和 `PYTHONPATH`。
+- 使用 `c2rust-xw env set model/base_url/api_key` 配置模型；
+  `c2rust-xw testgen` 会把配置传给 Python 流水线。
+- Python 环境需包含 `openai`、`httpx`、`tomli`、`libclang`、`requests`、
+  `matplotlib`、`numpy`、`pyyaml` 和 `xmltodict`。可在仓库内执行：
+  ```shell
+  python3 -m pip install -r cpp-utgen/utgen/requirements.txt
+  ```
+  Python clang 绑定必须与 `libclang.so`
+  版本一致；必要时通过 `C2RUST_LIBCLANG_PATH` 指定动态库。
+- `brinfo`、`focxt`、`include-finder` 必须在 `PATH` 中，或分别通过
+  `C2RUST_BRINFO`、`C2RUST_FOCXT`、`C2RUST_INCLUDE_FINDER` 指定。
+- C 项目需提前生成 `<build>/compile_commands.json`，并按
+  [cpp-utgen 使用说明](cpp-utgen/utgen/README.md) 配置 GoogleTest、CTest 和
+  `llm_coverage`。Rust feature 工作区需已有可构建的
+  `.c2rust/<feature>/rust/Cargo.toml`。
+
+退出码为：`0` 表示达到 `--min-kept`，`1` 表示环境或工具链等基础设施错误，
+`2` 表示流水线已正常完成但可用用例不足。完整设计和状态定义见
+[C 测试生成、翻译与修复流程](docs/c-test-generation-translation-workflow.md)。

@@ -4,7 +4,8 @@ c2rust 工作流的 C 项目测试执行工具。
 
 ## 概述
 
-`c2rust-test` 是一个命令行工具，用于在当前目录中执行 C 构建项目的测试命令。该工具是 c2rust 工作流的一部分，用于管理 C 到 Rust 的转换。
+`c2rust-test` 是 c2rust 工作流的测试工具，可在当前目录执行 C 项目的测试命令，
+也可驱动 C 用例生成、逐例检查/修复、Rust 用例翻译及 Rust 侧验证。
 
 ## 安装
 
@@ -81,6 +82,53 @@ c2rust-test --help
 ```bash
 c2rust-test test --help
 ```
+
+## 生成并翻译单元测试
+
+通常应使用上层入口 `c2rust-xw testgen`，它会读取 `c2rust-xw env` 中保存的
+模型配置。也可以直接调用本工具：
+
+```bash
+export C2RUST_MODEL="<model>"
+export C2RUST_BASE_URL="<base-url>"
+export C2RUST_API_KEY="<api-key>"
+
+c2rust-test testgen \
+  --feature default \
+  --project . \
+  --build build \
+  --test-type req-cxt \
+  --max-repair-attempts 10 \
+  --stage all \
+  --resume
+```
+
+直接调用时，脚本默认从
+`$C2RUST_HOME/python/cpp_utgen/test_pipeline.py` 加载，Python 解释器按
+`C2RUST_PYTHON`、`$C2RUST_HOME/bin/python`、`python3`、`python` 的顺序选择。
+开发环境可用 `C2RUST_TESTGEN_SCRIPT` 覆盖脚本位置。
+
+主要参数：
+
+- `--stage all`：逐例执行 C 生成/检查/修复、Rust 翻译/检查/修复。
+- `--stage c`：只处理 C 用例。
+- `--stage translate`：只翻译 manifest 中 C 侧已通过的用例。
+- `--stage rust`：只验证已有 Rust 翻译用例。
+- `--max-repair-attempts`：每个检查阶段的最大修复次数，默认 10。
+- `--resume`：跳过内容未变化的终态用例。
+- `--min-kept`：成功所需的最少可用用例数，默认 1。
+- `--json`：输出结构化汇总。
+
+单个无法修复的用例会被筛除，流水线继续处理其他用例。Rust 断言不一致会
+记录为 `semantic_mismatch`，不会调用修复模型修改期望值。结果保存在
+`.c2rust/<feature>/testgen/`，Rust 测试保存在
+`.c2rust/<feature>/rust/src/c2rust_generated_tests/`。
+
+退出码会原样转发：`0` 表示达到 `--min-kept`，`1` 表示基础设施错误，`2`
+表示流程完成但可用用例不足。C 生成阶段还需要 Python clang/libclang、
+`brinfo`、`focxt`、`include-finder`、`compile_commands.json` 及项目侧
+GoogleTest/CTest 配置；完整准备步骤见仓库根目录 README 的
+“C 单元测试生成与 Rust 用例翻译”章节。
 
 ## Git 自动提交
 

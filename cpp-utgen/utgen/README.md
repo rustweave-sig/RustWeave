@@ -45,13 +45,22 @@ config_private.py和config.py中都定义了如下值：
 3. LIBCLANG_PATH：指定libclang.so的路径。
 4. BRINFO_PATH：指定brinfo可执行文件的路径。
 5. FOCXT_PATH：指定focxt可执行文件的路径。
-6. CPU_COUNT：系统中CPU的数量，自动设置。用于并发执行任务时设置最多进程数，可根据需要在创建`ProcessPoolExecutor()`时调整参数`max_workers`。
-7. CLANG_SCAN_DEPS_PATH：指定`clang-scan-deps`的路径，Ubuntu下该工具可通过`apt install clang-tools`安装。
-8. CLANGD_INDEXER_PATH：指定`clangd-indexer`的路径，该工具可从[clangd官方GitHub仓库](https://github.com/clangd/clangd/releases)下载安装。
+6. INCLUDE_FINDER_PATH：指定include-finder可执行文件的路径。
+7. CPU_COUNT：系统中CPU的数量，自动设置。用于并发执行任务时设置最多进程数，可根据需要在创建`ProcessPoolExecutor()`时调整参数`max_workers`。
+8. CLANG_SCAN_DEPS_PATH：指定`clang-scan-deps`的路径，Ubuntu下该工具可通过`apt install clang-tools`安装。
+9. CLANGD_INDEXER_PATH：指定`clangd-indexer`的路径，该工具可从[clangd官方GitHub仓库](https://github.com/clangd/clangd/releases)下载安装。
 
 项目会首先尝试从`config_private.py`中导入上述值，当`config_private.py`不存在时，会从`config.py`中导入。
 
 建议是使用`config_private.py`来设置这些值，git不会将`config_private.py`加入版本控制。
+
+集成 CLI 也支持直接使用环境变量 `C2RUST_LIBCLANG_PATH`、
+`C2RUST_BRINFO`、`C2RUST_FOCXT` 和 `C2RUST_INCLUDE_FINDER`。Python 依赖可通过
+以下命令安装：
+
+```shell
+python3 -m pip install -r requirements.txt
+```
 
 ## 使用方法
 
