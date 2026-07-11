@@ -48,12 +48,18 @@ DESCRIPTION:
     
     - c2rust-build-master: Builds and installs libhook.so to <prefix>/lib
     - hybrid-build: Builds and installs libc2rust-hybrid-build.so to <prefix>/lib
-    - translate_and_fix: Copies the directory to <prefix>/python
+    - translate_and_fix: Copies the standalone package to
+      <prefix>/python/translate_and_fix
+    - cpp-utgen/utgen: Copies the unit-test pipeline to
+      <prefix>/python/cpp_utgen, excluding caches, private configuration, and
+      generated test artifacts
 
 INSTALLATION STRUCTURE:
     <prefix>/bin     - Binary executables from Rust projects
     <prefix>/lib     - Shared libraries (.so files)
     <prefix>/python  - Python modules and scripts
+      translate_and_fix/ - Translation and repair package
+      cpp_utgen/          - C unit-test generation pipeline
 
 EOF
 }
@@ -268,20 +274,90 @@ install_translate_and_fix() {
     
     echo "Processing translate_and_fix..."
     
-    # Remove existing directory if present to ensure idempotent behavior
     local dest_dir="${PREFIX}/python/translate_and_fix"
-    if [[ -d "$dest_dir" ]]; then
-        rm -rf "$dest_dir"
-    fi
-    
-    # Copy the entire directory to PREFIX/python/
-    if cp -r "$translate_dir" "${PREFIX}/python/"; then
-        echo -e "${GREEN}✓ Successfully copied translate_and_fix to python directory${NC}"
-        return 0
-    else
+    rm -rf "$dest_dir"
+    mkdir -p "$dest_dir"
+
+    if ! (
+        set -o pipefail
+        tar \
+            --exclude='__pycache__' \
+            --exclude='.pytest_cache' \
+            --exclude='.mypy_cache' \
+            --exclude='*.pyc' \
+            --exclude='*.pyo' \
+            --exclude='tests' \
+            -C "$translate_dir" -cf - . | tar -C "$dest_dir" -xf -
+    ); then
         echo -e "${RED}Error: Failed to copy translate_and_fix directory${NC}" >&2
         return 1
     fi
+
+    echo -e "${GREEN}✓ Successfully copied translate_and_fix to python directory${NC}"
+    return 0
+}
+
+# Install the cpp-utgen Python package without local caches, credentials, or run artifacts.
+install_cpp_utgen() {
+    local utgen_dir="${SCRIPT_DIR}/cpp-utgen/utgen"
+
+    if [[ ! -d "$utgen_dir" ]]; then
+        return 0
+    fi
+
+    echo "Processing cpp-utgen..."
+
+    local dest_dir="${PREFIX}/python/cpp_utgen"
+    rm -rf "$dest_dir"
+    mkdir -p "$dest_dir"
+
+    if ! (
+        set -o pipefail
+        tar \
+            --exclude='__pycache__' \
+            --exclude='.pytest_cache' \
+            --exclude='.mypy_cache' \
+            --exclude='.coverage' \
+            --exclude='*.pyc' \
+            --exclude='*.pyo' \
+            --exclude='*.bak' \
+            --exclude='*.txt' \
+            --exclude='*.cpp' \
+            --exclude='*.json' \
+            --exclude='*.xml' \
+            --exclude='*.yaml' \
+            --exclude='*.yml' \
+            --exclude='*.csv' \
+            --exclude='*.log' \
+            --exclude='config_private.py' \
+            --exclude='chat.py' \
+            --exclude='test.py' \
+            --exclude='scripts.py' \
+            --exclude='test' \
+            --exclude='tests' \
+            --exclude='llm_tests*' \
+            --exclude='filtered_tests*' \
+            --exclude='llm_coverage' \
+            --exclude='c2rust-testgen-bin' \
+            --exclude='filter_manifest.json' \
+            --exclude='result*.csv' \
+            --exclude='result*.xml' \
+            --exclude='coverage*.xml' \
+            --exclude='coverage*.log' \
+            --exclude='test_repair_*.xml' \
+            --exclude='test_*.cpp' \
+            -C "$utgen_dir" -cf - . | tar -C "$dest_dir" -xf -
+    ); then
+        echo -e "${RED}Error: Failed to copy cpp-utgen package${NC}" >&2
+        return 1
+    fi
+
+    if [[ -f "$utgen_dir/requirements.txt" ]]; then
+        cp "$utgen_dir/requirements.txt" "$dest_dir/requirements.txt"
+    fi
+
+    echo -e "${GREEN}✓ Successfully installed cpp-utgen to python/cpp_utgen${NC}"
+    return 0
 }
 
 # Handle conf directory
@@ -355,6 +431,16 @@ install_additional_components() {
             additional_succeeded+=("translate_and_fix")
         else
             additional_failed+=("translate_and_fix")
+        fi
+        echo ""
+    fi
+
+    # Install cpp-utgen if present
+    if [[ -d "${SCRIPT_DIR}/cpp-utgen/utgen" ]]; then
+        if install_cpp_utgen; then
+            additional_succeeded+=("cpp-utgen")
+        else
+            additional_failed+=("cpp-utgen")
         fi
         echo ""
     fi
@@ -507,10 +593,12 @@ main() {
     echo -e "对于 ${BLUE}bash${NC}，添加以下行到 ${BLUE}~/.bashrc${NC}："
     echo -e "    ${GREEN}export C2RUST_HOME=\"${PREFIX}\"${NC}"
     echo -e "    ${GREEN}export PATH=\$C2RUST_HOME/bin:\$PATH${NC}"
+    echo -e "    ${GREEN}export PYTHONPATH=\$C2RUST_HOME/python\${PYTHONPATH:+:\$PYTHONPATH}${NC}"
     echo ""
     echo -e "对于 ${BLUE}zsh${NC}，添加以下行到 ${BLUE}~/.zshrc${NC}："
     echo -e "    ${GREEN}export C2RUST_HOME=\"${PREFIX}\"${NC}"
     echo -e "    ${GREEN}export PATH=\$C2RUST_HOME/bin:\$PATH${NC}"
+    echo -e "    ${GREEN}export PYTHONPATH=\$C2RUST_HOME/python\${PYTHONPATH:+:\$PYTHONPATH}${NC}"
     echo ""
     echo -e "然后运行: ${BLUE}source ~/.bashrc${NC} (或 ${BLUE}source ~/.zshrc${NC})"
     echo "=========================================="

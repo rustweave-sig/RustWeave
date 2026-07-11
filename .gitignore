@@ -1,7 +1,8 @@
-./c2rust-build-master/hook/*.so
-./hybrid-build/*.so
+/c2rust-build-master/hook/*.so
+/hybrid-build/*.so
 
 **/Cargo.lock
 **/target/
 **/__pycache__/
 .local-dev/
+/auth.txt

@@ -72,6 +72,9 @@ struct TranslationUnitAnalysis {
 }
 
 impl Feature {
+    const GENERATED_TESTS_MODULE: &'static str = "c2rust_generated_tests";
+    const GENERATED_TESTS_DECL: &'static str = "#[cfg(test)]\nmod c2rust_generated_tests;\n";
+
     pub fn new(name: &str) -> Result<Self> {
         let root = get_root()?.join(".c2rust").join(name);
         let prefix = Self::get_file_prefix(&root.join("c"));
@@ -406,6 +409,7 @@ impl Feature {
         } else {
             println!("Feature '{}' already up to date", self.name);
         }
+        self.ensure_generated_tests_module()?;
         self.generate_translation_plan()?;
         Ok(())
     }
@@ -644,11 +648,57 @@ impl Feature {
             code.push_str(&mod_name);
             code.push_str(";\n");
         }
+        code.push('\n');
+        code.push_str(Self::GENERATED_TESTS_DECL);
         let lib_rs = self.root.join("rust/src/lib.rs");
         fs::write(&lib_rs, code.as_bytes()).log_err(&format!("write {}", lib_rs.display()))?;
         let lib_normalized = self.root.join("rust/src/lib.normalized");
         fs::write(&lib_normalized, code.as_bytes())
             .log_err(&format!("write {}", lib_normalized.display()))?;
+        self.ensure_generated_tests_module()?;
+        Ok(())
+    }
+
+    fn ensure_generated_tests_module(&self) -> Result<()> {
+        let rust_src = self.root.join("rust/src");
+        let tests_dir = rust_src.join(Self::GENERATED_TESTS_MODULE);
+        fs::create_dir_all(&tests_dir).log_err(&format!("create {}", tests_dir.display()))?;
+
+        let tests_mod = tests_dir.join("mod.rs");
+        if !tests_mod.exists() {
+            fs::write(
+                &tests_mod,
+                "// Rust tests translated from validated C unit tests are registered here.\n",
+            )
+            .log_err(&format!("write {}", tests_mod.display()))?;
+        }
+
+        for lib_path in [rust_src.join("lib.rs"), rust_src.join("lib.normalized")] {
+            if !lib_path.exists() {
+                continue;
+            }
+            let mut content =
+                fs::read_to_string(&lib_path).log_err(&format!("read {}", lib_path.display()))?;
+            let ast =
+                syn::parse_file(&content).log_err(&format!("parse {}", lib_path.display()))?;
+            let has_module = ast.items.iter().any(|item| {
+                matches!(
+                    item,
+                    syn::Item::Mod(module)
+                        if module.ident == Self::GENERATED_TESTS_MODULE
+                )
+            });
+            if has_module {
+                continue;
+            }
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push('\n');
+            content.push_str(Self::GENERATED_TESTS_DECL);
+            fs::write(&lib_path, content.as_bytes())
+                .log_err(&format!("write {}", lib_path.display()))?;
+        }
         Ok(())
     }
 
@@ -2199,6 +2249,65 @@ mod tests {
     fn write_mod_files(mod_dir: &Path, content: &str) {
         fs::write(mod_dir.join("mod.rs"), content).unwrap();
         fs::write(mod_dir.join("mod.normalized"), content).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_generated_tests_module_is_idempotent_and_preserves_tests() {
+        let temp = TempDir::new().unwrap();
+        let rust_src = temp.path().join("rust/src");
+        fs::create_dir_all(&rust_src).unwrap();
+        fs::write(rust_src.join("lib.rs"), "pub fn translated() {}\n").unwrap();
+        fs::write(rust_src.join("lib.normalized"), "pub fn translated() {}\n").unwrap();
+
+        let feature = Feature {
+            root: temp.path().to_path_buf(),
+            prefix: temp.path().to_path_buf(),
+            name: "test".to_string(),
+            files: Vec::new(),
+            fast: false,
+        };
+        feature.ensure_generated_tests_module().unwrap();
+
+        let tests_mod = rust_src.join("c2rust_generated_tests/mod.rs");
+        assert!(tests_mod.is_file());
+        fs::write(&tests_mod, "mod case_123;\n").unwrap();
+        feature.ensure_generated_tests_module().unwrap();
+
+        assert_eq!(fs::read_to_string(&tests_mod).unwrap(), "mod case_123;\n");
+        for lib_path in [rust_src.join("lib.rs"), rust_src.join("lib.normalized")] {
+            let content = fs::read_to_string(lib_path).unwrap();
+            assert_eq!(content.matches("mod c2rust_generated_tests;").count(), 1);
+            assert!(content.contains("#[cfg(test)]\nmod c2rust_generated_tests;"));
+        }
+    }
+
+    #[test]
+    fn test_reinitialization_layout_keeps_generated_test_registrations() {
+        let temp = TempDir::new().unwrap();
+        let rust_src = temp.path().join("rust/src");
+        let tests_dir = rust_src.join("c2rust_generated_tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(tests_dir.join("mod.rs"), "mod existing_case;\n").unwrap();
+
+        let feature = Feature {
+            root: temp.path().to_path_buf(),
+            prefix: temp.path().to_path_buf(),
+            name: "test".to_string(),
+            files: Vec::new(),
+            fast: false,
+        };
+        feature.create_file_directories().unwrap();
+        feature.create_file_directories().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(tests_dir.join("mod.rs")).unwrap(),
+            "mod existing_case;\n"
+        );
+        for lib_path in [rust_src.join("lib.rs"), rust_src.join("lib.normalized")] {
+            let content = fs::read_to_string(lib_path).unwrap();
+            assert_eq!(content.matches("mod c2rust_generated_tests;").count(), 1);
+            assert!(content.contains("#[cfg(test)]\nmod c2rust_generated_tests;"));
+        }
     }
 
     fn create_test_rust_structure(temp_dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {

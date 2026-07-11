@@ -1,8 +1,8 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -65,6 +65,36 @@ enum Commands {
         test_cmd: Vec<String>,
     },
 
+    /// 生成、检查并翻译 C 单元测试
+    Testgen {
+        #[arg(long, default_value = "default")]
+        feature: String,
+
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+
+        #[arg(long, default_value = "build")]
+        build: PathBuf,
+
+        #[arg(long, default_value = "req-cxt")]
+        test_type: String,
+
+        #[arg(long, default_value_t = 10, value_parser = parse_positive_usize)]
+        max_repair_attempts: usize,
+
+        #[arg(long, value_enum, default_value_t = TestgenStage::All)]
+        stage: TestgenStage,
+
+        #[arg(long)]
+        resume: bool,
+
+        #[arg(long)]
+        json: bool,
+
+        #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
+        min_kept: usize,
+    },
+
     /// 执行清理命令
     Clean {
         #[arg(long)]
@@ -124,6 +154,35 @@ enum Commands {
         #[command(subcommand)]
         command: FeatureCommands,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TestgenStage {
+    All,
+    C,
+    Translate,
+    Rust,
+}
+
+impl TestgenStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::C => "c",
+            Self::Translate => "translate",
+            Self::Rust => "rust",
+        }
+    }
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("'{value}' is not a positive integer"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
 }
 
 #[derive(Subcommand)]
@@ -378,15 +437,23 @@ fn has_non_empty_string_key(table: Option<&toml::value::Table>, key: &str) -> bo
 fn detect_python_interpreter_with_source() -> Option<(String, &'static str)> {
     if let Ok(c2rust_home) = env::var("C2RUST_HOME") {
         let candidate = PathBuf::from(c2rust_home).join("bin").join("python");
-        if candidate.is_file() && Command::new(&candidate).arg("--version").output().is_ok() {
+        if candidate.is_file() && python_interpreter_works(candidate.as_os_str()) {
             return Some((candidate.to_string_lossy().into_owned(), "c2rust_home"));
         }
     }
 
     ["python3", "python"]
         .into_iter()
-        .find(|candidate| Command::new(candidate).arg("--version").output().is_ok())
+        .find(|candidate| python_interpreter_works(OsStr::new(candidate)))
         .map(|candidate| (candidate.to_string(), "path"))
+}
+
+fn python_interpreter_works(candidate: &OsStr) -> bool {
+    Command::new(candidate)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn preflight_hint(issue: &str) -> Option<&'static str> {
@@ -1587,6 +1654,201 @@ fn save_user_env_config(path: &Path, config: &UserEnvConfig) -> Result<(), Strin
     Ok(())
 }
 
+fn model_env_vars_from_config<F>(
+    config: &UserEnvConfig,
+    mut env_is_set: F,
+) -> Vec<(&'static str, OsString)>
+where
+    F: FnMut(&str) -> bool,
+{
+    ENV_KEY_TO_VAR
+        .iter()
+        .filter_map(|&(key, env_var)| {
+            if env_is_set(env_var) {
+                return None;
+            }
+            config
+                .model
+                .get(key)
+                .map(|value| (env_var, OsString::from(value_to_string(value))))
+        })
+        .collect()
+}
+
+fn load_testgen_model_env_vars() -> Result<Vec<(&'static str, OsString)>, String> {
+    let path = match get_user_env_config_path() {
+        Ok(path) => path,
+        Err(_)
+            if ["C2RUST_MODEL", "C2RUST_BASE_URL", "C2RUST_API_KEY"]
+                .into_iter()
+                .all(env_var_is_nonempty) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let config = load_user_env_config(&path)?;
+    Ok(model_env_vars_from_config(&config, |env_var| {
+        env_var_is_nonempty(env_var)
+    }))
+}
+
+fn env_var_is_nonempty(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => !value.trim().is_empty(),
+        Err(env::VarError::NotUnicode(_)) => true,
+        Err(env::VarError::NotPresent) => false,
+    }
+}
+
+fn resolve_testgen_script_path(
+    script_override: Option<&OsStr>,
+    c2rust_home: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    let script = if let Some(path) = script_override.filter(|path| !path.is_empty()) {
+        PathBuf::from(path)
+    } else {
+        let home = c2rust_home.ok_or_else(|| {
+            "Error: C2RUST_HOME is not set and C2RUST_TESTGEN_SCRIPT was not provided".to_string()
+        })?;
+        PathBuf::from(home)
+            .join("python")
+            .join("cpp_utgen")
+            .join("test_pipeline.py")
+    };
+
+    if !script.is_file() {
+        return Err(format!(
+            "Error: test generation pipeline script not found at {}\n\
+Set C2RUST_TESTGEN_SCRIPT or reinstall cpp-utgen.",
+            script.display()
+        ));
+    }
+    Ok(script)
+}
+
+fn detect_testgen_python() -> Result<OsString, String> {
+    if let Some(candidate) = env::var_os("C2RUST_PYTHON").filter(|value| !value.is_empty()) {
+        if python_interpreter_works(&candidate) {
+            return Ok(candidate);
+        }
+        return Err(format!(
+            "Error: C2RUST_PYTHON does not name a working Python interpreter: {}",
+            PathBuf::from(candidate).display()
+        ));
+    }
+
+    detect_python_interpreter_with_source()
+        .map(|(python, _)| OsString::from(python))
+        .ok_or_else(|| {
+            "Error: no working Python interpreter found; set C2RUST_PYTHON or install python3"
+                .to_string()
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_testgen_tool_args(
+    feature: &str,
+    project: &Path,
+    build: &Path,
+    test_type: &str,
+    max_repair_attempts: usize,
+    stage: TestgenStage,
+    resume: bool,
+    json: bool,
+    min_kept: usize,
+) -> Vec<String> {
+    let mut args = vec![
+        "testgen".to_string(),
+        "--feature".to_string(),
+        feature.to_string(),
+        "--project".to_string(),
+        project.display().to_string(),
+        "--build".to_string(),
+        build.display().to_string(),
+        "--test-type".to_string(),
+        test_type.to_string(),
+        "--max-repair-attempts".to_string(),
+        max_repair_attempts.to_string(),
+        "--stage".to_string(),
+        stage.as_str().to_string(),
+        "--min-kept".to_string(),
+        min_kept.to_string(),
+    ];
+    if resume {
+        args.push("--resume".to_string());
+    }
+    if json {
+        args.push("--json".to_string());
+    }
+    args
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_testgen_command(
+    feature: &str,
+    project: &Path,
+    build: &Path,
+    test_type: &str,
+    max_repair_attempts: usize,
+    stage: TestgenStage,
+    resume: bool,
+    json: bool,
+    min_kept: usize,
+) -> i32 {
+    let script_override = env::var_os("C2RUST_TESTGEN_SCRIPT").filter(|value| !value.is_empty());
+    let script = match resolve_testgen_script_path(
+        script_override.as_deref(),
+        env::var_os("C2RUST_HOME").as_deref(),
+    ) {
+        Ok(script) => script,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+    let python_override = env::var_os("C2RUST_PYTHON").filter(|value| !value.is_empty());
+    let python = match detect_testgen_python() {
+        Ok(python) => python,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+    let mut env_vars = match load_testgen_model_env_vars() {
+        Ok(env_vars) => env_vars,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+    if script_override.is_none() {
+        env_vars.push(("C2RUST_TESTGEN_SCRIPT", script.into_os_string()));
+    }
+    if python_override.is_none() {
+        env_vars.push(("C2RUST_PYTHON", python));
+    }
+    if !env_var_is_nonempty("C2RUST_TRANSLATE_DIR") {
+        match get_python_dir("translate_and_fix") {
+            Ok(path) => env_vars.push(("C2RUST_TRANSLATE_DIR", path.into_os_string())),
+            Err(e) => eprintln!("{}", e),
+        }
+    }
+
+    let args = build_testgen_tool_args(
+        feature,
+        project,
+        build,
+        test_type,
+        max_repair_attempts,
+        stage,
+        resume,
+        json,
+        min_kept,
+    );
+    run_tool_with_env("test", &args, &env_vars)
+}
+
 fn supported_env_key(key: &str) -> bool {
     ENV_KEY_TO_VAR
         .iter()
@@ -1923,6 +2185,28 @@ fn main() {
             }
         }
 
+        Commands::Testgen {
+            feature,
+            project,
+            build,
+            test_type,
+            max_repair_attempts,
+            stage,
+            resume,
+            json,
+            min_kept,
+        } => run_testgen_command(
+            &feature,
+            &project,
+            &build,
+            &test_type,
+            max_repair_attempts,
+            stage,
+            resume,
+            json,
+            min_kept,
+        ),
+
         Commands::Clean { feature, clean_cmd } => {
             let feature_name = feature.clone().unwrap_or_else(|| "default".to_string());
             if let Err(code) = run_clean_preflight(&feature_name) {
@@ -2092,6 +2376,286 @@ mod tests {
                 env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn test_testgen_cli_defaults_are_stable() {
+        let cli = Cli::try_parse_from(["c2rust-xw", "testgen"]).unwrap();
+        let Commands::Testgen {
+            feature,
+            project,
+            build,
+            test_type,
+            max_repair_attempts,
+            stage,
+            resume,
+            json,
+            min_kept,
+        } = cli.command
+        else {
+            panic!("expected testgen command");
+        };
+        assert_eq!(feature, "default");
+        assert_eq!(project, PathBuf::from("."));
+        assert_eq!(build, PathBuf::from("build"));
+        assert_eq!(test_type, "req-cxt");
+        assert_eq!(max_repair_attempts, 10);
+        assert_eq!(stage, TestgenStage::All);
+        assert!(!resume);
+        assert!(!json);
+        assert_eq!(min_kept, 1);
+    }
+
+    #[test]
+    fn test_testgen_cli_rejects_zero_minimum() {
+        assert!(Cli::try_parse_from(["c2rust-xw", "testgen", "--min-kept", "0"]).is_err());
+    }
+
+    #[test]
+    fn test_testgen_cli_rejects_zero_repair_attempts() {
+        assert!(
+            Cli::try_parse_from(["c2rust-xw", "testgen", "--max-repair-attempts", "0",]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_build_testgen_tool_args_forwards_options() {
+        let args = build_testgen_tool_args(
+            "trial",
+            Path::new("/tmp/project"),
+            Path::new("output"),
+            "req-cxt",
+            12,
+            TestgenStage::Translate,
+            true,
+            true,
+            4,
+        );
+        assert_eq!(
+            args,
+            [
+                "testgen",
+                "--feature",
+                "trial",
+                "--project",
+                "/tmp/project",
+                "--build",
+                "output",
+                "--test-type",
+                "req-cxt",
+                "--max-repair-attempts",
+                "12",
+                "--stage",
+                "translate",
+                "--min-kept",
+                "4",
+                "--resume",
+                "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_testgen_script_path_uses_installed_layout() {
+        let temp = tempdir().unwrap();
+        let script = temp
+            .path()
+            .join("python")
+            .join("cpp_utgen")
+            .join("test_pipeline.py");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(&script, "").unwrap();
+        assert_eq!(
+            resolve_testgen_script_path(None, Some(temp.path().as_os_str())).unwrap(),
+            script
+        );
+    }
+
+    #[test]
+    fn test_resolve_testgen_script_path_prefers_override() {
+        let temp = tempdir().unwrap();
+        let script = temp.path().join("pipeline.py");
+        fs::write(&script, "").unwrap();
+
+        assert_eq!(
+            resolve_testgen_script_path(
+                Some(script.as_os_str()),
+                Some(OsStr::new("/unused/install")),
+            )
+            .unwrap(),
+            script
+        );
+    }
+
+    #[test]
+    fn test_model_env_vars_keep_process_environment_authoritative() {
+        let mut config = UserEnvConfig::default();
+        config
+            .model
+            .insert("model".to_string(), toml::Value::String("qwen".to_string()));
+        config.model.insert(
+            "base_url".to_string(),
+            toml::Value::String("https://example.invalid/v1".to_string()),
+        );
+        config.model.insert(
+            "api_key".to_string(),
+            toml::Value::String("from-file".to_string()),
+        );
+
+        let vars = model_env_vars_from_config(&config, |name| name == "C2RUST_API_KEY");
+        assert!(vars
+            .iter()
+            .any(|(name, value)| *name == "C2RUST_MODEL" && value == "qwen"));
+        assert!(vars.iter().any(
+            |(name, value)| *name == "C2RUST_BASE_URL" && value == "https://example.invalid/v1"
+        ));
+        assert!(!vars.iter().any(|(name, _)| *name == "C2RUST_API_KEY"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_model_env_vars_do_not_require_config_path_when_environment_is_complete() {
+        let env_file_guard = EnvVarGuard::new("C2RUST_XW_ENV_FILE");
+        let xdg_guard = EnvVarGuard::new("XDG_CONFIG_HOME");
+        let home_guard = EnvVarGuard::new("HOME");
+        let model_guard = EnvVarGuard::new("C2RUST_MODEL");
+        let base_url_guard = EnvVarGuard::new("C2RUST_BASE_URL");
+        let api_key_guard = EnvVarGuard::new("C2RUST_API_KEY");
+
+        env_file_guard.remove();
+        xdg_guard.remove();
+        home_guard.remove();
+        model_guard.set("qwen");
+        base_url_guard.set("https://example.invalid/v1");
+        api_key_guard.set("from-env");
+
+        assert!(load_testgen_model_env_vars().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn test_run_testgen_command_forwards_args_env_and_exit_code() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home_guard = EnvVarGuard::new("C2RUST_HOME");
+        let env_file_guard = EnvVarGuard::new("C2RUST_XW_ENV_FILE");
+        let capture_guard = EnvVarGuard::new("C2RUST_TESTGEN_CAPTURE");
+        let script_guard = EnvVarGuard::new("C2RUST_TESTGEN_SCRIPT");
+        let python_guard = EnvVarGuard::new("C2RUST_PYTHON");
+        let translate_dir_guard = EnvVarGuard::new("C2RUST_TRANSLATE_DIR");
+        let model_guard = EnvVarGuard::new("C2RUST_MODEL");
+        let base_url_guard = EnvVarGuard::new("C2RUST_BASE_URL");
+        let api_key_guard = EnvVarGuard::new("C2RUST_API_KEY");
+        let temperature_guard = EnvVarGuard::new("C2RUST_TEMPERATURE");
+        let top_p_guard = EnvVarGuard::new("C2RUST_TOP_P");
+        let seed_guard = EnvVarGuard::new("C2RUST_SEED");
+        let retries_guard = EnvVarGuard::new("C2RUST_MAX_RETRIES");
+        let timeout_guard = EnvVarGuard::new("C2RUST_TIMEOUT");
+
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let bin_dir = home.join("bin");
+        let cpp_utgen_dir = home.join("python/cpp_utgen");
+        let translate_dir = home.join("python/translate_and_fix");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&cpp_utgen_dir).unwrap();
+        fs::create_dir_all(&translate_dir).unwrap();
+
+        let pipeline_script = cpp_utgen_dir.join("test_pipeline.py");
+        fs::write(&pipeline_script, "").unwrap();
+
+        let python = bin_dir.join("python");
+        fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&python).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&python, permissions).unwrap();
+
+        let test_tool = bin_dir.join("c2rust-test");
+        fs::write(
+            &test_tool,
+            r#"#!/bin/sh
+{
+    printf 'ARG=%s\n' "$@"
+    printf 'SCRIPT=%s\n' "$C2RUST_TESTGEN_SCRIPT"
+    printf 'PYTHON=%s\n' "$C2RUST_PYTHON"
+    printf 'TRANSLATE_DIR=%s\n' "$C2RUST_TRANSLATE_DIR"
+    printf 'MODEL=%s\n' "$C2RUST_MODEL"
+    printf 'BASE_URL=%s\n' "$C2RUST_BASE_URL"
+    printf 'API_KEY=%s\n' "$C2RUST_API_KEY"
+    printf 'TEMPERATURE=%s\n' "$C2RUST_TEMPERATURE"
+    printf 'TOP_P=%s\n' "$C2RUST_TOP_P"
+    printf 'SEED=%s\n' "$C2RUST_SEED"
+    printf 'MAX_RETRIES=%s\n' "$C2RUST_MAX_RETRIES"
+    printf 'TIMEOUT=%s\n' "$C2RUST_TIMEOUT"
+} > "$C2RUST_TESTGEN_CAPTURE"
+exit 2
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&test_tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&test_tool, permissions).unwrap();
+
+        let env_file = home.join("env.toml");
+        fs::write(
+            &env_file,
+            "[model]\nmodel = \"qwen\"\nbase_url = \"https://example.invalid/v1\"\napi_key = \"from-file\"\ntemperature = 0.25\ntop_p = 0.9\nseed = 7\nmax_retries = 11\ntimeout = 123\n",
+        )
+        .unwrap();
+        let capture = home.join("capture.txt");
+
+        home_guard.set(home.to_str().unwrap());
+        env_file_guard.set(env_file.to_str().unwrap());
+        capture_guard.set(capture.to_str().unwrap());
+        for guard in [&script_guard, &python_guard, &translate_dir_guard] {
+            guard.set("");
+        }
+        for guard in [
+            &model_guard,
+            &base_url_guard,
+            &temperature_guard,
+            &top_p_guard,
+            &seed_guard,
+            &retries_guard,
+            &timeout_guard,
+        ] {
+            guard.set("   ");
+        }
+        api_key_guard.set("from-env");
+
+        let exit_code = run_testgen_command(
+            "trial",
+            Path::new("project with spaces"),
+            Path::new("out"),
+            "req-cxt",
+            12,
+            TestgenStage::Rust,
+            true,
+            true,
+            3,
+        );
+
+        assert_eq!(exit_code, 2);
+        let captured = fs::read_to_string(capture).unwrap();
+        let expected = format!(
+            "ARG=testgen\n\
+ARG=--feature\nARG=trial\n\
+ARG=--project\nARG=project with spaces\n\
+ARG=--build\nARG=out\n\
+ARG=--test-type\nARG=req-cxt\n\
+ARG=--max-repair-attempts\nARG=12\n\
+ARG=--stage\nARG=rust\n\
+ARG=--min-kept\nARG=3\n\
+ARG=--resume\nARG=--json\n\
+SCRIPT={}\nPYTHON={}\nTRANSLATE_DIR={}\n\
+MODEL=qwen\nBASE_URL=https://example.invalid/v1\nAPI_KEY=from-env\n\
+TEMPERATURE=0.25\nTOP_P=0.9\nSEED=7\nMAX_RETRIES=11\nTIMEOUT=123\n",
+            pipeline_script.display(),
+            python.display(),
+            translate_dir.display(),
+        );
+        assert_eq!(captured, expected);
     }
 
     #[test]

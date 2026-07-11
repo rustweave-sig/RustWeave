@@ -5,6 +5,7 @@ pub enum Error {
     ConfigToolNotFound,
     CommandExecutionFailed(String, Option<i32>),
     ConfigSaveFailed(String),
+    TestgenSetupFailed(String),
     IoError(std::io::Error),
     ProjectRootNotFound(String),
 }
@@ -20,6 +21,7 @@ impl Error {
             // but since we don't have the signal number, we use 128
             Error::CommandExecutionFailed(_, None) => 128,
             Error::ConfigSaveFailed(_) => 1,
+            Error::TestgenSetupFailed(_) => 1,
             Error::IoError(_) => 1,
             Error::ProjectRootNotFound(_) => 1,
         }
@@ -30,7 +32,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::ConfigToolNotFound => {
-                write!(f, "c2rust-config not found. Please install c2rust-config first.")
+                write!(
+                    f,
+                    "c2rust-config not found. Please install c2rust-config first."
+                )
             }
             Error::CommandExecutionFailed(msg, _) => {
                 write!(f, "Command execution failed: {}", msg)
@@ -38,6 +43,7 @@ impl fmt::Display for Error {
             Error::ConfigSaveFailed(msg) => {
                 write!(f, "Failed to save configuration: {}", msg)
             }
+            Error::TestgenSetupFailed(msg) => write!(f, "Test generation setup failed: {}", msg),
             Error::IoError(err) => {
                 write!(f, "IO error: {}", err)
             }
