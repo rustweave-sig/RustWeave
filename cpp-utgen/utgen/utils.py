@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import requests as rq
 
@@ -12,6 +13,11 @@ try:
     from config_private import API_KEY, URL
 except ImportError:
     from config import API_KEY, URL
+
+try:
+    from config_private import INCLUDE_FINDER_PATH
+except ImportError:
+    from config import INCLUDE_FINDER_PATH
 
 
 # SETUP_COV = """setup_target_for_coverage_lcov(
@@ -35,7 +41,23 @@ SETUP_COV = """setup_target_for_coverage_lcov(
 """
 
 # MODEL = "gpt-4o-2024-05-13"
-MODEL = "gpt-4-turbo-2024-04-09"
+MODEL = os.environ.get("C2RUST_MODEL", "gpt-4-turbo-2024-04-09")
+LLM_REQUEST_TIMEOUT = int(os.environ.get("C2RUST_TIMEOUT", "500"))
+_TEST_GENERATOR: Callable[[str, int], list[str]] | None = None
+
+
+def set_test_generator(generator: Callable[[str, int], list[str]] | None) -> None:
+    """Override the legacy HTTP generator for the integrated CLI pipeline."""
+
+    global _TEST_GENERATOR
+    _TEST_GENERATOR = generator
+
+
+def _chat_completions_url(url: str) -> str:
+    url = url.rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    return f"{url}/chat/completions"
 
 
 @dataclass
@@ -66,12 +88,13 @@ class ExptFileData:
     file_dict: dict[str, ExptFuncData]
 
 
-def is_test_or_build_file(file_path: str) -> bool:
-    directory = file_path[: file_path.rfind("/")]
-    file = file_path[file_path.rfind("/") + 1 :]
-    if "build" in directory or "test" in directory or "test" in file:
-        return True
-    return False
+def is_test_or_build_file(file_path: str, project_root: str | None = None) -> bool:
+    candidate = (
+        os.path.relpath(file_path, project_root) if project_root else file_path
+    )
+    normalized = candidate.replace("\\", "/").lower()
+    directory, file = normalized.rsplit("/", 1) if "/" in normalized else ("", normalized)
+    return "build" in directory or "test" in directory or "test" in file
 
 
 def is_header(file: str) -> bool:
@@ -98,7 +121,18 @@ def format_sig(sig: str) -> str:
 
 
 def get_test_from_LLM(prompt: str, n: int) -> list[str]:
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+    if _TEST_GENERATOR is not None:
+        return _TEST_GENERATOR(prompt, n)
+    api_key = os.environ.get("C2RUST_API_KEY", API_KEY)
+    configured_url = os.environ.get("C2RUST_BASE_URL", URL)
+    if not configured_url:
+        raise RuntimeError("No LLM base URL configured for cpp-utgen")
+    url = (
+        _chat_completions_url(configured_url)
+        if os.environ.get("C2RUST_BASE_URL")
+        else configured_url
+    )
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     payload = json.dumps(
         {
             "model": MODEL,
@@ -108,11 +142,25 @@ def get_test_from_LLM(prompt: str, n: int) -> list[str]:
     )
     data = None
     try:
-        response = rq.post(URL, headers=headers, data=payload, stream=True)
+        response = rq.post(
+            url,
+            headers=headers,
+            data=payload,
+            stream=True,
+            timeout=LLM_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
         data = response.json()
-    except:
+    except Exception:
         time.sleep(5)
-        response = rq.post(URL, headers=headers, data=payload, stream=True)
+        response = rq.post(
+            url,
+            headers=headers,
+            data=payload,
+            stream=True,
+            timeout=LLM_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
         data = response.json()
     if data is None:
         raise Exception("No response from the API")
@@ -138,7 +186,17 @@ def run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 def collect_includes(project: str, build: str, file_list: list[str]) -> list[str]:
     if not os.path.exists(project + "/includes.json"):
-        include_finder_cmd = ["include-finder", "--project", project, "-p", build]
+        if not INCLUDE_FINDER_PATH:
+            raise RuntimeError(
+                "include-finder is required; set C2RUST_INCLUDE_FINDER or add it to PATH"
+            )
+        include_finder_cmd = [
+            INCLUDE_FINDER_PATH,
+            "--project",
+            project,
+            "-p",
+            build,
+        ]
         for file in file_list:
             include_finder_cmd.append(file)
         run_command(include_finder_cmd)

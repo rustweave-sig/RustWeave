@@ -76,7 +76,9 @@ def gen_decl_def_dict(project_path: str, work_dir: str):
                     "file://", ""
                 )
                 decl_file = str(Path(decl_file).resolve())
-                if project_path in decl_file and not is_test_or_build_file(decl_file):
+                if project_path in decl_file and not is_test_or_build_file(
+                    decl_file, project_path
+                ):
                     def_file = context["Definition"]["FileURI"].replace("file://", "")
                     def_file = str(Path(def_file).resolve())
                     if def_file != decl_file:
@@ -96,13 +98,15 @@ def gen_deps_dict(project_path: str, work_dir: str, decl_def_dict: dict[str, set
                 data = unit["commands"][0]
             input_file = data["input-file"]
             input_file = str(Path(input_file).resolve())
-            if project_path in input_file and not is_test_or_build_file(input_file):
+            if project_path in input_file and not is_test_or_build_file(
+                input_file, project_path
+            ):
                 file_deps = data["file-deps"]
                 deps_set = set()
                 for file_dep in file_deps:
                     resolved_dep = str(Path(file_dep).resolve())
                     if project_path in resolved_dep and not is_test_or_build_file(
-                        resolved_dep
+                        resolved_dep, project_path
                     ):
                         if resolved_dep != input_file:
                             if not is_header(resolved_dep):

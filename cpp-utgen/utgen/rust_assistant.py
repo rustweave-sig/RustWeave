@@ -58,7 +58,8 @@ try:
 except ImportError:
     from config import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT, API_KEY, URL
 
-clang.cindex.Config.set_library_file(LIBCLANG_PATH)
+if LIBCLANG_PATH:
+    clang.cindex.Config.set_library_file(LIBCLANG_PATH)
 
 
 MIN_CHAIN_NUM = 2
@@ -636,5 +637,4 @@ def compile_error_parser_from_json_file(
         if "error" in message["kind"]:
             compile_error_list.append(ErrorMessage(message))
     return compile_error_list
-
 

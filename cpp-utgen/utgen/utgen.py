@@ -4,7 +4,7 @@ import re
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import clang.cindex
 
@@ -32,7 +32,8 @@ try:
 except ImportError:
     from config import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
 
-clang.cindex.Config.set_library_file(LIBCLANG_PATH)
+if LIBCLANG_PATH:
+    clang.cindex.Config.set_library_file(LIBCLANG_PATH)
 
 from prompt import NOREQ, PROMPT, TEST_CXT, TEST_INCLUDE
 
@@ -89,6 +90,15 @@ class Function:
 
     def set_test_cxt(self, test_cxt: TestCxt | None) -> None:
         self.__test_cxt = test_cxt
+
+    def get_name(self) -> str:
+        return self.__name
+
+    def get_sig(self) -> str:
+        return self.__sig
+
+    def get_decl_file(self) -> str:
+        return self.__decl_file
 
     def is_operator(self) -> bool:
         return self.__operator
@@ -216,11 +226,20 @@ class Function:
                 file.write("\n")
                 file.write(self.gen_namespaces())
 
-    def gen_unit_test(self, test_type: str, parent_test_dir: str) -> None:
+    def gen_unit_test(
+        self,
+        test_type: str,
+        parent_test_dir: str,
+        on_test_generated: Callable[["Function", str], None] | None = None,
+        replay_existing: bool = False,
+    ) -> None:
         if self.__focal_cxt is None:
             return
         test_dir = f"{parent_test_dir}/{format_sig(self.__sig)}"
         if os.path.exists(f"{test_dir}/.generated"):
+            if on_test_generated is not None and replay_existing:
+                for existing in sorted(Path(test_dir).glob("test_*.cpp")):
+                    on_test_generated(self, str(existing))
             return
         last_result = ""
         require_list = self.gen_req_list()
@@ -230,6 +249,9 @@ class Function:
         os.makedirs(test_dir, exist_ok=True)
         prompt_dir = f"{test_dir}/prompt"
         os.makedirs(prompt_dir, exist_ok=True)
+        # Per-case verification needs the include context before the first test
+        # file is handed to the callback.
+        self.gen_include_file(parent_test_dir)
         # print(f"    Generating unit tests for {self.__sig} ...")
         if "req" in test_type:
             num = 0
@@ -275,6 +297,9 @@ class Function:
                             f'#include "include.h"\n/*\n{require}*/\n\n'
                             + remove_macros(test_func)
                         )
+                    os.unlink(temp_file_name)
+                    if on_test_generated is not None:
+                        on_test_generated(self, test_file_path)
                 last_result = f"Below are some example test cases, you should generate your own class if needed:\n{test_func_list[0]}\n{test_func_list[1]}\n"
                 # last_result = ""
         else:
@@ -308,9 +333,10 @@ class Function:
                 test_file_path = f"{test_dir}/test_{i + 1:0>3}.cpp"
                 with open(test_file_path, "w") as file:
                     file.write(f'#include "include.h"\n\n' + remove_macros(func))
+                if on_test_generated is not None:
+                    on_test_generated(self, test_file_path)
                 i += 1
-        # generate include.h
-        self.gen_include_file(parent_test_dir)
+            os.unlink(temp_file_name)
         with open(f"{test_dir}/.generated", "w"):
             pass
 
@@ -497,7 +523,13 @@ class SourceFile:
                 function.load_focal_cxt(cxt_data)
                 function.set_test_cxt(test_cxt)
 
-    def gen_unit_test(self, test_type: str, parent_test_dir: str) -> None:
+    def gen_unit_test(
+        self,
+        test_type: str,
+        parent_test_dir: str,
+        on_test_generated: Callable[["SourceFile", Function, str], None] | None = None,
+        replay_existing: bool = False,
+    ) -> None:
         test_dir = f"{parent_test_dir}/{self.__name}"
         os.makedirs(test_dir, exist_ok=True)
         # print(f"  Generating unit tests for {self.__name} ...")
@@ -509,7 +541,17 @@ class SourceFile:
                 and function.cond_chain_num() > MIN_CHAIN_NUM
                 and function.min_cover_num() <= MAX_MIN_COVER
             ):
-                function.gen_unit_test(test_type, test_dir)
+                callback = None
+                if on_test_generated is not None:
+                    callback = lambda generated_function, test_path: on_test_generated(
+                        self, generated_function, test_path
+                    )
+                function.gen_unit_test(
+                    test_type,
+                    test_dir,
+                    callback,
+                    replay_existing,
+                )
                 # function.only_gen_include(test_dir)
 
     def write_cmake_file(self, test_type: str, parent_test_dir: str) -> bool:
@@ -591,7 +633,7 @@ class Project:
             with open(database_path, "r") as file:
                 database = json.load(file)
             for item in database:
-                if is_test_or_build_file(item["file"]):
+                if is_test_or_build_file(item["file"], self.__project_path):
                     continue
                 file_list_set.add(item["file"])
             if len(file_list_set) > 0:
@@ -647,7 +689,12 @@ class Project:
         self.__set_expt_dict()
         self.__load_cxt_file()
 
-    def prepare(self, test_types: list[str], just_load: bool) -> None:
+    def prepare(
+        self,
+        test_types: list[str],
+        just_load: bool,
+        modify_sources: bool = True,
+    ) -> None:
         print("Preparing the project ...")
         if just_load:
             self.__get_source_files()
@@ -658,14 +705,25 @@ class Project:
                 create_dir_with_cmake(self.__project_path, f"llm_tests{test_type}")
             cmake_config(self.__project_path, self.__build_path)
             source_files = self.__get_source_files()
-            comment_out(source_files, ["main", "test", "tests"])
+            if modify_sources:
+                comment_out(source_files, ["main", "test", "tests"])
 
-    def gen_unit_test(self, test_type) -> None:
+    def gen_unit_test(
+        self,
+        test_type,
+        on_test_generated: Callable[[SourceFile, Function, str], None] | None = None,
+        replay_existing: bool = False,
+    ) -> None:
         test_dir = f"{self.__project_path}/llm_tests{test_type}"
         os.makedirs(test_dir, exist_ok=True)
         print(f"Generating unit tests for llm_tests{test_type} ...")
         for source_file in self.__source_files:
-            source_file.gen_unit_test(test_type, test_dir)
+            source_file.gen_unit_test(
+                test_type,
+                test_dir,
+                on_test_generated,
+                replay_existing,
+            )
 
     def run_gen_ut_workers(
         self, function: Function, test_type: str, parent_test_dir: str

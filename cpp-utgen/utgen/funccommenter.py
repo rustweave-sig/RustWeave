@@ -7,7 +7,8 @@ try:
 except ImportError:
     from config import LIBCLANG_PATH
 
-clang.cindex.Config.set_library_file(LIBCLANG_PATH)
+if LIBCLANG_PATH:
+    clang.cindex.Config.set_library_file(LIBCLANG_PATH)
 
 
 def find_function(node, name: str):

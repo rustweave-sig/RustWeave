@@ -44,7 +44,8 @@ try:
 except ImportError:
     from config import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
 
-clang.cindex.Config.set_library_file(LIBCLANG_PATH)
+if LIBCLANG_PATH:
+    clang.cindex.Config.set_library_file(LIBCLANG_PATH)
 
 from prompt import (
     CAHTTESTER_INTENTION_PROMPT_FORMAT,

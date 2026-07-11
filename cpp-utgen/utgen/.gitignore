@@ -2,6 +2,7 @@
 __pycache__/
 test/
 *.txt
+!requirements.txt
 *.cpp
 *.json
 *.xml
