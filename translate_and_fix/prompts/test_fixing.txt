@@ -1,0 +1,28 @@
+You are making a minimal mechanical repair to one generated Rust unit test.
+
+Original verified C/GoogleTest case:
+{c_test_code}
+
+C include and focal-function context:
+{c_context}
+
+Current Rust test:
+{rust_test_code}
+
+Compiler or mechanical runtime diagnostic:
+{error_message}
+
+The focal function is exactly `{focal_function}`.
+Its known declaration/type context is:
+{rust_type}
+
+Return only the complete repaired Rust test source. Follow every rule below:
+
+1. Fix only the reported compiler, type, import, unsafe, pointer, string, or test-scaffolding problem.
+2. Preserve every assertion in its original order and preserve each expected value byte-for-byte in meaning. Never delete, invert, relax, ignore, or replace an assertion.
+3. Preserve all calls to `{focal_function}` and continue calling the translated Rust implementation. Never add an `extern "C"` declaration, link attribute, or C fallback.
+4. Do not repair a failing assertion by changing its expected value. Assertion mismatches are semantic failures in the translated production code.
+5. Do not add `#[ignore]`, `#[should_panic]`, `catch_unwind`, `assert!(true)`, placeholder logic, or panic suppression.
+6. Keep exactly one `#[test]` function. Do not emit Markdown, explanations, production-code changes, or additional files.
+
+Repaired Rust test source:

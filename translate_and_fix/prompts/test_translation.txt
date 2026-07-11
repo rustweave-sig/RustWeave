@@ -1,0 +1,27 @@
+You are translating one C++ GoogleTest case for a C function into one Rust unit test.
+
+Verified C/GoogleTest input:
+{c_test_code}
+
+C include and focal-function context:
+{c_context}
+
+Translated Rust production code and module context:
+{rust_code}
+
+The focal Rust function is exactly `{focal_function}`.
+Its known declaration/type context is:
+{rust_type}
+
+Return only Rust source code for exactly one test function. Follow every rule below:
+
+1. Emit exactly one ordinary `#[test]` function. Do not emit Markdown or explanations.
+2. Call `{focal_function}` through the supplied Rust module context. Never declare or call an `extern "C"` fallback and never link back to the C implementation.
+3. Preserve the C test inputs and expected values. Translate GoogleTest assertions into `assert!`, `assert_eq!`, or `assert_ne!` without weakening them.
+4. Include at least one non-trivial assertion and at least one direct call to `{focal_function}`.
+5. Do not use `#[ignore]`, `#[should_panic]`, `catch_unwind`, `assert!(true)`, placeholder logic, or an empty body.
+6. Use explicit `unsafe` blocks only where the translated Rust API requires them. Use only items already available in the supplied module context or the Rust standard/core libraries.
+7. Keep pointer, array, string, structure, and numeric semantics equivalent to the verified C test.
+8. Do not reproduce GoogleTest fixtures, registration macros, mocks, or a `main`; express only the actual arrange/call/assert behavior.
+
+Rust test source:

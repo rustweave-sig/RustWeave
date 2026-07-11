@@ -1,136 +1,243 @@
-import argparse
+"""Command-line entry point for translation and repair helpers."""
 
-from LLM_calling import load_LLM_config, init_openai_instance, close_openai_instance
-from proxy import ProxyDetector
-from function_translation import function_translation
-from variable_translation import var_translation
-from batch_translation import batch_translation
-from syntax_fixing import syntax_fixing
-from semantic_fixing import semantic_fixing
+from __future__ import annotations
+
+import argparse
 import json
 import os
+from pathlib import Path
+import sys
 
-# 输入参数。error参数只在调用语法修复时需要填写；其他所有参数每次调用时都必须填写
-parser = argparse.ArgumentParser(description='Translate and fix')
-parser.add_argument('--config', type=str, help='Config file path. The config file should be in toml format.')
-parser.add_argument('--type', type=str, help='Type of translate tools. Allowed values: "var", "fn", "batch_fn_var", "syntax_fix", "semantic_fix"')
-parser.add_argument('--c_code', type=str, default=None, help='The input file path. Input C code for var/fun translation or fixing. The input file should ONLY contain the code that are about to be translated.')
-parser.add_argument('--rust_code', type=str, default=None, help='The input file path. Input rust code for fixing. The input file should ONLY contain the code that are about to be fixed.')
-parser.add_argument('--output', type=str, help='The output file path of LLM translation/fixing result. The content of output file will be OVEWRITTEN.')
-parser.add_argument('--output_dir', type=str, default=None, help='The output directory path for batch translation result files.')
-parser.add_argument('--batch_manifest', type=str, default=None, help='The manifest json file path for batch translation.')
-parser.add_argument('--error', type=str, default=None, help='The file path of error message for syntax fixing. The error message file should ONLY contain the error message about the code in the input file.')
-parser.add_argument('--suggestion', type=str, default=None, help='The file path of human suggestion for fixing.')
-parser.add_argument('--rusttype', type=str, help='The type of Rust var or func after translation or fix. e.g.: i32')
-args = parser.parse_args()
+from LLM_calling import close_openai_instance, init_openai_instance, load_LLM_config
+from batch_translation import batch_translation
+from function_translation import function_translation
+from proxy import ProxyDetector
+from semantic_fixing import semantic_fixing
+from syntax_fixing import syntax_fixing
+from test_fixing import SemanticMismatchError, classify_test_failure, test_fixing
+from test_translation import test_translation
+from variable_translation import var_translation
 
-# 配置代理
-try:
-    detector = ProxyDetector(timeout=5)
-    proxy_config = detector.detect()
 
-    # 创建 HTTP 客户端
-    if proxy_config:
-        print(f"Info - 使用代理: {proxy_config['http']}")
-        print(f"Info - 来源: {proxy_config['source']}")
-    else:
-        print(f"Info - 未检测到代理，将尝试直连")
-except Exception as e:
-    print(f"ERROR - 配置代理出错: {e}")
-    exit(1)
+TOOL_TYPES = (
+    "var",
+    "fn",
+    "batch_fn_var",
+    "syntax_fix",
+    "semantic_fix",
+    "test_translate",
+    "test_fix",
+)
 
-# 根据config字段创建大模型会话
-try:
-    LLM_config = load_LLM_config(args.config)
-    openai_instance = init_openai_instance(LLM_config, proxy_config)
-except Exception as e:
-    print(f"ERROR - 加载配置文件/创建大模型会话出错: {e}")
-    exit(1)
 
-# 加载待翻译/修复的C代码
-if args.c_code is not None:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Translate and fix C/Rust code")
+    parser.add_argument("--config", help="TOML model configuration file")
+    parser.add_argument("--type", dest="tool_type", help="Tool type: " + "/".join(TOOL_TYPES))
+    parser.add_argument("--c_code", default=None, help="Input C/C++ source file")
+    parser.add_argument("--rust_code", default=None, help="Input Rust source file")
+    parser.add_argument("--output", help="Output file (overwritten on success)")
+    parser.add_argument("--output_dir", default=None, help="Batch translation output directory")
+    parser.add_argument("--batch_manifest", default=None, help="Batch translation manifest JSON")
+    parser.add_argument("--error", default=None, help="Compiler/test diagnostic file")
+    parser.add_argument("--suggestion", default=None, help="Optional repair suggestion file")
+    parser.add_argument("--rusttype", default=None, help="Known Rust type or function declaration")
+    parser.add_argument(
+        "--focal",
+        "--focal-function",
+        "--focal_function",
+        dest="focal_function",
+        default=None,
+        help="Focal translated Rust function name/path for test translation or repair",
+    )
+    return parser
+
+
+def validate_cli_args(args: argparse.Namespace) -> None:
+    if args.tool_type not in TOOL_TYPES:
+        raise ValueError("--type must be one of: " + ", ".join(TOOL_TYPES))
+
+    required = {
+        "var": ("config", "c_code", "output"),
+        "fn": ("config", "c_code", "output"),
+        "batch_fn_var": (
+            "config",
+            "c_code",
+            "output",
+            "output_dir",
+            "batch_manifest",
+        ),
+        "syntax_fix": ("config", "c_code", "rust_code", "output", "error"),
+        "semantic_fix": ("config", "c_code", "rust_code", "output"),
+        "test_translate": (
+            "config",
+            "c_code",
+            "rust_code",
+            "output",
+            "focal_function",
+        ),
+        "test_fix": (
+            "config",
+            "c_code",
+            "rust_code",
+            "output",
+            "error",
+            "focal_function",
+        ),
+    }[args.tool_type]
+    missing = ["--" + name for name in required if not getattr(args, name, None)]
+    if missing:
+        raise ValueError(f"{args.tool_type} requires: {', '.join(missing)}")
+
+
+def _read_text(path: str, description: str) -> str:
     try:
-        with open(args.c_code, 'r', encoding='utf-8') as file:
-            c_code = file.read()
-    except Exception as e:
-        # 关闭大模型会话
-        close_openai_instance(openai_instance)
-        print(f"ERROR - 读取input文件时发生错误: {e}")
-        exit(1)
+        return Path(path).read_text(encoding="utf-8-sig")
+    except Exception as error:
+        raise RuntimeError(f"failed to read {description} {path!r}: {error}") from error
 
-# 加载待修复的Rust代码
-if args.rust_code is not None:
-    try:
-        with open(args.rust_code, 'r', encoding='utf-8') as file:
-            rust_code = file.read()
-    except Exception as e:
-        # 关闭大模型会话
-        close_openai_instance(openai_instance)
-        print(f"ERROR - 读取input文件时发生错误: {e}")
-        exit(1)
 
-# 根据type字段类型，进入不同的分支，并调用工具
-tool_type = args.type
-if tool_type == "var":
-    res = var_translation(c_code, LLM_config.model, openai_instance, args.rusttype)
-elif tool_type == "fn":
-    res = function_translation(c_code, LLM_config.model, openai_instance, args.rusttype)
-elif tool_type == "batch_fn_var":
-    try:
-        with open(args.batch_manifest, 'r', encoding='utf-8') as file:
-            manifest_json = file.read()
-    except Exception as e:
-        close_openai_instance(openai_instance)
-        print(f"ERROR - 读取batch manifest文件时发生错误: {e}")
-        exit(1)
-    res = batch_translation(c_code, manifest_json, LLM_config.model, openai_instance, args.suggestion)
-elif tool_type == "syntax_fix":
-    # 加错误信息
-    try:
-        with open(args.error, 'r', encoding='utf-8') as file:
-            error = file.read()
-    except Exception as e:
-        # 关闭大模型会话
-        close_openai_instance(openai_instance)
-        print(f"ERROR - 读取error文件时发生错误: {e}")
-        exit(1)
-    if args.suggestion is not None:
-        res = syntax_fixing(c_code, rust_code, error, LLM_config.model, openai_instance, args.rusttype, args.suggestion)
-    else:
-        res = syntax_fixing(c_code, rust_code, error, LLM_config.model, openai_instance, args.rusttype)
-elif tool_type == "semantic_fix":
-    if args.suggestion is not None:
-        res = semantic_fixing(c_code, rust_code, LLM_config.model, openai_instance, args.rusttype, args.suggestion)
-    else:
-        res = semantic_fixing(c_code, rust_code, LLM_config.model, openai_instance, args.rusttype)
-else:
-    # 关闭大模型会话
-    close_openai_instance(openai_instance)
-    print(f"ERROR - 调用工具的类型出错，只允许以下值： var/fn/batch_fn_var/syntax_fix/semantic_fix（分别代表变量翻译/函数翻译/批量翻译/语法修复/语义修复）")
-    exit(1)
+def load_inputs(args: argparse.Namespace) -> dict[str, str | None]:
+    return {
+        "c_code": _read_text(args.c_code, "C code") if args.c_code else None,
+        "rust_code": _read_text(args.rust_code, "Rust code") if args.rust_code else None,
+        "error": _read_text(args.error, "diagnostic") if args.error else None,
+        "manifest_json": (
+            _read_text(args.batch_manifest, "batch manifest") if args.batch_manifest else None
+        ),
+    }
 
-# 关闭大模型会话
-close_openai_instance(openai_instance)
 
-if tool_type == "batch_fn_var":
-    try:
+def dispatch_tool(
+    args: argparse.Namespace,
+    *,
+    c_code: str | None,
+    rust_code: str | None,
+    error: str | None,
+    manifest_json: str | None,
+    model: str,
+    openai_instance,
+):
+    """Dispatch an already validated request; kept pure enough for unit tests."""
+
+    if args.tool_type == "var":
+        return var_translation(c_code, model, openai_instance, args.rusttype)
+    if args.tool_type == "fn":
+        return function_translation(c_code, model, openai_instance, args.rusttype)
+    if args.tool_type == "batch_fn_var":
+        return batch_translation(
+            c_code,
+            manifest_json,
+            model,
+            openai_instance,
+            args.suggestion,
+        )
+    if args.tool_type == "syntax_fix":
+        return syntax_fixing(
+            c_code,
+            rust_code,
+            error,
+            model,
+            openai_instance,
+            args.rusttype,
+            args.suggestion,
+        )
+    if args.tool_type == "semantic_fix":
+        return semantic_fixing(
+            c_code,
+            rust_code,
+            model,
+            openai_instance,
+            args.rusttype,
+            args.suggestion,
+        )
+    if args.tool_type == "test_translate":
+        return test_translation(
+            c_code,
+            rust_code,
+            model,
+            openai_instance,
+            args.focal_function,
+            args.rusttype,
+        )
+    if args.tool_type == "test_fix":
+        return test_fixing(
+            c_code,
+            rust_code,
+            error,
+            model,
+            openai_instance,
+            args.focal_function,
+            args.rusttype,
+        )
+    raise ValueError(f"unsupported tool type: {args.tool_type}")
+
+
+def _write_result(args: argparse.Namespace, result) -> None:
+    if args.tool_type == "batch_fn_var":
+        if not isinstance(result, dict) or not isinstance(result.get("files"), list):
+            raise RuntimeError("batch translation returned an invalid result")
         os.makedirs(args.output_dir, exist_ok=True)
-        for item in res["files"]:
-            target = os.path.join(args.output_dir, os.path.basename(item["path"]))
-            with open(target, 'w', encoding='utf-8') as file:
-                file.write(item["code"])
-        with open(args.output, 'w', encoding='utf-8') as file:
-            file.write(json.dumps(res, ensure_ascii=False, indent=2))
-        print(f"Info - batch翻译结果已写入 {args.output_dir}")
-    except Exception as e:
-        print(f"ERROR - 写入batch output文件时发生错误: {e}")
-        exit(1)
-else:
-    # 将结果写入输入路径
+        for item in result["files"]:
+            target = Path(args.output_dir) / os.path.basename(item["path"])
+            target.write_text(item["code"], encoding="utf-8")
+        Path(args.output).write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Info - batch translation result written to {args.output_dir}")
+        return
+
+    if not isinstance(result, str):
+        raise RuntimeError(f"{args.tool_type} returned a non-string result")
+    Path(args.output).write_text(result, encoding="utf-8")
+    print(f"Info - translation/fix result written to {args.output}")
+
+
+def _detect_proxy(proxy_detector_cls=ProxyDetector):
+    detector = proxy_detector_cls(timeout=5)
+    proxy_config = detector.detect()
+    if proxy_config:
+        print(f"Info - using proxy: {proxy_config['http']}")
+    else:
+        print("Info - no proxy detected; using direct connection")
+    return proxy_config
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    openai_instance = None
     try:
-        with open(args.output, 'w', encoding='utf-8') as file:
-            file.write(res)
-            print(f"Info - 翻译/修复结果已写入 {args.output}")
-    except Exception as e:
-        print(f"ERROR - 写入output文件时发生错误: {e}")
-        exit(1)
+        validate_cli_args(args)
+        inputs = load_inputs(args)
+        if args.tool_type == "test_fix" and classify_test_failure(inputs["error"]) == (
+            "semantic_mismatch"
+        ):
+            raise SemanticMismatchError(
+                "Rust assertion mismatch is a semantic_mismatch and must not be repaired"
+            )
+        proxy_config = _detect_proxy()
+        llm_config = load_LLM_config(args.config)
+        openai_instance = init_openai_instance(llm_config, proxy_config)
+        result = dispatch_tool(
+            args,
+            **inputs,
+            model=llm_config.model,
+            openai_instance=openai_instance,
+        )
+        _write_result(args, result)
+        return 0
+    except SemanticMismatchError as error:
+        print(f"ERROR - {error}", file=sys.stderr)
+        return 2
+    except Exception as error:
+        print(f"ERROR - {error}", file=sys.stderr)
+        return 1
+    finally:
+        if openai_instance is not None:
+            close_openai_instance(openai_instance)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
