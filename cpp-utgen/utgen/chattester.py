@@ -247,8 +247,6 @@ def write_file_into_disk(test_dir: str, test_func: str) -> list[str]:
             file.write(f'#include "include.h"\n\n' + remove_macros(func))
         i += 1
         test_file_list.append(test_file_path)
-    with open(f"{test_dir}/.generated", "w") as file:
-        pass
     return test_file_list
 
 
@@ -361,6 +359,8 @@ def gen_chattester_tests_for_function(
     """
     test_file_list = write_file_into_disk(test_dir, test_function)
     func.gen_include_file(parent_dir)
+    with open(f"{test_dir}/.generated", "w"):
+        pass
     return test_file_list
 
 

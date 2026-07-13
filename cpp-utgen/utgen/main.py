@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 from utgen import Project
+from case_workflow import CaseWorkflow
 from utils import UtgenArgs
 
 parser = argparse.ArgumentParser()
@@ -50,6 +51,33 @@ parser.add_argument(
     dest="export_only",
 )
 parser.add_argument(
+    "--batch-workflow",
+    help="use the legacy generate-all-then-check workflow",
+    action="store_true",
+    dest="batch_workflow",
+)
+parser.add_argument(
+    "--max-repair-rounds",
+    help="maximum total LLM repair rounds per generated test",
+    type=int,
+    default=10,
+    dest="max_repair_rounds",
+)
+parser.add_argument(
+    "--repair-choices",
+    help="number of LLM repair candidates per round",
+    type=int,
+    default=3,
+    dest="repair_choices",
+)
+parser.add_argument(
+    "--test-timeout",
+    help="timeout in seconds for each generated test run",
+    type=int,
+    default=600,
+    dest="test_timeout",
+)
+parser.add_argument(
     "-s", "--source", help="the path of the source file", required=False, dest="source"
 )
 parser.add_argument(
@@ -69,6 +97,12 @@ def print_time(start_time: float, end_time: float) -> None:
 
 if __name__ == "__main__":
     raw_args = parser.parse_args()
+    if raw_args.max_repair_rounds < 0:
+        parser.error("--max-repair-rounds must be non-negative")
+    if raw_args.repair_choices < 1:
+        parser.error("--repair-choices must be positive")
+    if raw_args.test_timeout < 1:
+        parser.error("--test-timeout must be positive")
     mode_selected = raw_args.compile_only or raw_args.test_only or raw_args.export_only
     post_analysis = raw_args.post_analysis or mode_selected
     project_path = str(Path(raw_args.project).resolve())
@@ -85,6 +119,10 @@ if __name__ == "__main__":
         raw_args.compile_only,
         raw_args.test_only,
         raw_args.export_only,
+        raw_args.batch_workflow,
+        raw_args.max_repair_rounds,
+        raw_args.repair_choices,
+        raw_args.test_timeout,
     )
     project_name = Path(project_path).name
     project = Project(project_name, project_path, build)
@@ -99,8 +137,18 @@ if __name__ == "__main__":
             project.analyze()
         project.init_data()
         for test_type in test_types:
-            # project.gen_unit_test(test_type)
-            project.gen_unit_test_concurrent(test_type)
+            if utgen_args.batch_workflow:
+                project.gen_unit_test_concurrent(test_type)
+            else:
+                workflow = CaseWorkflow(
+                    project_path,
+                    build,
+                    test_type,
+                    utgen_args.max_repair_rounds,
+                    utgen_args.repair_choices,
+                    utgen_args.test_timeout,
+                )
+                project.gen_unit_test(test_type, workflow.process_generated_test)
             project.write_cmake_file(test_type)
         # while True:
         #     user_input = input(
@@ -116,6 +164,14 @@ if __name__ == "__main__":
             do_compile=utgen_args.compile_only,
             do_test=utgen_args.test_only,
             do_export=utgen_args.export_only,
+        )
+    elif not utgen_args.post_analysis and not utgen_args.batch_workflow:
+        project.post_analysis(
+            test_types,
+            do_compile=False,
+            do_test=True,
+            do_export=True,
+            kept_only=True,
         )
     else:
         project.post_analysis(test_types)
