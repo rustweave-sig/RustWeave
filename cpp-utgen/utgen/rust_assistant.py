@@ -1,9 +1,9 @@
 #! /usr/bin/python3
 
 from enum import Enum
+import hashlib
 import logging
 import shutil
-import time
 import traceback
 from prompt import (
     RUSTASSISTANT_ERRORINFORMATION_AND_CODE_SNIPPETS,
@@ -27,7 +27,7 @@ import re
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import clang.cindex
 
@@ -39,6 +39,7 @@ from utils import (
     MODEL,
     ExptFileData,
     ExptFuncData,
+    atomic_write_json,
     cmake_config,
     collect_includes,
     create_dir_with_cmake,
@@ -51,12 +52,10 @@ from utils import (
     run_command,
 )
 
-import requests as rq
-
 try:
-    from config_private import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT, API_KEY, URL
+    from config_private import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
 except ImportError:
-    from config import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT, API_KEY, URL
+    from config import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
 
 if LIBCLANG_PATH:
     clang.cindex.Config.set_library_file(LIBCLANG_PATH)
@@ -71,6 +70,111 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+CandidateValidator = Callable[[str], tuple[bool, str]]
+CandidateValidatorFactory = Callable[[str, str, str, str], CandidateValidator]
+REFINED_MARKER_VERSION = 3
+
+
+def _test_content_sha256(test_target: str | Path) -> str:
+    return hashlib.sha256(Path(test_target).read_bytes()).hexdigest()
+
+
+def _current_test_passes_guard(
+    test_target: str | Path,
+    candidate_validator: CandidateValidator | None,
+) -> bool:
+    if candidate_validator is None:
+        return False
+    try:
+        content = Path(test_target).read_text(encoding="utf-8", errors="replace")
+        valid, _ = candidate_validator(content)
+    except Exception:
+        return False
+    return bool(valid)
+
+
+def refined_marker_is_valid(
+    marker_path: str | Path,
+    test_target: str | Path,
+    include_path: str | Path,
+    candidate_validator: CandidateValidator | None,
+) -> bool:
+    """Accept a compile marker only for the same, currently valid test bytes."""
+
+    marker = Path(marker_path)
+    test_path = Path(test_target).expanduser().resolve(strict=False)
+    resolved_include = Path(include_path).expanduser().resolve(strict=False)
+    if (
+        not marker.is_file()
+        or not test_path.is_file()
+        or not resolved_include.is_file()
+    ):
+        return False
+    try:
+        marker_data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(marker_data, dict):
+        return False
+    try:
+        current_hash = _test_content_sha256(test_path)
+        current_include_hash = _test_content_sha256(resolved_include)
+    except OSError:
+        return False
+    if (
+        marker_data.get("version") != REFINED_MARKER_VERSION
+        or marker_data.get("status") != "pass"
+        or marker_data.get("format_valid") is not True
+        or marker_data.get("test_path") != str(test_path)
+        or marker_data.get("include_path") != str(resolved_include)
+        or marker_data.get("content_sha256") != current_hash
+        or marker_data.get("include_sha256") != current_include_hash
+    ):
+        return False
+    return _current_test_passes_guard(test_path, candidate_validator)
+
+
+def write_refined_marker(
+    marker_path: str | Path,
+    test_target: str | Path,
+    include_path: str | Path,
+    candidate_validator: CandidateValidator | None,
+) -> bool:
+    """Persist a content-bound marker only after the section 8.5 guard passes."""
+
+    marker = Path(marker_path)
+    test_path = Path(test_target).expanduser().resolve(strict=False)
+    resolved_include = Path(include_path).expanduser().resolve(strict=False)
+    if (
+        not test_path.is_file()
+        or not resolved_include.is_file()
+        or not _current_test_passes_guard(test_path, candidate_validator)
+    ):
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+        return False
+    try:
+        current_hash = _test_content_sha256(test_path)
+        current_include_hash = _test_content_sha256(resolved_include)
+    except OSError:
+        return False
+    atomic_write_json(
+        str(marker),
+        {
+            "version": REFINED_MARKER_VERSION,
+            "status": "pass",
+            "format_valid": True,
+            "test_path": str(test_path),
+            "include_path": str(resolved_include),
+            "content_sha256": current_hash,
+            "include_sha256": current_include_hash,
+        },
+    )
+    return True
 
 
 class ErrorMessage:
@@ -260,14 +364,24 @@ class ChangeLog:
             raise ChangeLogError("Change Log don't fix the standard format.")
 
 
-def compilation_fix_assistant(project: Project, test_type: str):
+def compilation_fix_assistant(
+    project: Project,
+    test_type: str,
+    *,
+    candidate_validator_factory: CandidateValidatorFactory | None = None,
+):
     """
         Iterate all SourceFile objects in current processing project.
     """
     test_dir = f"{project._Project__project_path}/llm_tests{test_type}"
     for source_file in project._Project__source_files:
         compilation_fix_assistant_for_source_file(
-            source_file, test_dir, project)
+            source_file,
+            test_dir,
+            project,
+            test_type=test_type,
+            candidate_validator_factory=candidate_validator_factory,
+        )
 
 
 def get_compile_cmds(target_file_list: list, build: str) -> dict[str, list[str]]:
@@ -299,37 +413,18 @@ def get_compile_cmds(target_file_list: list, build: str) -> dict[str, list[str]]
 
 
 def get_fixes_from_LLM(prompt: str, n: int) -> list[str]:
-    """
-        Request LLM and get results. 
-    """
-    headers = {"Content-Type": "application/json",
-               "Authorization": f"Bearer {API_KEY}"}
-    payload = json.dumps(
-        {
-            "model": MODEL,
-            "n": n,
-            "messages": [{"role": "user", "content": f"{prompt}"}],
-        }
-    )
-    data = None
-    try:
-        response = rq.post(URL, headers=headers, data=payload, stream=True)
-        data = response.json()
-    except:
-        time.sleep(5)
-        response = rq.post(URL, headers=headers, data=payload, stream=True)
-        data = response.json()
-    if data is None:
-        raise Exception("No response from the API")
-    test_func_list = []
-    for choice in data["choices"]:
-        answer = choice["message"]["content"]
-        test_func_list.append(answer)
-    return test_func_list
+    """Use the shared generator so CLI model/auth overrides apply to repairs."""
+
+    return get_test_from_LLM(prompt, n)
 
 
 def compilation_fix_assistant_for_source_file(
-    source_file: SourceFile, parent_dir: str, project: Project
+    source_file: SourceFile,
+    parent_dir: str,
+    project: Project,
+    *,
+    test_type: str,
+    candidate_validator_factory: CandidateValidatorFactory | None,
 ):
     """
         Iterate and process all Function objects contained in a SourceFile object. 
@@ -371,11 +466,40 @@ def compilation_fix_assistant_for_source_file(
                 except KeyError as e:
                     logger.info("Key Error:\n" + e)
                     continue
+                if candidate_validator_factory is None:
+                    logger.error(
+                        "Skipping legacy compile repair without a section 8.5 "
+                        "candidate guard: %s",
+                        test_target,
+                    )
+                    continue
+                try:
+                    candidate_validator = candidate_validator_factory(
+                        test_target,
+                        source_file.get_name(),
+                        func._Function__sig,
+                        test_type,
+                    )
+                except Exception as error:
+                    logger.error(
+                        "Cannot build section 8.5 candidate guard for %s: %s",
+                        test_target,
+                        error,
+                    )
+                    continue
+                if candidate_validator is None:
+                    logger.error(
+                        "Skipping legacy compile repair with an empty section 8.5 "
+                        "candidate guard: %s",
+                        test_target,
+                    )
+                    continue
                 compilation_fix_assistant_for_test_file(
                     test_target,
                     cmd_dict[test_target],
                     current_func_test_dir,
                     project._Project__build_path,
+                    candidate_validator=candidate_validator,
                 )
 
 
@@ -409,22 +533,47 @@ def compilation_fix_assistant_for_test_file(
     choices: int = 3,
     max_errors: int = 2,
     max_iterations: int = 2,
+    candidate_validator: Callable[[str], tuple[bool, str]] | None = None,
 ) -> None:
 
 
     logger.info(f"Try to fix compilation error for {test_target} by using compile command{compile_command[0]}")
     refined_finish_dir = f"{test_dir}/.{test_target.split("/")[-1]}.refined"
     backup_file_dir = f"{test_dir}/backup_{test_target.split("/")[-1]}.txt"
-    if os.path.isfile(refined_finish_dir):
+    include_path = Path(test_dir) / "include.h"
+    if candidate_validator is None:
+        logger.error(
+            "Refusing compile repair without a section 8.5 candidate guard: %s",
+            test_target,
+        )
+        try:
+            os.remove(refined_finish_dir)
+        except FileNotFoundError:
+            pass
+        return False
+    if refined_marker_is_valid(
+        refined_finish_dir, test_target, include_path, candidate_validator
+    ) and run_command(compile_command[0]).returncode == 0:
         logger.info(f"{test_target} has been fixed for compilation.")
         return True
+    try:
+        os.remove(refined_finish_dir)
+    except FileNotFoundError:
+        pass
     compile_result = run_command(compile_command[0])
     if compile_result.returncode == 0:
-        with open(refined_finish_dir, "w+") as refined_file:
-            refined_file.write("1")
+        if write_refined_marker(
+            refined_finish_dir, test_target, include_path, candidate_validator
+        ):
+            logger.info(
+                f"{test_target} compile successfully without LLM assistant."
+            )
+            return True
         logger.info(
-            f"{test_target} compile successfully without LLM assistant.")
-        return True
+            "Rejecting compiled test because it violates section 8.5: %s",
+            test_target,
+        )
+        return False
     """
         Backup the original test files
     """
@@ -460,22 +609,25 @@ def compilation_fix_assistant_for_test_file(
             build_dir,
             choices,
             max_iterations,
+            candidate_validator,
         )
         if len(new_error_set) < len(compile_error_set):
             compile_error_set = new_error_set
             test_file_content = new_error_content
         if len(new_error_set) == 0:
             break
-    with open(refined_finish_dir, "w+") as refined_file:
-        compile_result = run_command(compile_command[0])
-        if compile_result.returncode == 0:
-            logger.info(f"Fixing target {test_target} successfully")
-            refined_file.write("1")
-            return True;
-        else:
-            logger.info(f"Fixing target {test_target} failed")
-            refined_file.write("0")
-            return False;
+    compile_result = run_command(compile_command[0])
+    if compile_result.returncode == 0 and write_refined_marker(
+        refined_finish_dir, test_target, include_path, candidate_validator
+    ):
+        logger.info(f"Fixing target {test_target} successfully")
+        return True
+    logger.info(f"Fixing target {test_target} failed")
+    try:
+        os.remove(refined_finish_dir)
+    except FileNotFoundError:
+        pass
+    return False
 
             
         
@@ -490,6 +642,7 @@ def compilation_fix_assistant_for_an_error(
     build_dir: str,
     choices: int = 3,
     max_iterations: int = 2,
+    candidate_validator: Callable[[str], tuple[bool, str]] | None = None,
 ):
     """
         Inner loop of fixing procedure. 
@@ -546,6 +699,13 @@ def compilation_fix_assistant_for_an_error(
             # input()
             if not new_file:
                 continue
+            if candidate_validator is not None:
+                valid, reason = candidate_validator(new_file)
+                if not valid:
+                    logger.info(
+                        "Rejecting compile repair candidate before build: %s", reason
+                    )
+                    continue
             # logger.debug("fixed file:\n" + new_file )
             after_error = apply_file_into_disk_and_compile(test_target, new_file, compile_command, build_dir)
             request_reuslt.append((after_error, new_file))

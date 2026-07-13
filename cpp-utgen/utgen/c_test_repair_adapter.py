@@ -6,12 +6,30 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 try:
     from .case_pipeline import RepairContext
 except ImportError:
     from case_pipeline import RepairContext
+
+try:
+    from .c_test_format import (
+        assertion_macro_counts,
+        count_focal_calls,
+        extract_requirement_comment,
+        extract_test_identity,
+        validate_c_test_format,
+    )
+except ImportError:
+    from c_test_format import (
+        assertion_macro_counts,
+        count_focal_calls,
+        extract_requirement_comment,
+        extract_test_identity,
+        validate_c_test_format,
+    )
 
 
 TEST_PATTERN = re.compile(r"\bTEST(?:_F|_P)?\s*\(")
@@ -91,38 +109,69 @@ def _focal_call_count(source: str, function: str) -> int:
 
 
 def validate_c_test_candidate(
-    original: str, candidate: str, function_signature: str
+    original: str,
+    candidate: str,
+    function_signature: str,
+    *,
+    filename: str = "test_001.cpp",
+    test_type: str = "",
+    expected_test_signature: str | tuple[str, str] | None = None,
+    initial_format_repair: bool = False,
 ) -> tuple[bool, str]:
-    original_code = _mask_c_non_code(original)
-    candidate_code = _mask_c_non_code(candidate)
-    if len(TEST_PATTERN.findall(candidate_code)) < len(TEST_PATTERN.findall(original_code)):
-        return False, "candidate removes the TEST body"
-    if "GTEST_SKIP" in candidate_code:
-        return False, "candidate uses GTEST_SKIP"
-    if EMPTY_CATCH_PATTERN.search(candidate_code):
-        return False, "candidate catches and ignores all exceptions"
-    original_checks = len(CHECK_PATTERN.findall(original_code))
-    candidate_checks = len(CHECK_PATTERN.findall(candidate_code))
-    if candidate_checks < original_checks:
-        return False, "candidate removes assertions or mock expectations"
-    if candidate_checks == 1 and TRIVIAL_PATTERN.search(candidate_code):
-        return False, "candidate leaves only a trivial assertion"
-    function = focal_name(function_signature)
-    if function and _focal_call_count(candidate, function) < _focal_call_count(
-        original, function
-    ):
-        return False, "candidate removes the focal function call"
-    if '#include "include.h"' in original and '#include "include.h"' not in candidate:
-        return False, "candidate removes include.h"
+    original_identity = extract_test_identity(original)
+    candidate_identity = extract_test_identity(candidate)
+    if not initial_format_repair:
+        if original_identity is None:
+            return False, "original TEST suite/name cannot be determined safely"
+        if candidate_identity != original_identity:
+            return False, "candidate changes the original TEST suite/name"
+
+    if "req" in test_type:
+        original_requirement = extract_requirement_comment(original)
+        candidate_requirement = extract_requirement_comment(candidate)
+        if not original_requirement or candidate_requirement != original_requirement:
+            return False, "candidate changes or removes the original requirement comment"
+
+    original_checks = assertion_macro_counts(original)
+    candidate_checks = assertion_macro_counts(candidate)
+    format_errors = validate_c_test_format(
+        candidate,
+        filename=filename,
+        test_type=test_type,
+        focal_function=function_signature,
+        expected_test_signature=expected_test_signature,
+    )
+    trivial_errors = [error for error in format_errors if "trivially true" in error]
+    if trivial_errors:
+        return False, "candidate leaves a trivial assertion: " + "; ".join(
+            trivial_errors
+        )
+    if not initial_format_repair:
+        removed_checks = {
+            name: count - candidate_checks[name]
+            for name, count in original_checks.items()
+            if candidate_checks[name] < count
+        }
+        if removed_checks:
+            return False, "candidate removes or changes original assertions/mock expectations"
+
+        if count_focal_calls(candidate, function_signature) < count_focal_calls(
+            original, function_signature
+        ):
+            return False, "candidate removes the focal function call"
+
+    if format_errors:
+        return False, "candidate violates section 8.5: " + "; ".join(format_errors)
     return True, ""
 
 
 def build_c_repair_prompt(context: RepairContext) -> str:
-    purpose = (
-        "make the GoogleTest compile"
-        if context.stage == "compile"
-        else "make the generated GoogleTest pass against the correct C implementation"
-    )
+    if context.stage == "format":
+        purpose = "make the GoogleTest conform exactly to the generated-test format"
+    elif context.stage == "compile":
+        purpose = "make the GoogleTest compile"
+    else:
+        purpose = "make the generated GoogleTest pass against the correct C implementation"
     runtime_rules = ""
     if context.stage == "run":
         runtime_rules = """
@@ -136,6 +185,9 @@ Goal: {purpose}.
 Only return the complete replacement content of this test file as C++ code.
 Do not edit production code or include.h.
 Preserve the TEST body, focal function call, and meaningful checks.
+Preserve the exact TEST suite/name and any embedded requirement comment.
+The first effective source item must be #include "include.h" and the file must
+contain exactly one ordinary TEST with an observable oracle tied to the focal call.
 Do not use GTEST_SKIP, empty catch-all blocks, signal handlers, sleeps, network
 access, randomness, or trivial always-passing assertions.
 {runtime_rules}
@@ -171,9 +223,15 @@ class CTestRepairAdapter:
 
     def __call__(self, context: RepairContext) -> str | None:
         candidate = strip_code_fence(self.generate(build_c_repair_prompt(context)))
+        test_path = getattr(context, "test_path", "test_001.cpp")
+        record = context.record
         valid, _ = validate_c_test_candidate(
             context.baseline_content,
             candidate,
-            str(context.record.get("function", "")),
+            str(record.get("function", "")),
+            filename=Path(test_path).name,
+            test_type=str(record.get("test_type", "")),
+            expected_test_signature=record.get("expected_test_signature"),
+            initial_format_repair=context.stage == "format",
         )
         return candidate if valid else None

@@ -1,5 +1,6 @@
 import unittest
 
+import rust_assistant
 import utils
 
 
@@ -23,6 +24,21 @@ class UtilsLlmOverrideTests(unittest.TestCase):
             utils._chat_completions_url("https://example.invalid/v1"),
             "https://example.invalid/v1/chat/completions",
         )
+
+    def test_compile_and_run_repairs_use_integrated_generator_override(self):
+        calls = []
+
+        def generate(prompt, count):
+            calls.append((prompt, count))
+            return ["repair"] * count
+
+        utils.set_test_generator(generate)
+
+        self.assertEqual(
+            rust_assistant.get_fixes_from_LLM("repair prompt", 3),
+            ["repair", "repair", "repair"],
+        )
+        self.assertEqual(calls, [("repair prompt", 3)])
 
     def test_test_and_build_filter_ignores_project_root_name(self):
         root = "/tmp/company/testgen-project"

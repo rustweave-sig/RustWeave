@@ -15,7 +15,7 @@ from proxy import ProxyDetector
 from semantic_fixing import semantic_fixing
 from syntax_fixing import syntax_fixing
 from test_fixing import SemanticMismatchError, classify_test_failure, test_fixing
-from test_translation import test_translation
+from test_translation import CTestFormatContract, test_translation
 from variable_translation import var_translation
 
 
@@ -50,6 +50,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Focal translated Rust function name/path for test translation or repair",
     )
+    parser.add_argument(
+        "--c-test-project",
+        default=None,
+        help="Project root containing llm_tests<type> for C test translation",
+    )
+    parser.add_argument(
+        "--c-test-type",
+        default=None,
+        help="C generation type: none/cxt/req/req-cxt",
+    )
+    parser.add_argument(
+        "--c-source-name",
+        default=None,
+        help="Original C/C++ source filename used in the generated test path",
+    )
+    parser.add_argument(
+        "--c-focal-signature",
+        default=None,
+        help="Full C/C++ focal function signature",
+    )
+    parser.add_argument(
+        "--c-include",
+        default=None,
+        help="Generated include.h paired with the C test",
+    )
+    parser.add_argument(
+        "--expected-test-signature",
+        default=None,
+        help="Immutable TEST(suite, name) signature for requirement mode",
+    )
     return parser
 
 
@@ -75,6 +105,11 @@ def validate_cli_args(args: argparse.Namespace) -> None:
             "rust_code",
             "output",
             "focal_function",
+            "c_test_project",
+            "c_test_type",
+            "c_source_name",
+            "c_focal_signature",
+            "c_include",
         ),
         "test_fix": (
             "config",
@@ -105,6 +140,11 @@ def load_inputs(args: argparse.Namespace) -> dict[str, str | None]:
         "manifest_json": (
             _read_text(args.batch_manifest, "batch manifest") if args.batch_manifest else None
         ),
+        "c_include": (
+            _read_text(args.c_include, "generated include.h")
+            if args.c_include
+            else None
+        ),
     }
 
 
@@ -115,6 +155,7 @@ def dispatch_tool(
     rust_code: str | None,
     error: str | None,
     manifest_json: str | None,
+    c_include: str | None,
     model: str,
     openai_instance,
 ):
@@ -152,6 +193,15 @@ def dispatch_tool(
             args.suggestion,
         )
     if args.tool_type == "test_translate":
+        contract = CTestFormatContract(
+            test_path=args.c_code,
+            include_source=c_include or "",
+            project=args.c_test_project,
+            test_type=args.c_test_type,
+            source_name=args.c_source_name,
+            focal_signature=args.c_focal_signature,
+            expected_test_signature=args.expected_test_signature,
+        )
         return test_translation(
             c_code,
             rust_code,
@@ -159,6 +209,7 @@ def dispatch_tool(
             openai_instance,
             args.focal_function,
             args.rusttype,
+            c_test_contract=contract,
         )
     if args.tool_type == "test_fix":
         return test_fixing(

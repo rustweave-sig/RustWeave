@@ -7,10 +7,19 @@ from pathlib import Path
 from typing import Any
 
 from case_runner import CaseResult, SingleTestSession
+from c_test_format import (
+    extract_requirement_comment,
+    extract_requirement_test_signature,
+    extract_test_identity,
+    validate_c_test_format,
+    validate_c_test_path,
+    validate_include_header_format,
+)
+from c_test_repair_adapter import strip_code_fence, validate_c_test_candidate
 from compile_repair import repair_record_once
 from linecounter import count_code_lines
 from test_repair import repair_record
-from utils import atomic_write_json, write_text_best_effort
+from utils import atomic_write_json, get_test_from_LLM, write_text_best_effort
 
 
 INFRASTRUCTURE_FAILURES = {
@@ -107,6 +116,7 @@ class CaseWorkflow:
         max_repair_rounds: int = 10,
         choices: int = 3,
         timeout: int = 600,
+        resume: bool = True,
     ) -> None:
         if max_repair_rounds < 0:
             raise ValueError("max_repair_rounds must be non-negative")
@@ -120,6 +130,7 @@ class CaseWorkflow:
         self.max_repair_rounds = max_repair_rounds
         self.choices = choices
         self.timeout = timeout
+        self.resume = resume
         self.manifest = ManifestStore(project, test_type)
 
     def _new_record(
@@ -127,6 +138,23 @@ class CaseWorkflow:
     ) -> dict[str, Any]:
         test_path = str(Path(test_path).resolve())
         function_dir = str(Path(test_path).parent)
+        content = Path(test_path).read_text(encoding="utf-8", errors="replace")
+        requirement = extract_requirement_comment(content) or ""
+        expected_signature = (
+            extract_requirement_test_signature(content)
+            if "req" in self.test_type
+            else ""
+        )
+        if not expected_signature and "req" not in self.test_type:
+            identity = extract_test_identity(content)
+            if identity is not None:
+                expected_signature = f"TEST({identity.suite}, {identity.name})"
+        get_decl_file = getattr(function, "get_decl_file", None)
+        get_function_body = getattr(function, "get_function_body", None)
+        decl_file = get_decl_file() if callable(get_decl_file) else ""
+        function_body = get_function_body() if callable(get_function_body) else ""
+        include_path = Path(function_dir) / "include.h"
+        include_hash = file_hash(str(include_path)) if include_path.is_file() else ""
         return {
             "test_file": Path(test_path).name,
             "test_path": test_path,
@@ -146,6 +174,14 @@ class CaseWorkflow:
             "source_file": source_file.get_name(),
             "source_path": source_file.get_path(),
             "function": function.get_sig(),
+            "test_type": self.test_type,
+            "decl_file": decl_file,
+            "function_body": function_body,
+            "requirement": requirement,
+            "expected_test_signature": expected_signature,
+            "format_status": "not_run",
+            "format_errors": [],
+            "format_log": "",
             "function_dir": function_dir,
             "function_dir_rel": os.path.relpath(
                 function_dir, self.manifest.test_root
@@ -157,6 +193,11 @@ class CaseWorkflow:
             "repair_stage": "",
             "terminal_reason": "",
             "content_hash": file_hash(test_path),
+            "include_hash": include_hash,
+            "metadata": {
+                "decl_file": decl_file,
+                "function_body": function_body,
+            },
         }
 
     def _load_record(
@@ -166,9 +207,22 @@ class CaseWorkflow:
         old = self.manifest.get(fresh["test_path"])
         if old is None:
             return fresh, False
+        if not self.resume:
+            for key in ("expected_test_signature", "requirement"):
+                if old.get(key):
+                    fresh[key] = old[key]
+            return fresh, False
         current_hash = fresh["content_hash"]
         old_hash = old.get("content_hash")
         if old_hash and old_hash != current_hash:
+            for key in ("expected_test_signature", "requirement"):
+                if old.get(key):
+                    fresh[key] = old[key]
+            return fresh, False
+        if not old_hash:
+            for key in ("expected_test_signature", "requirement"):
+                if old.get(key):
+                    fresh[key] = old[key]
             return fresh, False
         fresh.update(old)
         fresh.update(
@@ -177,6 +231,7 @@ class CaseWorkflow:
                 "source_file": source_file.get_name(),
                 "source_path": source_file.get_path(),
                 "function": function.get_sig(),
+                "test_type": self.test_type,
                 "function_dir": str(Path(fresh["test_path"]).parent),
                 "function_dir_rel": os.path.relpath(
                     str(Path(fresh["test_path"]).parent), self.manifest.test_root
@@ -189,14 +244,29 @@ class CaseWorkflow:
                 "content_hash": current_hash,
             }
         )
+        get_decl_file = getattr(function, "get_decl_file", None)
+        get_function_body = getattr(function, "get_function_body", None)
+        fresh["decl_file"] = get_decl_file() if callable(get_decl_file) else ""
+        fresh["function_body"] = (
+            get_function_body() if callable(get_function_body) else ""
+        )
+        fresh["metadata"] = {
+            "decl_file": fresh["decl_file"],
+            "function_body": fresh["function_body"],
+        }
         include_exists = os.path.isfile(f"{fresh['function_dir']}/include.h")
-        if not old_hash and old.get("kept") and old.get("run") == "pass":
-            if include_exists:
-                fresh["workflow_status"] = "passed"
-                self.manifest.put(fresh)
-                return fresh, True
+        current_include_hash = (
+            file_hash(f"{fresh['function_dir']}/include.h") if include_exists else ""
+        )
+        if old.get("include_hash") and old.get("include_hash") != current_include_hash:
             fresh["workflow_status"] = "interrupted"
             fresh["terminal_reason"] = ""
+            fresh["include_hash"] = current_include_hash
+            return fresh, False
+        if not old.get("include_hash"):
+            fresh["workflow_status"] = "interrupted"
+            fresh["terminal_reason"] = ""
+            fresh["include_hash"] = current_include_hash
             return fresh, False
         status = fresh.get("workflow_status")
         if status in {"passed", "filtered"} and not include_exists:
@@ -219,12 +289,18 @@ class CaseWorkflow:
             fresh["workflow_status"] = "interrupted"
             fresh["terminal_reason"] = ""
             return fresh, False
-        return fresh, status in {"passed", "filtered"}
+        return fresh, status in {"passed", "filtered"} and fresh.get(
+            "format_status"
+        ) in {"pass", "fail"}
 
     def _save(self, record: dict[str, Any]) -> None:
         if os.path.isfile(record["test_path"]):
             record["content_hash"] = file_hash(record["test_path"])
             record["lines"] = count_code_lines(record["test_path"])
+        include_path = Path(record["function_dir"]) / "include.h"
+        record["include_hash"] = (
+            file_hash(str(include_path)) if include_path.is_file() else ""
+        )
         self.manifest.put(record)
 
     def _record_build(self, record: dict[str, Any], result: CaseResult) -> None:
@@ -298,7 +374,8 @@ class CaseWorkflow:
                 print(f"Failed to process generated test {test_path}")
 
     def _process(self, record: dict[str, Any]) -> None:
-        original_content = Path(record["test_path"]).read_text()
+        baseline_content = Path(record["test_path"]).read_text()
+        current_content = baseline_content
         include_path = f"{record['function_dir']}/include.h"
         if not os.path.isfile(include_path):
             log_path = f"{record['function_dir']}/missing_include.log"
@@ -324,6 +401,91 @@ class CaseWorkflow:
             self._finish(record, "filtered", "missing_include")
             return
         rounds = int(record.get("repair_rounds", 0) or 0)
+        hard_format_errors = self._hard_format_errors(record, include_path)
+        if hard_format_errors:
+            self._record_format_failure(record, hard_format_errors, "format_failure")
+            return
+
+        format_errors = self._test_format_errors(record, current_content)
+        while format_errors and rounds < self.max_repair_rounds:
+            rounds += 1
+            record["repair_rounds"] = rounds
+            record["repair_stage"] = "format"
+            record["repair_status"] = "checking"
+            record["format_status"] = "fail"
+            record["format_errors"] = format_errors
+            self._save(record)
+            prompt = self._format_repair_prompt(record, current_content, format_errors)
+            try:
+                candidates = get_test_from_LLM(prompt, self.choices)
+            except Exception as exc:
+                record["repair_status"] = "llm_error"
+                self._record_format_failure(
+                    record, [f"LLM format repair failed: {exc}"], "llm_error"
+                )
+                return
+            rejected: list[str] = []
+            repaired_content = ""
+            for candidate_index, response in enumerate(candidates, start=1):
+                candidate = strip_code_fence(response)
+                valid, reason = validate_c_test_candidate(
+                    current_content,
+                    candidate,
+                    str(record.get("function", "")),
+                    filename=record["test_file"],
+                    test_type=self.test_type,
+                    expected_test_signature=record.get("expected_test_signature") or None,
+                    initial_format_repair=True,
+                )
+                if not valid:
+                    rejected.append(f"candidate {candidate_index}: {reason}")
+                    continue
+                repaired_content = candidate
+                break
+            log_path = (
+                f"{record['function_dir']}/"
+                f"format_{Path(record['test_path']).stem}_r{rounds}.log"
+            )
+            log_lines = ["Initial format diagnostics:", *format_errors]
+            if repaired_content:
+                Path(record["test_path"]).write_text(
+                    repaired_content, encoding="utf-8"
+                )
+                identity = extract_test_identity(repaired_content)
+                if not record.get("expected_test_signature") and identity is not None:
+                    record["expected_test_signature"] = (
+                        f"TEST({identity.suite}, {identity.name})"
+                    )
+                record["format_status"] = "pass"
+                record["format_errors"] = []
+                record["format_log"] = log_path
+                record["repair_status"] = "format_repaired"
+                Path(log_path).write_text(
+                    "\n".join(log_lines + ["Format repair accepted."]) + "\n",
+                    encoding="utf-8",
+                )
+                self._save(record)
+                current_content = repaired_content
+                format_errors = []
+                break
+            format_errors = rejected or ["LLM returned no format repair candidate"]
+            record["format_errors"] = format_errors
+            record["format_log"] = log_path
+            record["repair_log"] = log_path
+            Path(log_path).write_text(
+                "\n".join(log_lines + ["Rejected candidates:", *format_errors])
+                + "\n",
+                encoding="utf-8",
+            )
+            self._save(record)
+
+        if format_errors:
+            Path(record["test_path"]).write_text(baseline_content, encoding="utf-8")
+            self._record_format_failure(record, format_errors, "max_repair_rounds")
+            return
+
+        record["format_status"] = "pass"
+        record["format_errors"] = []
         record["workflow_status"] = "checking"
         record["terminal_reason"] = ""
         record["exported"] = False
@@ -376,12 +538,12 @@ class CaseWorkflow:
                 and before_hash == file_hash(record["test_path"])
                 and build_result.failure_type == "link_failure"
             ):
-                Path(record["test_path"]).write_text(original_content)
+                Path(record["test_path"]).write_text(baseline_content)
                 self._finish(record, "filtered", "link_failure_no_progress")
                 return
 
         if not build_result.passed:
-            Path(record["test_path"]).write_text(original_content)
+            Path(record["test_path"]).write_text(baseline_content)
             self._finish(record, "filtered", "max_repair_rounds")
             return
 
@@ -423,3 +585,82 @@ class CaseWorkflow:
                 return
 
         self._finish(record, "filtered", "max_repair_rounds")
+
+    def _hard_format_errors(
+        self, record: dict[str, Any], include_path: str
+    ) -> list[str]:
+        errors = validate_c_test_path(
+            record["test_path"],
+            project=self.project,
+            test_type=self.test_type,
+            source_name=record["source_file"],
+            function_signature=record["function"],
+        )
+        include_source = Path(include_path).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        errors.extend(validate_include_header_format(include_source))
+        if "req" in self.test_type and not record.get("expected_test_signature"):
+            errors.append(
+                "requirement-mode test has no immutable expected TEST signature"
+            )
+        return errors
+
+    def _test_format_errors(
+        self, record: dict[str, Any], content: str
+    ) -> list[str]:
+        return validate_c_test_format(
+            content,
+            filename=record["test_file"],
+            test_type=self.test_type,
+            focal_function=record["function"],
+            expected_test_signature=record.get("expected_test_signature") or None,
+        )
+
+    def _record_format_failure(
+        self, record: dict[str, Any], errors: list[str], terminal_reason: str
+    ) -> None:
+        log_path = (
+            f"{record['function_dir']}/format_{Path(record['test_path']).stem}.log"
+        )
+        message = "Generated test violates section 8.5:\n- " + "\n- ".join(errors) + "\n"
+        write_text_best_effort(log_path, message)
+        record.update(
+            {
+                "format_status": "fail",
+                "format_errors": errors,
+                "format_log": log_path,
+                "repair_log": log_path,
+                "failure_type": "format_failure",
+                "compile": "not_run",
+                "coverage_build": "not_run",
+                "run": "not_run",
+                "kept": False,
+                "exported": False,
+            }
+        )
+        self._finish(record, "filtered" if terminal_reason != "llm_error" else "interrupted", terminal_reason)
+
+    @staticmethod
+    def _format_repair_prompt(
+        record: dict[str, Any], content: str, errors: list[str]
+    ) -> str:
+        diagnostics = "\n".join(f"- {error}" for error in errors)
+        return f"""Repair this generated C/C++ GoogleTest to satisfy section 8.5.
+Return only the complete replacement C++ file, without markdown.
+Preserve the embedded requirement comment when present. Use exactly one ordinary
+TEST, call the focal function, and assert an observable result related to it.
+Do not use skips, disabled names, main, production source includes, randomness,
+network/process APIs, sleeps, unbounded loops, or swallowed exceptions.
+
+Filename: {record['test_file']}
+Test type: {record.get('test_type', '')}
+Focal function: {record.get('function', '')}
+Required TEST signature: {record.get('expected_test_signature') or 'not fixed yet'}
+
+Format diagnostics:
+{diagnostics}
+
+Current complete test file:
+{content}
+"""

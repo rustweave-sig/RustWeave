@@ -7,10 +7,12 @@ per-test workflow:
 
 ```text
 generate one C test
-  -> C compile check -> C compile repair (up to 10 rounds)
-  -> C run check -> C runtime repair (up to 10 rounds)
+  -> section 8.5 format check/repair
+  -> C compile check/repair
+  -> C run check/repair (10 shared repair rounds in total)
   -> filter an unrepaired test without stopping the project
-  -> translate a kept C test into a Rust #[test]
+  -> final C recheck and export to filtered_tests*
+  -> translate an exported C test into a Rust #[test]
   -> Rust compile check -> Rust compile repair (up to 10 rounds)
   -> Rust exact test run -> mechanical test repair or semantic failure
   -> register kept Rust tests and emit a machine-readable report
@@ -47,8 +49,11 @@ The unified state is stored under:
 .c2rust/<feature>/testgen/logs/
 ```
 
-Existing `llm_tests*/filter_manifest.json` files remain readable for backward
-compatibility and are merged before standalone `translate` or `rust` stages.
+`llm_tests*/filter_manifest.json` version 2 is the C-side source of truth.
+Standalone `translate` and `rust` stages trust only records that are explicitly
+kept and exported after final verification, whose source and exported SHA-256
+values still match. Version 1 records remain readable for compatibility, but
+are never promoted from compile/run status alone.
 
 ## 3. Per-Case State Machine
 
@@ -74,21 +79,31 @@ are atomic and versioned.
 1. Preflight checks CMake, `compile_commands.json`, GoogleTest, model settings,
    and the `brinfo`, `focxt`, and `include-finder` tools.
 2. Project analysis runs once.
-3. Each generated `test_*.cpp` is handed to the verifier immediately. Repair
-   candidates and rollbacks are installed atomically.
-4. A unique CMake target is built for that case. The verifier captures stdout,
+3. Each generated `test_*.cpp` is checked against section 8.5 before it can be
+   compiled. The same fail-closed validator runs for cached files, every repair
+   candidate, final verification, and export. It enforces the directory and
+   filename layout, one ordinary `TEST`, the immutable requirement-mode test
+   name, one leading `include.h`, a focal call with a related oracle, and the
+   forbidden skip/disable/trivial/non-deterministic constructs.
+4. Format failures are repairable and consume the same per-case repair budget
+   as compile and runtime failures. Repair candidates and rollbacks are
+   installed atomically.
+5. A unique CMake target is built for that case. The verifier captures stdout,
    stderr, return code, and a diagnostic fingerprint.
-5. A compile failure invokes a test-only repair prompt. Candidate changes are
+6. A compile failure invokes a test-only repair prompt. Candidate changes are
    statically guarded and compiled one at a time. A candidate exposing a new
    diagnostic becomes the input to the next round; final failure rolls the file
    back to the version present at the start of that phase.
-6. A compiled case is run directly with a timeout. Failures are classified as
+7. A compiled case is run directly with a timeout. GoogleTest XML must prove
+   that at least one non-disabled, non-skipped test completed. Failures are classified as
    assertion, mock, exception, crash, timeout, build, or unknown failures.
-7. Runtime repair candidates must pass both compile and run checks. Candidates
+8. Runtime repair candidates must pass format, compile, and run checks. Candidates
    that remove the focal call, assertions, or meaningful behavior are rejected.
-8. Ten repair rounds are allowed by default. A repeated code/diagnostic
+9. Ten repair rounds are allowed by default across all C repair stages. A repeated code/diagnostic
    fingerprint stops the loop early.
-9. Unrepaired cases are marked filtered and processing continues.
+10. Kept cases receive a final format/build/run recheck. Only matching-hash
+    copies are exported to `filtered_tests*`; unrepaired or stale cases remain
+    in `llm_tests*` as filtered and processing continues.
 
 The product path must not edit original C sources with `comment_out`, and must
 not clear a shared build directory. Verification is serialized initially and
@@ -96,8 +111,8 @@ uses stable, unique target names with incremental builds.
 
 ## 5. C-Test to Rust-Test Translation
 
-Only `c_kept` cases are translated. Translation input includes the complete C
-test, `include.h`, the focal C function body/context, the resolved Rust
+Only final `c_kept` and `exported` cases from `filtered_tests*` are translated.
+Translation input includes the complete exported C test, `include.h`, the focal C function body/context, the resolved Rust
 implementation, its declaration, and its module path. Common scalar and boolean
 GoogleTest oracle values are checked against the Rust assertion before Cargo is
 invoked.
@@ -197,10 +212,12 @@ resolved from explicit environment variables or `PATH` and checked by preflight.
 ## 9. Acceptance Criteria
 
 - Every generated test reaches an explicit terminal state.
+- Every generated, cached, repaired, rechecked, and exported C test satisfies
+  the same section 8.5 format validator.
 - C and Rust repair limits default to 10 and are configurable.
 - A broken individual case never aborts processing of later cases.
 - Failed candidates are rolled back and all attempts have durable logs.
-- Only C-passing tests enter translation by default.
+- Only final C-passing, exported, hash-consistent tests enter translation.
 - Rust tests invoke the translated Rust implementation.
 - Every successful Rust exact-run log proves that the requested test executed;
   a successful Cargo process that reports zero matching tests is rejected.

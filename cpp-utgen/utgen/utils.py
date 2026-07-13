@@ -133,6 +133,10 @@ def count_executed_tests(xml_path: str) -> int:
     root = ET.parse(xml_path).getroot()
     executed = 0
     for test_case in root.iter("testcase"):
+        if "DISABLED_" in test_case.attrib.get(
+            "name", ""
+        ) or "DISABLED_" in test_case.attrib.get("classname", ""):
+            continue
         status = test_case.attrib.get("status", "run").lower()
         result = test_case.attrib.get("result", "completed").lower()
         if status == "notrun" or result in {"skipped", "suppressed"}:

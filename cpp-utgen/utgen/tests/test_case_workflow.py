@@ -13,7 +13,7 @@ sys.path.insert(0, str(UTGEN_DIR))
 
 from case_runner import CaseResult  # noqa: E402
 from case_workflow import CaseWorkflow  # noqa: E402
-from expt import Expt, FunctionData  # noqa: E402
+from expt import Expt, FileData, FunctionData  # noqa: E402
 
 
 class FakeSource:
@@ -37,6 +37,12 @@ class FakeFunction:
     def is_decl_in_header(self) -> bool:
         return False
 
+    def get_decl_file(self) -> str:
+        return "sample.c"
+
+    def get_function_body(self) -> str:
+        return "void target(void) {}"
+
 
 def create_test(project: Path) -> tuple[FakeSource, FakeFunction, Path]:
     source_path = project / "sample.c"
@@ -49,7 +55,7 @@ def create_test(project: Path) -> tuple[FakeSource, FakeFunction, Path]:
     )
     test_path = function_dir / "test_001.cpp"
     test_path.write_text(
-        '#include "include.h"\nTEST(Target, Works) { EXPECT_EQ(1, 1); }\n',
+        '#include "include.h"\nTEST(Target, Works) { EXPECT_EQ(target(), 1); }\n',
         encoding="utf-8",
     )
     return FakeSource(source_path), FakeFunction(), test_path
@@ -88,7 +94,86 @@ class CaseWorkflowTests(unittest.TestCase):
             record = self.load_record(project)
             self.assertEqual(record["workflow_status"], "passed")
             self.assertEqual(record["repair_rounds"], 0)
+            self.assertEqual(record["format_status"], "pass")
+            self.assertEqual(record["decl_file"], "sample.c")
+            self.assertEqual(record["function_body"], "void target(void) {}")
             self.assertTrue(record["kept"])
+
+    def test_format_failure_is_repaired_before_build_and_uses_shared_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            source, function, test_path = create_test(project)
+            test_path.write_text(
+                '#include "include.h"\nTEST(Target, Works) {}\n',
+                encoding="utf-8",
+            )
+            repaired = (
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n"
+            )
+
+            class PassingSession:
+                attempts = []
+
+                def __init__(self, *args, **kwargs) -> None:
+                    pass
+
+                def build_test(self, attempt: str) -> CaseResult:
+                    self.attempts.append(attempt)
+                    return CaseResult(True, "", "build.log", "", ["build"])
+
+                def run_test(self, attempt: str) -> CaseResult:
+                    return CaseResult(True, "", "run.log", "", ["run"])
+
+            with (
+                patch("case_workflow.get_test_from_LLM", return_value=[repaired]) as llm,
+                patch("case_workflow.SingleTestSession", PassingSession),
+            ):
+                workflow = CaseWorkflow(
+                    str(project), "build", "_cxt", max_repair_rounds=2
+                )
+                workflow.process_generated_test(
+                    "_cxt", source, function, str(test_path)
+                )
+
+            record = self.load_record(project)
+            self.assertEqual(record["workflow_status"], "passed")
+            self.assertEqual(record["format_status"], "pass")
+            self.assertEqual(record["repair_rounds"], 1)
+            self.assertEqual(PassingSession.attempts, ["resume_1"])
+            self.assertEqual(test_path.read_text(encoding="utf-8"), repaired)
+            llm.assert_called_once()
+
+    def test_format_repair_exhaustion_filters_without_building(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            source, function, test_path = create_test(project)
+            test_path.write_text(
+                '#include "include.h"\nTEST(Target, Works) {}\n',
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "case_workflow.get_test_from_LLM",
+                    return_value=['#include "include.h"\nTEST(Target, Works) {}\n'],
+                ) as llm,
+                patch("case_workflow.SingleTestSession") as session,
+            ):
+                workflow = CaseWorkflow(
+                    str(project), "build", "_cxt", max_repair_rounds=2
+                )
+                workflow.process_generated_test(
+                    "_cxt", source, function, str(test_path)
+                )
+
+            record = self.load_record(project)
+            self.assertEqual(record["workflow_status"], "filtered")
+            self.assertEqual(record["terminal_reason"], "max_repair_rounds")
+            self.assertEqual(record["failure_type"], "format_failure")
+            self.assertEqual(record["repair_rounds"], 2)
+            self.assertEqual(llm.call_count, 2)
+            session.assert_not_called()
 
     def test_interrupted_manifest_dump_preserves_previous_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,6 +701,63 @@ class CaseWorkflowTests(unittest.TestCase):
 
             self.assertEqual(prepare.call_args.args[3], ["test_001.cpp"])
 
+    def test_batch_compile_and_coverage_filter_invalid_format_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            source_path = project / "sample.c"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text("int target(void) { return 1; }\n", encoding="utf-8")
+            parent = project / "llm_tests_cxt" / "sample.c"
+            function_dir = parent / "target_void_"
+            function_dir.mkdir(parents=True)
+            (function_dir / "include.h").write_text(
+                "int target(void);\n", encoding="utf-8"
+            )
+            test_path = function_dir / "test_001.cpp"
+            test_path.write_text(
+                '#include "include.h"\nTEST(Target, Works) { EXPECT_EQ(1, 1); }\n',
+                encoding="utf-8",
+            )
+            function_data = FunctionData(
+                "target(void)",
+                str(source_path),
+                False,
+                str(parent),
+                (1, 1),
+                {"test_001.cpp": 1},
+            )
+            record = function_data.get_test_records()["test_001.cpp"]
+            record.update({"compile": "pass", "run": "pass", "kept": True})
+            file_data = FileData("sample.c", str(source_path), str(project / "llm_tests_cxt"))
+            file_data.add_function_data(function_data)
+            expt = Expt("_cxt", str(project))
+            expt.add_file_data(file_data)
+            compile_commands = {
+                str(function_dir): {"test_001.cpp": ["clang++", "test_001.cpp"]}
+            }
+
+            with (
+                patch.object(expt, "get_compile_cmds", return_value=compile_commands),
+                patch.object(function_data, "try_compile", return_value=True) as compile_test,
+            ):
+                expt.gen_compile_result("build")
+
+            compile_test.assert_not_called()
+            self.assertEqual(record["format_status"], "fail")
+            self.assertFalse(record["kept"])
+            self.assertEqual(record["workflow_status"], "filtered")
+
+            with (
+                patch("expt.cmake_config"),
+                patch.object(
+                    function_data, "_FunctionData__prepare_coverage_dir"
+                ) as prepare,
+                patch.object(function_data, "collect_line_branch"),
+            ):
+                expt.gen_covtest_result(str(project), "build")
+
+            prepare.assert_not_called()
+
     def test_kept_only_final_run_failure_is_filtered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"
@@ -667,7 +809,10 @@ class CaseWorkflowTests(unittest.TestCase):
             function_dir = parent / "target_void_"
             function_dir.mkdir(parents=True)
             test_path = function_dir / "test_001.cpp"
-            test_path.write_text("verified content\n")
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n"
+            )
             old_hash = hashlib.sha256(test_path.read_bytes()).hexdigest()
             test_path.write_text("changed content\n")
             data = FunctionData(
@@ -742,7 +887,10 @@ class CaseWorkflowTests(unittest.TestCase):
             function_dir.mkdir(parents=True)
             (function_dir / "include.h").touch()
             test_path = function_dir / "test_001.cpp"
-            test_path.write_text("verified content\n")
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n"
+            )
             content_hash = hashlib.sha256(test_path.read_bytes()).hexdigest()
             data = FunctionData(
                 "target(void)",
@@ -783,7 +931,10 @@ class CaseWorkflowTests(unittest.TestCase):
             function_dir.mkdir(parents=True)
             (function_dir / "include.h").touch()
             test_path = function_dir / "test_001.cpp"
-            test_path.write_text("verified content\n")
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n"
+            )
             content_hash = hashlib.sha256(test_path.read_bytes()).hexdigest()
             data = FunctionData(
                 "target(void)",
@@ -820,6 +971,72 @@ class CaseWorkflowTests(unittest.TestCase):
                     / "test_001.cpp"
                 ).is_file()
             )
+
+    def test_post_analysis_manifest_round_trip_preserves_trust_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            parent = project / "llm_tests_req_cxt" / "sample.c"
+            function_dir = parent / "target_void_"
+            function_dir.mkdir(parents=True)
+            include_path = function_dir / "include.h"
+            include_path.write_text("void target(void);\n", encoding="utf-8")
+            test_path = function_dir / "test_001_1.cpp"
+            content = (
+                '#include "include.h"\n'
+                "/* TEST(Target, target_void_001)\n"
+                "Input parameter: none.\n"
+                "Precondition: target is callable.\n"
+                "Expected result: target returns 1. */\n"
+                "TEST(Target, target_void_001) { EXPECT_EQ(target(), 1); }\n"
+            )
+            test_path.write_text(content, encoding="utf-8")
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+            include_hash = hashlib.sha256(include_path.read_bytes()).hexdigest()
+            metadata = {
+                "test_type": "_req_cxt",
+                "decl_file": "sample.c",
+                "function_body": "void target(void) {}",
+                "requirement": (
+                    "/* TEST(Target, target_void_001)\n"
+                    "Input parameter: none.\n"
+                    "Precondition: target is callable.\n"
+                    "Expected result: target returns 1. */"
+                ),
+                "expected_test_signature": "TEST(Target, target_void_001)",
+                "format_status": "pass",
+                "format_errors": [],
+                "format_log": "format.log",
+                "include_hash": include_hash,
+                "metadata": {
+                    "decl_file": "sample.c",
+                    "function_body": "void target(void) {}",
+                },
+            }
+            old_record = {
+                "test_path": str(test_path),
+                "compile": "pass",
+                "run": "pass",
+                "kept": True,
+                "content_hash": content_hash,
+                "workflow_status": "passed",
+                **metadata,
+            }
+            data = FunctionData(
+                "target(void)",
+                str(project / "sample.c"),
+                False,
+                str(parent),
+                (1, 3),
+                {"test_001_1.cpp": 1},
+            )
+
+            data.load_manifest_records({str(test_path): old_record})
+            regenerated = data.gen_manifest_records(
+                "sample.c", str(project / "sample.c"), str(parent.parent)
+            )[0]
+
+            for key, value in metadata.items():
+                self.assertEqual(regenerated[key], value)
 
     def test_batch_run_rejects_missing_xml_and_removes_stale_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -904,6 +1121,8 @@ class CaseWorkflowTests(unittest.TestCase):
             self.assertTrue(passed)
             self.assertEqual(record["run"], "pass")
             self.assertTrue(record["kept"])
+            self.assertEqual(record["workflow_status"], "passed")
+            self.assertTrue(record["content_hash"])
 
 
 if __name__ == "__main__":

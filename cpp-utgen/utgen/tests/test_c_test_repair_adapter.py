@@ -56,6 +56,64 @@ class CTestRepairAdapterTests(unittest.TestCase):
         self.assertIn("missing cast", build_c_repair_prompt(ctx))
         self.assertEqual(strip_code_fence("```cpp\nint x;\n```"), "int x;\n")
 
+    def test_initial_format_repair_can_restore_required_identity(self):
+        requirement = (
+            "/* TEST(AddTest, RequiredName)\n"
+            "Input parameter: left is 1 and right is 2.\n"
+            "Precondition: both inputs are valid integers.\n"
+            "Expected result: 3. */"
+        )
+        original = (
+            '#include "include.h"\n'
+            f"{requirement}\n"
+            "TEST(AddTest, WrongName) {}\n"
+        )
+        candidate = (
+            '#include "include.h"\n'
+            f"{requirement}\n"
+            "TEST(AddTest, RequiredName) { EXPECT_EQ(add(1, 2), 3); }\n"
+        )
+
+        valid, reason = validate_c_test_candidate(
+            original,
+            candidate,
+            "int add(int, int)",
+            filename="test_001_1.cpp",
+            test_type="_req",
+            expected_test_signature="TEST(AddTest, RequiredName)",
+            initial_format_repair=True,
+        )
+
+        self.assertTrue(valid, reason)
+
+    def test_compile_repair_preserves_identity_requirement_and_assertion_kinds(self):
+        requirement = (
+            "/* TEST(AddTest, RequiredName)\n"
+            "Input parameter: left is 1 and right is 2.\n"
+            "Precondition: both inputs are valid integers.\n"
+            "Expected result: 3. */"
+        )
+        original = (
+            '#include "include.h"\n'
+            f"{requirement}\n"
+            "TEST(AddTest, RequiredName) { EXPECT_EQ(add(1, 2), 3); }\n"
+        )
+        changed_name = original.replace("RequiredName) {", "ChangedName) {")
+        changed_comment = original.replace("Expected result: 3", "Expected result: 4")
+        changed_assertion = original.replace("EXPECT_EQ", "ASSERT_EQ")
+
+        for candidate in (changed_name, changed_comment, changed_assertion):
+            with self.subTest(candidate=candidate):
+                valid, _ = validate_c_test_candidate(
+                    original,
+                    candidate,
+                    "int add(int, int)",
+                    filename="test_001_1.cpp",
+                    test_type="_req",
+                    expected_test_signature="TEST(AddTest, RequiredName)",
+                )
+                self.assertFalse(valid)
+
 
 if __name__ == "__main__":
     unittest.main()

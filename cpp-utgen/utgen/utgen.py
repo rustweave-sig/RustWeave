@@ -23,10 +23,11 @@ from utils import (
     get_test_from_LLM,
     is_header,
     is_test_or_build_file,
-    remove_macros,
     run_command,
     write_text_best_effort,
 )
+
+from c_test_format import sanitize_generated_test_source
 
 try:
     from config_private import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
@@ -262,11 +263,28 @@ class Function:
                 )
                 include_set = self.get_includes()
                 for include in include_set:
+                    if Path(include).suffix.lower() in {
+                        ".c",
+                        ".cc",
+                        ".cpp",
+                        ".cxx",
+                        ".c++",
+                    }:
+                        continue
                     if "/" in include:
                         file.write(f'#include "{include}"\n')
                     else:
                         file.write(f"#include <{include}>\n")
-                file.write(f'#include "{self.__decl_file}"\n')
+                if is_header(self.__decl_file):
+                    file.write(f'#include "{self.__decl_file}"\n')
+                else:
+                    declaration = self.__standalone_declaration()
+                    if declaration is None:
+                        raise ValueError(
+                            "Cannot safely declare headerless focal function "
+                            f"{self.__sig}"
+                        )
+                    file.write(f'extern "C" {{ {declaration} }}\n')
                 if self.__namespace:
                     file.write("\n")
                     file.write(self.gen_namespaces())
@@ -274,6 +292,28 @@ class Function:
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    def __standalone_declaration(self) -> str | None:
+        if (
+            Path(self.__decl_file).suffix.lower() != ".c"
+            or self.__body is None
+            or self.__namespace
+            or self.__class_name
+            or self.__operator
+        ):
+            return None
+        body_start = self.__body.find("{")
+        if body_start < 0:
+            return None
+        declaration = self.__body[:body_start].strip().rstrip(";")
+        if not declaration or any(marker in declaration for marker in ("#", "}", "=")):
+            return None
+        if re.search(r"\b(?:static|inline)\b", declaration):
+            return None
+        name_match = re.search(rf"\b{re.escape(self.__name)}\s*\(", declaration)
+        if name_match is None or declaration.count("(") != declaration.count(")"):
+            return None
+        return declaration + ";"
 
     def ensure_include_file(self, parent_test_dir: str) -> bool:
         if self.__focal_cxt is None:
@@ -396,7 +436,9 @@ class Function:
                         atomic_write_text(
                             test_file_path,
                             f'#include "include.h"\n/*\n{require}*/\n\n'
-                            + remove_macros(test_func),
+                            + sanitize_generated_test_source(
+                                test_func, forbidden_headers={self.__decl_file}
+                            ),
                         )
                     os.unlink(temp_file_name)
                     notify(test_file_path)
@@ -445,7 +487,10 @@ class Function:
                 if not is_valid_test_file(test_file_path):
                     atomic_write_text(
                         test_file_path,
-                        '#include "include.h"\n\n' + remove_macros(func),
+                        '#include "include.h"\n\n'
+                        + sanitize_generated_test_source(
+                            func, forbidden_headers={self.__decl_file}
+                        ),
                     )
                 generated_tests.append(test_file_path)
                 i += 1
@@ -492,7 +537,7 @@ class Function:
             return False
         path = Path(test_dir)
         rela_path = ""
-        if not is_header(file_path) and is_header(self.__decl_file):
+        if not is_header(file_path):
             rela_path = os.path.relpath(file_path, test_dir)
         test_file_list = [
             file.name

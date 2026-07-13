@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext, redirect_stdout
+import hashlib
 import json
 import os
 import re
@@ -14,11 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from c_test_harness import CMakeCaseHarnessBuilder
-from c_test_repair_adapter import CTestRepairAdapter
-from c_test_verifier import CTestVerifier, CommandRunner, InfrastructureError
-from case_manifest import CaseManifest, stable_case_id
-from case_pipeline import CCasePipeline, CCaseSpec
+from case_manifest import CaseManifest
 from rust_test_pipeline import (
     RustCasePipeline,
     RustRepairContext,
@@ -91,11 +88,26 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
 
 
 def import_legacy_cases(
-    project: Path, test_type: str, manifest: CaseManifest
+    project: Path,
+    test_type: str,
+    manifest: CaseManifest,
+    *,
+    require_v2: bool = False,
 ) -> int:
     legacy_path = project / f"llm_tests{test_type}" / "filter_manifest.json"
     if not legacy_path.is_file():
+        if require_v2:
+            raise FileNotFoundError(
+                f"Version 2 C-test filter manifest not found: {legacy_path}"
+            )
         return 0
+    if require_v2:
+        with legacy_path.open("r", encoding="utf-8") as source:
+            source_manifest = json.load(source)
+        if source_manifest.get("version") != 2:
+            raise ValueError(
+                f"C stage requires a version 2 filter manifest: {legacy_path}"
+            )
     return manifest.import_legacy_filter_manifest(legacy_path, test_type=test_type)
 
 
@@ -127,6 +139,7 @@ class ModelSession:
         from LLM_calling import LLM_config, call_llm_api, close_openai_instance, init_openai_instance
         from test_fixing import SemanticMismatchError, test_fixing
         from test_translation import (
+            CTestFormatContract,
             ensure_c_oracles_preserved,
             ensure_valid_rust_test,
             test_translation,
@@ -157,6 +170,7 @@ class ModelSession:
         self._call = call_llm_api
         self._close = close_openai_instance
         self._translate_test = test_translation
+        self._c_test_format_contract = CTestFormatContract
         self._fix_test = test_fixing
         self._validate_rust_test = ensure_valid_rust_test
         self._validate_c_oracles = ensure_c_oracles_preserved
@@ -171,7 +185,90 @@ class ModelSession:
     def generate_many(self, prompt: str, count: int) -> list[str]:
         return [self.call(prompt) for _ in range(count)]
 
+    @staticmethod
+    def _trusted_c_artifact(context: RustTranslationContext) -> tuple[Path, Path, str]:
+        record = context.record
+        metadata = record.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("C test manifest metadata is malformed")
+        test_type = str(record.get("test_type", ""))
+        if (
+            record.get("c_status") != "kept"
+            or metadata.get("filter_manifest_version") != 2
+        ):
+            raise ValueError("Rust translation requires a trusted strict v2 C test")
+
+        legacy_manifest = Path(str(record.get("legacy_manifest", ""))).resolve()
+        expected_test_root = f"llm_tests{test_type}"
+        if (
+            legacy_manifest.name != "filter_manifest.json"
+            or legacy_manifest.parent.name != expected_test_root
+        ):
+            raise ValueError("strict v2 C test has an invalid source manifest path")
+        project = legacy_manifest.parent.parent
+        raw_relative = str(metadata.get("relative_path", "")).replace("\\", "/")
+        relative = Path(raw_relative)
+        if not raw_relative or relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("strict v2 C test has an invalid relative path")
+
+        source_test = (legacy_manifest.parent / relative).resolve()
+        exported_test = (
+            project / f"filtered_tests{test_type}" / relative
+        ).resolve()
+        if Path(str(metadata.get("source_test_path", ""))).resolve() != source_test:
+            raise ValueError("strict v2 source test metadata does not match the manifest")
+        if (
+            Path(str(metadata.get("exported_test_path", ""))).resolve()
+            != exported_test
+            or context.c_test_path.resolve() != exported_test
+        ):
+            raise ValueError("strict v2 exported test path does not match the manifest")
+
+        source_bytes = source_test.read_bytes()
+        exported_bytes = exported_test.read_bytes()
+        declared_hash = str(metadata.get("filter_manifest_content_hash", ""))
+        current_hash = hashlib.sha256(source_bytes).hexdigest()
+        if (
+            source_bytes != exported_bytes
+            or not declared_hash
+            or current_hash != declared_hash
+            or str(record.get("content_sha256", "")) != declared_hash
+        ):
+            raise ValueError("strict v2 source/export C test content is no longer trusted")
+
+        source_include = source_test.parent / "include.h"
+        exported_include = exported_test.parent / "include.h"
+        source_include_bytes = source_include.read_bytes()
+        exported_include_bytes = exported_include.read_bytes()
+        declared_include_hash = str(metadata.get("include_hash", ""))
+        if (
+            source_include_bytes != exported_include_bytes
+            or not declared_include_hash
+            or hashlib.sha256(source_include_bytes).hexdigest()
+            != declared_include_hash
+        ):
+            raise ValueError("strict v2 source/export include.h is no longer trusted")
+        return source_test, project, source_include_bytes.decode(
+            "utf-8", errors="replace"
+        )
+
     def translate_test(self, context: RustTranslationContext) -> str:
+        record = context.record
+        metadata = record.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("C test manifest metadata is malformed")
+        test_type = str(record.get("test_type", ""))
+        source_test, project, include_source = self._trusted_c_artifact(context)
+        contract = self._c_test_format_contract(
+            test_path=source_test,
+            include_source=include_source,
+            project=project,
+            test_type=test_type,
+            source_name=str(metadata.get("source_file", ""))
+            or Path(str(metadata.get("source_path", ""))).name,
+            focal_signature=str(record.get("function", "")),
+            expected_test_signature=metadata.get("expected_test_signature") or None,
+        )
         return self._translate_test(
             context.c_test_code,
             context.target.rust_code,
@@ -179,6 +276,7 @@ class ModelSession:
             self.client,
             context.target.call_path,
             context.target.declaration or None,
+            c_test_contract=contract,
             c_context=context.c_context,
         )
 
@@ -270,90 +368,60 @@ def run_c_stage(
 ) -> None:
     _preflight_c(project, build)
     from config import BRINFO_PATH, FOCXT_PATH, INCLUDE_FINDER_PATH
+    from case_workflow import CaseWorkflow
     from utils import set_test_generator
     from utgen import Project
 
     if not BRINFO_PATH or not FOCXT_PATH or not INCLUDE_FINDER_PATH:
         raise RuntimeError("cpp-utgen analysis tool paths could not be resolved")
-    set_test_generator(model.generate_many)
-    verifier = CTestVerifier(
-        build_dir=build,
-        log_dir=manifest.path.parent / "logs",
-    )
-    command_runner = CommandRunner()
-    harness_builder = CMakeCaseHarnessBuilder(project, build)
-    repair = CTestRepairAdapter(model.call)
-    c_pipeline = CCasePipeline(
-        manifest,
-        verifier,
-        compile_repair=repair,
-        run_repair=repair,
-        max_repair_attempts=max_attempts,
-    )
     project_model = Project(project.name, str(project), str(build))
     project_model.prepare([test_type], just_load=False, modify_sources=False)
     project_model.analyze()
     project_model.init_data()
+    workflow = CaseWorkflow(
+        str(project),
+        str(build),
+        test_type,
+        max_repair_rounds=max_attempts,
+        choices=1,
+        resume=resume,
+    )
 
-    def on_test_generated(source_file, function, test_path: str) -> None:
-        case_id = stable_case_id(
-            test_path,
-            project_root=project,
-            function=function.get_sig(),
-            test_type=test_type,
+    def process_generated_test(
+        generated_test_type: str, source_file, function, test_path: str
+    ) -> None:
+        workflow.process_generated_test(
+            generated_test_type, source_file, function, test_path
         )
-        existing = manifest.get(case_id)
-        if existing is not None and not manifest.should_process(
-            case_id, resume=resume, stage="c"
-        ):
-            record = existing
-        else:
-            harness = harness_builder.prepare(
-                case_id,
-                test_path,
-                source_path=source_file.get_path(),
-                compile_source=function.is_decl_in_header(),
-            )
-            configure = command_runner.run(
-                harness.configure_command,
-                cwd=project,
-                timeout=600,
-            )
-            if configure.returncode != 0 or configure.timed_out:
-                raise InfrastructureError(
-                    "CMake configure failed for generated case "
-                    f"{case_id}: {configure.output}"
-                )
-            record = c_pipeline.run_case(
-                CCaseSpec(
-                    case_id=case_id,
-                    test_path=test_path,
-                    compile_command=harness.compile_command,
-                    run_command=harness.run_command,
-                    function=function.get_sig(),
-                    test_type=test_type,
-                    compile_cwd=build,
-                    run_cwd=build,
-                    metadata={
-                        "source_path": source_file.get_path(),
-                        "decl_file": function.get_decl_file(),
-                        "loc": list(function.get_loc()),
-                        "function_body": function.get_function_body(),
-                    },
-                ),
-                resume=resume,
-            )
-        if rust_pipeline is not None and record.get("c_status") == "kept":
-            rust_pipeline.run_case(case_id, resume=resume)
 
+    set_test_generator(model.generate_many)
     try:
         project_model.gen_unit_test(
             test_type,
-            on_test_generated=on_test_generated,
-            replay_existing=resume,
+            on_test_generated=process_generated_test,
+        )
+        project_model.write_cmake_file(test_type)
+        project_model.post_analysis(
+            [test_type],
+            do_compile=False,
+            do_test=True,
+            do_export=True,
+            kept_only=True,
         )
     finally:
         set_test_generator(None)
+
+    import_legacy_cases(project, test_type, manifest, require_v2=True)
+    if rust_pipeline is not None:
+        run_manifest_stage(
+            "all",
+            manifest,
+            rust_pipeline,
+            resume=resume,
+            imported_manifest=(
+                project / f"llm_tests{test_type}" / "filter_manifest.json"
+            ),
+        )
 
 
 def run_manifest_stage(
@@ -362,9 +430,16 @@ def run_manifest_stage(
     pipeline: RustCasePipeline,
     *,
     resume: bool,
+    imported_manifest: Path | None = None,
 ) -> None:
+    pipeline.sync_registry()
+    imported_manifest_path = (
+        str(imported_manifest.resolve()) if imported_manifest is not None else ""
+    )
     for record in manifest.cases():
         if record.get("c_status") != "kept":
+            continue
+        if imported_manifest_path and record.get("legacy_manifest") != imported_manifest_path:
             continue
         if stage == "translate":
             pipeline.run_case(
@@ -384,16 +459,35 @@ def run_manifest_stage(
             pipeline.run_case(record["case_id"], resume=resume)
 
 
-def kept_count(stage: str, manifest: CaseManifest) -> int:
+def kept_count(
+    stage: str,
+    manifest: CaseManifest,
+    *,
+    test_type: str | None = None,
+    imported_manifest: Path | None = None,
+) -> int:
+    imported_manifest_path = (
+        str(imported_manifest.resolve()) if imported_manifest is not None else ""
+    )
+    records = [
+        record
+        for record in manifest.cases()
+        if (test_type is None or record.get("test_type") == test_type)
+        and (
+            not imported_manifest_path
+            or record.get("legacy_manifest") == imported_manifest_path
+        )
+    ]
     if stage == "c":
-        return manifest.summary["c_kept"]
+        return sum(1 for record in records if record.get("c_status") == "kept")
     if stage == "translate":
         return sum(
             1
-            for record in manifest.cases()
+            for record in records
             if record.get("rust_translation") == "pass"
+            and record.get("rust_compile") == "pass"
         )
-    return manifest.summary["rust_kept"]
+    return sum(1 for record in records if record.get("rust_status") == "kept")
 
 
 def render_report(
@@ -426,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest = CaseManifest(manifest_path, project_root=project)
         test_type = TEST_TYPES[args.test_type]
         if args.stage in {"translate", "rust"}:
-            import_legacy_cases(project, test_type, manifest)
+            import_legacy_cases(project, test_type, manifest, require_v2=True)
         model = ModelSession()
         stage_output = redirect_stdout(sys.stderr) if args.json_output else nullcontext()
         with stage_output:
@@ -448,14 +542,26 @@ def main(argv: list[str] | None = None) -> int:
                     rust_pipeline if args.stage == "all" else None,
                 )
             elif rust_pipeline is not None:
+                filter_manifest = (
+                    project / f"llm_tests{test_type}" / "filter_manifest.json"
+                )
                 run_manifest_stage(
                     args.stage,
                     manifest,
                     rust_pipeline,
                     resume=args.resume,
+                    imported_manifest=(
+                        filter_manifest if filter_manifest.is_file() else None
+                    ),
                 )
 
-        kept = kept_count(args.stage, manifest)
+        filter_manifest = project / f"llm_tests{test_type}" / "filter_manifest.json"
+        kept = kept_count(
+            args.stage,
+            manifest,
+            test_type=test_type,
+            imported_manifest=filter_manifest,
+        )
         render_report(args.stage, manifest, kept, json_output=args.json_output)
         return 0 if kept >= args.min_kept else 2
     except Exception as error:

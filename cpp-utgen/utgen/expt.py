@@ -12,6 +12,12 @@ from typing import Any
 
 import xmltodict
 
+from c_test_format import (
+    validate_c_test_artifact,
+    validate_c_test_format,
+    validate_c_test_path,
+    validate_include_header_format,
+)
 from linecounter import count_code_lines
 from utils import (
     SETUP_COV,
@@ -247,6 +253,19 @@ class FunctionData:
         can_compile_set = set(can_compile)
         compile_log = f"{self.__test_dir_path}/compile_err.log"
         for test_file_name, record in self.__test_records.items():
+            if record.get("format_status") == "fail":
+                record.update(
+                    {
+                        "compile": "not_run",
+                        "coverage_build": "not_run",
+                        "run": "not_run",
+                        "kept": False,
+                        "exported": False,
+                        "workflow_status": "filtered",
+                        "terminal_reason": "format_failure",
+                    }
+                )
+                continue
             if test_file_name in can_compile_set:
                 record["compile"] = "pass"
                 record["compile_log"] = ""
@@ -313,6 +332,9 @@ class FunctionData:
                 "repair_stage": "",
                 "terminal_reason": reason,
                 "content_hash": content_hash,
+                "format_status": "not_run",
+                "format_errors": [],
+                "format_log": "",
             }
         )
 
@@ -325,6 +347,7 @@ class FunctionData:
         for record in self.__test_records.values():
             record["compile"] = "fail"
             record["coverage_build"] = "fail"
+            record["compile"] = "fail"
             record["run"] = "not_run"
             record["kept"] = False
             record["failure_type"] = "missing_include"
@@ -352,6 +375,12 @@ class FunctionData:
 
     def load_manifest_records(self, records_by_path: dict[str, dict[str, Any]]) -> None:
         can_compile = []
+        include_path = Path(self.__test_dir_path) / "include.h"
+        current_include_hash = (
+            hashlib.sha256(include_path.read_bytes()).hexdigest()
+            if include_path.is_file()
+            else ""
+        )
         for test_file_name, record in self.__test_records.items():
             old_record = records_by_path.get(record["test_path"])
             if old_record is None:
@@ -361,6 +390,14 @@ class FunctionData:
                 "content_hash"
             ) != current_hash:
                 self.__invalidate_changed_record(record, current_hash)
+                continue
+            if old_record.get("include_hash") and old_record.get(
+                "include_hash"
+            ) != current_include_hash:
+                self.__invalidate_changed_record(
+                    record, current_hash, "include_content_changed"
+                )
+                record["include_hash"] = current_include_hash
                 continue
             for key in (
                 "compile",
@@ -381,17 +418,82 @@ class FunctionData:
                 "terminal_reason",
                 "content_hash",
                 "run_command",
+                "test_type",
+                "decl_file",
+                "function_body",
+                "requirement",
+                "expected_test_signature",
+                "format_status",
+                "format_errors",
+                "format_log",
+                "include_hash",
+                "metadata",
             ):
                 if key in old_record:
                     record[key] = old_record[key]
+            record["include_hash"] = current_include_hash
             if record["compile"] == "pass":
                 can_compile.append(test_file_name)
         self.__can_compile = can_compile
+
+    def validate_formats(
+        self, project: str, test_type: str, source_name: str
+    ) -> None:
+        include_path = Path(self.__test_dir_path) / "include.h"
+        try:
+            include_source = include_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError as exc:
+            errors = [f"unable to read generated include.h: {exc}"]
+            for record in self.__test_records.values():
+                self.__mark_format_failure(record, errors)
+            self.__can_compile = []
+            return
+
+        valid_files: list[str] = []
+        for test_file_name, record in self.__test_records.items():
+            try:
+                source = Path(record["test_path"]).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError as exc:
+                errors = [f"unable to read generated test: {exc}"]
+            else:
+                errors = validate_c_test_artifact(
+                    source,
+                    test_path=record["test_path"],
+                    include_source=include_source,
+                    project=project,
+                    test_type=test_type,
+                    source_name=source_name,
+                    function_signature=self.__sig,
+                    expected_test_signature=record.get("expected_test_signature")
+                    or None,
+                )
+            if errors:
+                self.__mark_format_failure(record, errors)
+                continue
+            record["format_status"] = "pass"
+            record["format_errors"] = []
+            record["format_log"] = ""
+            valid_files.append(test_file_name)
+        self.__can_compile = [
+            name for name in self.__can_compile if name in set(valid_files)
+        ]
 
     def gen_manifest_records(
         self, source_name: str, source_path: str, test_root: str
     ) -> list[dict[str, Any]]:
         records = []
+        root_name = Path(test_root).name
+        test_type = root_name[len("llm_tests") :] if root_name.startswith("llm_tests") else ""
+        include_path = Path(self.__test_dir_path) / "include.h"
+        include_hash = (
+            hashlib.sha256(include_path.read_bytes()).hexdigest()
+            if include_path.is_file()
+            else ""
+        )
         for test_file_name in sorted(self.__test_records):
             source_record = self.__test_records[test_file_name]
             if os.path.isfile(source_record["test_path"]):
@@ -409,6 +511,8 @@ class FunctionData:
                     "relative_path": os.path.relpath(record["test_path"], test_root),
                     "decl_in_header": self.__decl_in_header,
                     "loc": self.__loc,
+                    "test_type": source_record.get("test_type", test_type),
+                    "include_hash": include_hash,
                 }
             )
             records.append(record)
@@ -421,43 +525,112 @@ class FunctionData:
             return False
         if not self.__has_include():
             return False
+        include_path = Path(self.__test_dir_path) / "include.h"
+        include_errors = validate_include_header_format(
+            include_path.read_text(encoding="utf-8", errors="replace")
+        )
+        if include_errors:
+            for record in self.__test_records.values():
+                if record["kept"]:
+                    self.__mark_format_failure(record, include_errors)
+            return False
         kept_files = []
         for test_file_name, record in self.__test_records.items():
             if not record["kept"]:
                 continue
             current_hash = self.__content_hash(record)
             if (
-                record["compile"] == "pass"
-                and record["run"] == "pass"
-                and record.get("content_hash")
-                and record["content_hash"] == current_hash
-            ):
-                kept_files.append(test_file_name)
-                continue
-            reason = (
-                "content_changed"
-                if not record.get("content_hash")
+                record["compile"] != "pass"
+                or record["run"] != "pass"
+                or not record.get("content_hash")
                 or record["content_hash"] != current_hash
-                else "unverified_state"
+            ):
+                reason = (
+                    "content_changed"
+                    if not record.get("content_hash")
+                    or record["content_hash"] != current_hash
+                    else "unverified_state"
+                )
+                self.__invalidate_changed_record(record, current_hash, reason)
+                continue
+            test_root_name = Path(self.__test_dir_path).parents[1].name
+            inferred_test_type = (
+                test_root_name[len("llm_tests") :]
+                if test_root_name.startswith("llm_tests")
+                else ""
             )
-            self.__invalidate_changed_record(record, current_hash, reason)
+            test_type = str(record.get("test_type", inferred_test_type))
+            format_errors = validate_c_test_path(
+                record["test_path"],
+                project=project,
+                test_type=test_type,
+                source_name=Path(self.__file_path).name,
+                function_signature=self.__sig,
+            )
+            try:
+                test_source = Path(record["test_path"]).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError as exc:
+                format_errors.append(f"unable to read generated test: {exc}")
+                test_source = ""
+            format_errors.extend(
+                validate_c_test_format(
+                    test_source,
+                    filename=test_file_name,
+                    test_type=test_type,
+                    focal_function=self.__sig,
+                    expected_test_signature=record.get("expected_test_signature")
+                    or None,
+                )
+            )
+            if format_errors:
+                self.__mark_format_failure(record, format_errors)
+                continue
+            record["format_status"] = "pass"
+            record["format_errors"] = []
+            kept_files.append(test_file_name)
         if len(kept_files) == 0:
             return False
         export_dir = f"{export_parent_dir}/{Path(self.__test_dir_path).name}"
         os.makedirs(export_dir, exist_ok=True)
-        shutil.copy(f"{self.__test_dir_path}/include.h", f"{export_dir}/include.h")
+        exported_include = Path(export_dir) / "include.h"
+        shutil.copy2(include_path, exported_include)
+        if hashlib.sha256(include_path.read_bytes()).digest() != hashlib.sha256(
+            exported_include.read_bytes()
+        ).digest():
+            for test_file_name in kept_files:
+                self.__mark_format_failure(
+                    self.__test_records[test_file_name],
+                    ["exported include.h content hash does not match source"],
+                )
+            shutil.rmtree(export_dir, ignore_errors=True)
+            return False
+        exported_files: list[str] = []
         for test_file_name in kept_files:
-            shutil.copy(
-                f"{self.__test_dir_path}/{test_file_name}",
-                f"{export_dir}/{test_file_name}",
-            )
+            source_test = Path(self.__test_dir_path) / test_file_name
+            exported_test = Path(export_dir) / test_file_name
+            shutil.copy2(source_test, exported_test)
+            if hashlib.sha256(source_test.read_bytes()).digest() != hashlib.sha256(
+                exported_test.read_bytes()
+            ).digest():
+                self.__mark_format_failure(
+                    self.__test_records[test_file_name],
+                    ["exported test content hash does not match source"],
+                )
+                exported_test.unlink(missing_ok=True)
+                continue
             self.__test_records[test_file_name]["exported"] = True
+            exported_files.append(test_file_name)
+        if not exported_files:
+            shutil.rmtree(export_dir, ignore_errors=True)
+            return False
         rela_path, deps_list = self.__get_relative_source_and_deps(project, export_dir)
         deps = " ".join(deps_list)
         target_name = safe_target_name("filtered_test", self.__test_dir_path)
         with open(f"{export_dir}/CMakeLists.txt", "w") as cmake_file:
             cmake_file.write('set(SOURCE_FILES "")\n')
-            for test_file_name in kept_files:
+            for test_file_name in exported_files:
                 cmake_file.write(
                     f"set(SOURCE_FILES ${{SOURCE_FILES}} {test_file_name})\n"
                 )
@@ -466,6 +639,34 @@ class FunctionData:
             )
             cmake_file.write(f"target_link_libraries({target_name} gmock_main)\n")
         return True
+
+    def __mark_format_failure(
+        self, record: dict[str, Any], errors: list[str]
+    ) -> None:
+        log_path = (
+            f"{self.__test_dir_path}/format_{Path(record['test_file']).stem}.log"
+        )
+        write_text_file(
+            log_path,
+            "Generated test violates section 8.5:\n- "
+            + "\n- ".join(errors)
+            + "\n",
+        )
+        record.update(
+            {
+                "format_status": "fail",
+                "format_errors": errors,
+                "format_log": log_path,
+                "failure_type": "format_failure",
+                "compile": "not_run",
+                "coverage_build": "not_run",
+                "run": "not_run",
+                "kept": False,
+                "exported": False,
+                "workflow_status": "filtered",
+                "terminal_reason": "format_failure",
+            }
+        )
 
     def get_test_result(self) -> TestResult | None:
         return self.__test_result
@@ -491,7 +692,11 @@ class FunctionData:
     ) -> tuple[int, int]:
         success = 0
         failed = 0
-        compile_cmd_dict = compile_cmds[self.__test_dir_path]
+        compile_cmd_dict = {
+            name: command
+            for name, command in compile_cmds[self.__test_dir_path].items()
+            if self.__test_records.get(name, {}).get("format_status") != "fail"
+        }
         if os.path.exists(f"{self.__test_dir_path}/compile_err.log"):
             os.remove(f"{self.__test_dir_path}/compile_err.log")
         for test_file_name in compile_cmd_dict:
@@ -509,8 +714,13 @@ class FunctionData:
         success = 0
         failed = 0
         can_compile = []
+        compile_cmds = {
+            name: command
+            for name, command in compile_cmds.items()
+            if self.__test_records.get(name, {}).get("format_status") != "fail"
+        }
         if len(compile_cmds) == 0:
-            return 0, len(self.__test_records), []
+            return 0, 0, []
         if os.path.exists(f"{self.__test_dir_path}/compile_err.log"):
             os.remove(f"{self.__test_dir_path}/compile_err.log")
         for test_file_name in compile_cmds:
@@ -612,7 +822,7 @@ class FunctionData:
             os.remove(f"{self.__test_dir_path}/build_empty_test_err.log")
         build_cov_dir = f"{build}/coverage"
         rela_path = ""
-        if not is_header(self.__file_path) and self.__decl_in_header:
+        if not is_header(self.__file_path):
             rela_path = os.path.relpath(self.__file_path, llm_cov_dir)
         work_dir = f"{project}/project_info"
         deps_set = set()
@@ -672,7 +882,7 @@ class FunctionData:
         self, project: str, base_dir: str
     ) -> tuple[str, list[str]]:
         rela_path = ""
-        if not is_header(self.__file_path) and self.__decl_in_header:
+        if not is_header(self.__file_path):
             rela_path = os.path.relpath(self.__file_path, base_dir)
         deps_set = set()
         deps_file_path = f"{project}/project_info/deps_dict.json"
@@ -747,6 +957,7 @@ class FunctionData:
             record["failure_type"] = "build_failure"
             return False
         record["coverage_build"] = "pass"
+        record["compile"] = "pass"
         record["build_log"] = ""
         return True
 
@@ -807,6 +1018,9 @@ class FunctionData:
                 record["run"] = "pass"
                 record["kept"] = True
                 record["failure_type"] = ""
+                record["workflow_status"] = "passed"
+                record["terminal_reason"] = ""
+                record["content_hash"] = self.__content_hash(record)
                 return True
             record["run"] = "fail"
             record["kept"] = False
@@ -884,10 +1098,6 @@ class FunctionData:
         for test_file_name, target_name in build_pass_targets:
             if self.__run_test_target(build, test_file_name, target_name):
                 run_pass_files.append(test_file_name)
-                if not kept_only:
-                    record = self.__test_records[test_file_name]
-                    record["workflow_status"] = "passed"
-                    record["terminal_reason"] = ""
             else:
                 run_failed += 1
                 if kept_only:
@@ -980,6 +1190,10 @@ class FileData:
         for func_data in self.__data:
             func_data.load_manifest_records(records_by_path)
 
+    def validate_formats(self, project: str, test_type: str) -> None:
+        for func_data in self.__data:
+            func_data.validate_formats(project, test_type, self.__name)
+
     def gen_manifest_records(self, test_root: str) -> list[dict[str, Any]]:
         records = []
         for func_data in self.__data:
@@ -1062,6 +1276,10 @@ class Expt:
                 records_by_path[record["test_path"]] = record
         for file_data in self.__data:
             file_data.load_manifest_records(records_by_path)
+
+    def validate_formats(self) -> None:
+        for file_data in self.__data:
+            file_data.validate_formats(self.__project, self.__type)
 
     def gen_manifest_data(self) -> dict[str, Any]:
         tests = []
@@ -1164,6 +1382,7 @@ class Expt:
         return cmds
 
     def gen_compile_result(self, build: str) -> None:
+        self.validate_formats()
         success = 0
         failed = 0
         self.__compile_cmds = self.get_compile_cmds(build)
@@ -1181,6 +1400,7 @@ class Expt:
         return func_data.get_compile_result_concurrent(compile_cmds)
 
     def gen_compile_result_concurrent(self, build: str) -> None:
+        self.validate_formats()
         success = 0
         failed = 0
         self.__compile_cmds = self.get_compile_cmds(build)
@@ -1205,6 +1425,7 @@ class Expt:
     def gen_covtest_result(
         self, project: str, build: str, kept_only: bool = False
     ) -> None:
+        self.validate_formats()
         cmake_config(project, build)
         print(f"Generating coverage and test result for llm_tests{self.__type} ...")
         for file_data in self.__data:

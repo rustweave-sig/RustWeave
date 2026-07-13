@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from case_runner import SingleTestSession
+from c_test_repair_adapter import validate_c_test_candidate
 from prompt import (
     RUSTASSISTANT_INSTRUCTIONS_AND_EXAMPLES_FOR_FORMATTING_THE_CHANGELOG_OUTPUT,
     TEST_REPAIR_PROMPT,
@@ -185,6 +186,16 @@ def focal_name(signature: str) -> str:
 def validate_candidate(
     record: dict[str, Any], original_content: str, new_content: str
 ) -> tuple[bool, str]:
+    strict_valid, strict_reason = validate_c_test_candidate(
+        original_content,
+        new_content,
+        str(record.get("function", "")),
+        filename=Path(record.get("test_path", "test_001.cpp")).name,
+        test_type=str(record.get("test_type", "")),
+        expected_test_signature=record.get("expected_test_signature"),
+    )
+    if not strict_valid:
+        return False, strict_reason
     if "GTEST_SKIP" in new_content:
         return False, "candidate uses GTEST_SKIP"
     if not TEST_PATTERN.search(new_content):

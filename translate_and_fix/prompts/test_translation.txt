@@ -17,11 +17,14 @@ Return only Rust source code for exactly one test function. Follow every rule be
 
 1. Emit exactly one ordinary `#[test]` function. Do not emit Markdown or explanations.
 2. Call `{focal_function}` through the supplied Rust module context. Never declare or call an `extern "C"` fallback and never link back to the C implementation.
-3. Preserve the C test inputs and expected values. Translate GoogleTest assertions into `assert!`, `assert_eq!`, or `assert_ne!` without weakening them.
-4. Include at least one non-trivial assertion and at least one direct call to `{focal_function}`.
-5. Do not use `#[ignore]`, `#[should_panic]`, `catch_unwind`, `assert!(true)`, placeholder logic, or an empty body.
-6. Use explicit `unsafe` blocks only where the translated Rust API requires them. Use only items already available in the supplied module context or the Rust standard/core libraries.
-7. Keep pointer, array, string, structure, and numeric semantics equivalent to the verified C test.
-8. Do not reproduce GoogleTest fixtures, registration macros, mocks, or a `main`; express only the actual arrange/call/assert behavior.
+3. Preserve every focal-call argument, setup value, expected value, and assertion relation from the verified C test. Type casts and equivalent pointer/string adapters are allowed, but changing an input or expectation is forbidden.
+4. Bind the focal return value (or its output parameter/state) and assert on that value. Calling the focal function and then asserting an unrelated local variable or constant is forbidden.
+5. Translate only supported value or state checks into `assert!`, `assert_eq!`, or `assert_ne!` without weakening them. Do not invent an approximation for `EXPECT_CALL`, throw/no-throw checks, death checks, or another unsupported GoogleTest macro; those tests must be filtered before this prompt is used.
+6. When a C expected value is an immutable local constant, such as `EXPECT_EQ(actual, low)` in a clamp test, preserve both the constant's initializer and its role as the expected side. Do not infer or substitute a different expected literal.
+7. Include at least one non-trivial assertion and at least one direct call to `{focal_function}`.
+8. Do not use `#[ignore]`, `#[should_panic]`, `catch_unwind`, `assert!(true)`, placeholder logic, or an empty body.
+9. Use explicit `unsafe` blocks only where the translated Rust API requires them. Use only items already available in the supplied module context or the Rust standard/core libraries.
+10. Keep pointer, array, string, structure, and numeric semantics equivalent to the verified C test.
+11. Do not reproduce GoogleTest fixtures, registration macros, mocks, or a `main`; express only the actual arrange/call/assert behavior.
 
 Rust test source:

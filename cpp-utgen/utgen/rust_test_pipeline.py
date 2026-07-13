@@ -519,14 +519,24 @@ class RustCasePipeline:
         self.repair = repair
         self.validate = validate
         self.max_repair_attempts = max_repair_attempts
+        self.sync_registry()
+
+    def sync_registry(self) -> None:
+        """Register only cases whose C and Rust verification state is current."""
+
+        self.registry.set_registered_cases(self._registered_ids())
 
     def _registered_ids(
         self, current: str | None = None, *, exclude: str | None = None
     ) -> list[str]:
+        for record in self.manifest.cases():
+            self.manifest.invalidate_changed_c(record["case_id"])
         result = [
             record["case_id"]
             for record in self.manifest.cases()
-            if record.get("rust_status") == "kept" and record["case_id"] != exclude
+            if record.get("c_status") == "kept"
+            and record.get("rust_status") == "kept"
+            and record["case_id"] != exclude
         ]
         if current and current not in result:
             result.append(current)
@@ -539,9 +549,12 @@ class RustCasePipeline:
     def _c_context(record: Mapping[str, Any], c_test_path: Path) -> str:
         sections: list[str] = []
         include_path = c_test_path.parent / "include.h"
-        if include_path.is_file():
-            include_code = include_path.read_text(encoding="utf-8", errors="replace")
-            sections.append(f"include.h:\n{include_code}")
+        if not include_path.is_file():
+            raise FileNotFoundError(
+                f"Required generated C test header is missing: {include_path}"
+            )
+        include_code = include_path.read_text(encoding="utf-8", errors="replace")
+        sections.append(f"include.h:\n{include_code}")
         function_body = str(record.get("metadata", {}).get("function_body", "")).strip()
         if function_body:
             sections.append(f"focal C function:\n{function_body}")
@@ -588,10 +601,14 @@ class RustCasePipeline:
         translate_case: bool = True,
         verify_case: bool = True,
     ) -> dict[str, Any]:
+        if self.manifest.invalidate_changed_c(case_id):
+            self.registry.set_registered_cases(self._registered_ids(exclude=case_id))
+            return self.manifest.get(case_id) or {}
         record = self.manifest.get(case_id)
         if record is None:
             raise KeyError(f"Unknown case ID: {case_id}")
         if record.get("c_status") != "kept":
+            self.registry.set_registered_cases(self._registered_ids(exclude=case_id))
             return record
         if not translate_case and record.get("rust_translation") == "fail":
             return record
@@ -605,8 +622,17 @@ class RustCasePipeline:
             return record
 
         c_test_path = Path(record["test_path"])
-        c_test_code = c_test_path.read_text(encoding="utf-8", errors="replace")
-        c_context = self._c_context(record, c_test_path)
+        try:
+            c_test_code = c_test_path.read_text(encoding="utf-8", errors="replace")
+            c_context = self._c_context(record, c_test_path)
+        except OSError as error:
+            return self._filter(
+                case_id,
+                state="rust_context_filtered",
+                failure_type="rust_c_context_missing",
+                reason=str(error),
+                rust_translation="fail",
+            )
         try:
             target = self.resolver.resolve(
                 str(record.get("function", "")),
@@ -649,9 +675,10 @@ class RustCasePipeline:
             self.registry.set_registered_cases(self._registered_ids(case_id))
             self.manifest.transition(
                 case_id,
-                "rust_translated",
+                "rust_translation_compile_pending",
                 rust_status="pending",
-                rust_translation="pass",
+                rust_translation="not_run",
+                rust_compile="not_run",
                 rust_test_path=str(rust_test_path),
                 rust_target_path=str(target.rust_path),
                 rust_target_module=target.module,
@@ -685,8 +712,6 @@ class RustCasePipeline:
                 )
             self.registry.set_registered_cases(self._registered_ids(case_id))
 
-        if not verify_case:
-            return self.manifest.get(case_id) or record
         original_translation = translated
 
         compile_result = self.verifier.compile(case_id)
@@ -708,15 +733,19 @@ class RustCasePipeline:
                     failure_type=compile_result.failure_type,
                     reason="Rust test did not compile after repair attempts",
                     rust_compile="fail",
+                    rust_translation="fail",
                 )
 
         self.manifest.transition(
             case_id,
             "rust_compile_passed",
+            rust_translation="pass",
             rust_compile="pass",
             rust_failure_type="",
             rust_failure_reason="",
         )
+        if not verify_case:
+            return self.manifest.get(case_id) or record
         test_name = extract_test_name(translated)
         run_result = self.verifier.run_exact(case_id, test_name)
         self._record(case_id, "rust_run", run_result)

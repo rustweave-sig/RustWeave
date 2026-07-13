@@ -101,6 +101,47 @@ Artifacts:
 - Combined run log:
   `${TMPDIR:-/tmp}/c2rust-testgen-smoke-all/testgen-stage-all-final2.log`
 
+## Section 8.5 Strict-Format Rerun (2026-07-13)
+
+Workspace: `${TMPDIR:-/tmp}/c2rust-strict-format-smoke`
+
+This rerun used the final installed CLI, Clang 18.1.3, the real `focxt` and
+`brinfo` binaries, and `qwen3-max`. The fixture contains a multi-branch C
+function and a matching Rust crate. The API key was injected from the ignored
+local `auth.txt` file and was not copied into the project or repository.
+
+The first strict run generated and verified all C cases, then exposed an
+integration defect before any Rust model call: strict-v2 import correctly used
+the exported `filtered_tests_cxt` artifact, while the translation contract only
+accepted its `llm_tests_cxt` source path. The fix now reconstructs both paths
+from the trusted v2 manifest, verifies both test files and both `include.h`
+files against their declared hashes, and validates the canonical source
+artifact before translation. After redeployment, the complete `stage all`
+command returned success:
+
+- Generated C cases: 10
+- Section 8.5 format pass: 10/10
+- C compile and exact run pass: 10/10
+- C filtered or repaired: 0
+- Source/export test and `include.h` hash matches: 10/10
+- Rust translations and Cargo compile checks: 10/10
+- Rust exact run pass: 10/10
+- Rust filtered or repaired: 0
+- Full generated Rust crate: 10/10 tests passed
+
+Every Rust exact-run log reported `running 1 test` and the requested fully
+qualified test ending in `ok`. The ten registered tests have ten distinct
+content hashes. A final `cargo test` over the complete crate also passed.
+
+Artifacts:
+
+- C filter manifest:
+  `${TMPDIR:-/tmp}/c2rust-strict-format-smoke/llm_tests_cxt/filter_manifest.json`
+- Unified C/Rust manifest:
+  `${TMPDIR:-/tmp}/c2rust-strict-format-smoke/.c2rust/default/testgen/manifest.json`
+- Per-case logs:
+  `${TMPDIR:-/tmp}/c2rust-strict-format-smoke/.c2rust/default/testgen/logs`
+
 ## xxHash Trial
 
 Workspace: `${TMPDIR:-/tmp}/c2rust-real-projects/xxhash-testgen`
@@ -181,18 +222,27 @@ SHA-256 and byte comparison.
    transfers and non-evaluating macro/configuration constructs, and ignores
    short-circuit RHS behavior when deciding whether a case is effective. Every
    focal call and assertion must remain in that eagerly-executed projection.
+9. Strict-v2 translation initially treated an exported `filtered_tests*` path
+   as though it had to be under `llm_tests*`. Translation now rebuilds both
+   paths from the manifest and revalidates source/export content and hashes
+   before invoking the model.
+10. Legacy compile-repair markers were tied only to a filename and successful
+    compile. Marker v3 now binds canonical test and `include.h` paths plus both
+    SHA-256 values, reruns the complete section 8.5 artifact guard, and rejects
+    moved tests or modified headers.
 
 ## Verification
 
-- `cpp-utgen` Python tests: 43 passed
-- `translate_and_fix` Python tests: 44 passed
+- `cpp-utgen` Python tests: 149 passed
+- `translate_and_fix` Python tests: 61 passed
 - `c2rust-code-analyse` Rust tests: 112 passed
 - Top-level CLI Rust tests: 29 passed
 - Test CLI Rust tests: 21 passed
-- Total related automated tests: 249 passed
+- Total related automated tests: 372 passed
 - Real Clang analysis-tool probe: passed
 - Real model endpoint probe: passed
 - Fresh one-shot C/Rust workflow: passed
+- Section 8.5 strict-format C/Rust workflow: 10/10 passed
 - Controlled xxHash workflow: completed with expected filtering
 - Fresh installed-layout Rust rerun: smoke 11/11; xxHash retained case 1/1
 

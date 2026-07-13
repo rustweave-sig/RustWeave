@@ -34,6 +34,16 @@ class CliDispatchTests(unittest.TestCase):
                 "crate::module::foo",
                 "--rusttype",
                 "unsafe fn(i32) -> i32",
+                "--c-test-project",
+                "/project",
+                "--c-test-type",
+                "cxt",
+                "--c-source-name",
+                "sample.c",
+                "--c-focal-signature",
+                "int foo(int)",
+                "--c-include",
+                "include.h",
             ]
         )
 
@@ -46,6 +56,7 @@ class CliDispatchTests(unittest.TestCase):
                 rust_code="Rust target",
                 error="ignored",
                 manifest_json=None,
+                c_include='int foo(int);',
                 model="model-x",
                 openai_instance="client",
             )
@@ -57,6 +68,15 @@ class CliDispatchTests(unittest.TestCase):
             "client",
             "crate::module::foo",
             "unsafe fn(i32) -> i32",
+            c_test_contract=cli.CTestFormatContract(
+                test_path="case.cpp",
+                include_source="int foo(int);",
+                project="/project",
+                test_type="cxt",
+                source_name="sample.c",
+                focal_signature="int foo(int)",
+                expected_test_signature=None,
+            ),
         )
 
     def test_dispatches_test_fix_with_diagnostic(self):
@@ -68,6 +88,7 @@ class CliDispatchTests(unittest.TestCase):
                 rust_code="Rust test",
                 error="rustc error",
                 manifest_json=None,
+                c_include=None,
                 model="model-x",
                 openai_instance="client",
             )
@@ -94,6 +115,21 @@ class CliDispatchTests(unittest.TestCase):
         args.focal_function = None
         with self.assertRaisesRegex(ValueError, "--focal_function"):
             cli.validate_cli_args(args)
+
+    def test_validation_requires_complete_c_test_contract(self):
+        args = self._args("test_translate")
+        for attribute in (
+            "c_test_project",
+            "c_test_type",
+            "c_source_name",
+            "c_focal_signature",
+            "c_include",
+        ):
+            with self.subTest(attribute=attribute):
+                incomplete = self._args("test_translate")
+                setattr(incomplete, attribute, None)
+                with self.assertRaises(ValueError):
+                    cli.validate_cli_args(incomplete)
 
     def test_semantic_mismatch_exits_two_without_network_setup(self):
         with tempfile.TemporaryDirectory() as directory:

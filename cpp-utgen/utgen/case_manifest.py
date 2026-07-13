@@ -11,6 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from c_test_format import (
+    validate_c_test_format,
+    validate_c_test_path,
+    validate_include_header_format,
+)
+
 
 SCHEMA_VERSION = 1
 C_TERMINAL_STATUSES = frozenset({"kept", "filtered"})
@@ -29,6 +35,42 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def c_input_sha256(record: Mapping[str, Any]) -> str:
+    """Hash every persisted C-side input used by Rust test translation."""
+
+    test_path = Path(str(record.get("test_path", "")))
+    include_path = test_path.parent / "include.h"
+    metadata = record.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+
+    def value(name: str) -> Any:
+        return metadata.get(name, record.get(name, ""))
+
+    payload = {
+        "test_sha256": file_sha256(test_path) if test_path.is_file() else "",
+        "include_sha256": (
+            file_sha256(include_path) if include_path.is_file() else ""
+        ),
+        "function": str(record.get("function", "")),
+        "test_type": str(record.get("test_type", "")),
+        "source_file": str(value("source_file")),
+        "source_path": str(value("source_path")),
+        "decl_file": str(value("decl_file")),
+        "function_body": str(value("function_body")),
+        "expected_test_signature": str(value("expected_test_signature")),
+        "requirement": str(value("requirement")),
+        "relative_path": str(value("relative_path")),
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def stable_case_id(
@@ -166,6 +208,27 @@ class CaseManifest:
         attempts.setdefault("run", [])
         attempts.setdefault("rust_compile", [])
         attempts.setdefault("rust_run", [])
+
+    @classmethod
+    def _reset_rust_state(cls, record: dict[str, Any]) -> None:
+        cls._ensure_rust_fields(record)
+        record.update(
+            {
+                "rust_status": "pending",
+                "rust_translation": "not_run",
+                "rust_compile": "not_run",
+                "rust_run": "not_run",
+                "rust_kept": False,
+                "rust_test_path": "",
+                "rust_content_sha256": "",
+                "rust_target_path": "",
+                "rust_target_sha256": "",
+                "rust_failure_type": "",
+                "rust_failure_reason": "",
+            }
+        )
+        record["attempts"]["rust_compile"] = []
+        record["attempts"]["rust_run"] = []
 
     @staticmethod
     def _empty_summary() -> dict[str, Any]:
@@ -359,6 +422,7 @@ class CaseManifest:
             "updated_at": now,
         }
         self._ensure_rust_fields(record)
+        record["c_input_sha256"] = c_input_sha256(record)
         self._data.setdefault("cases", []).append(record)
         self.save()
         return deepcopy(record)
@@ -366,7 +430,13 @@ class CaseManifest:
     def import_legacy_filter_manifest(
         self, path: str | Path, *, test_type: str = ""
     ) -> int:
-        """Merge cpp-utgen's version-1 filter manifest into this workflow."""
+        """Merge a cpp-utgen filter manifest into this workflow.
+
+        Version 2 records are trusted only through the exported artifact.  A
+        version 1 record remains importable, but it needs an explicit kept
+        decision and a matching content hash instead of inheriting the old
+        compile/run-only promotion behavior.
+        """
 
         legacy_path = Path(path)
         with legacy_path.open("r", encoding="utf-8") as source:
@@ -375,16 +445,60 @@ class CaseManifest:
         if not isinstance(tests, list):
             raise ValueError(f"Invalid legacy filter manifest: {legacy_path}")
 
+        version = legacy.get("version", 1)
+        if version not in {1, 2}:
+            raise ValueError(
+                f"Unsupported cpp-utgen filter manifest version {version}: "
+                f"{legacy_path}"
+            )
+        manifest_test_type = str(legacy.get("test_type", ""))
+        resolved_test_type = test_type or manifest_test_type
+        project_root = self.project_root or legacy_path.resolve().parent.parent
+
+        def relative_path(record: Mapping[str, Any]) -> Path | None:
+            raw = str(record.get("relative_path", "")).strip().replace("\\", "/")
+            if not raw:
+                return None
+            candidate = Path(raw)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                return None
+            return candidate
+
+        def original_path(record: Mapping[str, Any], relative: Path | None) -> Path:
+            if version == 2 and relative is not None:
+                return (legacy_path.parent / relative).resolve(strict=False)
+            raw = Path(str(record.get("test_path", "")))
+            if raw.is_absolute():
+                return raw.expanduser().resolve(strict=False)
+            if relative is not None:
+                return (legacy_path.parent / relative).resolve(strict=False)
+            test_root = Path(str(legacy.get("test_root", legacy_path.parent)))
+            if not test_root.is_absolute():
+                project_relative_root = (project_root / test_root).resolve(strict=False)
+                test_root = (
+                    project_relative_root
+                    if project_relative_root.is_dir()
+                    else legacy_path.parent
+                )
+            return (test_root / raw).resolve(strict=False)
+
         imported = 0
+        imported_case_ids: set[str] = set()
         for legacy_record in tests:
             if not isinstance(legacy_record, dict) or not legacy_record.get("test_path"):
                 continue
-            test_path = Path(str(legacy_record["test_path"]))
-            if not test_path.is_absolute():
-                test_root = Path(str(legacy.get("test_root", legacy_path.parent)))
-                if not test_root.is_absolute():
-                    test_root = legacy_path.parent / test_root
-                test_path = test_root / test_path
+            relative = relative_path(legacy_record)
+            source_test_path = original_path(legacy_record, relative)
+            filtered_test_path = (
+                project_root / f"filtered_tests{resolved_test_type}" / relative
+                if relative is not None
+                else None
+            )
+            test_path = (
+                filtered_test_path
+                if version == 2 and filtered_test_path is not None
+                else source_test_path
+            )
             function = str(legacy_record.get("function", ""))
             metadata = {
                 key: deepcopy(legacy_record[key])
@@ -395,16 +509,55 @@ class CaseManifest:
                     "function_dir_rel",
                     "relative_path",
                     "decl_in_header",
+                    "decl_file",
+                    "function_body",
+                    "expected_test_signature",
+                    "requirement",
+                    "format_valid",
+                    "format_errors",
+                    "include_hash",
                     "loc",
                 )
                 if key in legacy_record
             }
+            metadata.update(
+                {
+                    "filter_manifest_version": version,
+                    "filter_manifest_content_hash": str(
+                        legacy_record.get("content_hash", "")
+                    ),
+                    "source_test_path": str(source_test_path),
+                    "exported_test_path": str(test_path),
+                }
+            )
+            existing_case = next(
+                (
+                    case
+                    for case in self.cases()
+                    if relative is not None
+                    and case.get("function") == function
+                    and case.get("test_type") == resolved_test_type
+                    and case.get("metadata", {}).get("relative_path")
+                    == relative.as_posix()
+                ),
+                None,
+            )
+            if existing_case is None:
+                fallback_id = stable_case_id(
+                    test_path,
+                    project_root=self.project_root,
+                    function=function,
+                    test_type=resolved_test_type,
+                )
+                existing_case = self.get(fallback_id)
             record = self.register_case(
                 test_path,
+                case_id=(existing_case or {}).get("case_id"),
                 function=function,
-                test_type=test_type or str(legacy.get("test_type", "")),
+                test_type=resolved_test_type,
                 metadata=metadata,
             )
+            imported_case_ids.add(record["case_id"])
             legacy_fingerprint = hashlib.sha256(
                 json.dumps(
                     legacy_record,
@@ -413,23 +566,135 @@ class CaseManifest:
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
+            compile_status = str(legacy_record.get("compile", "not_run"))
+            run_status = str(legacy_record.get("run", "not_run"))
+            declared_hash = str(legacy_record.get("content_hash", "")).strip()
+            declared_include_hash = str(
+                legacy_record.get("include_hash", "")
+            ).strip()
+            current_hash = file_sha256(test_path) if test_path.is_file() else ""
+            source_current_hash = (
+                file_sha256(source_test_path) if source_test_path.is_file() else ""
+            )
+            include_exists = (test_path.parent / "include.h").is_file()
+            source_include_exists = (source_test_path.parent / "include.h").is_file()
+            format_errors: list[str] = []
+            path_errors: list[str] = []
+            include_errors: list[str] = []
+            include_content_matches = False
+            exported_include_hash = ""
+            source_include_hash = ""
+            if version == 2 and test_path.is_file():
+                try:
+                    format_errors = validate_c_test_format(
+                        test_path.read_text(encoding="utf-8", errors="replace"),
+                        filename=test_path.name,
+                        test_type=resolved_test_type,
+                        focal_function=function,
+                        expected_test_signature=legacy_record.get(
+                            "expected_test_signature"
+                        ),
+                    )
+                except Exception as error:
+                    format_errors = [
+                        f"format validation failed closed: {type(error).__name__}: {error}"
+                    ]
+                try:
+                    path_errors = validate_c_test_path(
+                        source_test_path,
+                        project=project_root,
+                        test_type=resolved_test_type,
+                        source_name=str(legacy_record.get("source_file", "")),
+                        function_signature=function,
+                    )
+                except Exception as error:
+                    path_errors = [
+                        f"path validation failed closed: {type(error).__name__}: {error}"
+                    ]
+            if version == 2 and include_exists and source_include_exists:
+                exported_include = test_path.parent / "include.h"
+                source_include = source_test_path.parent / "include.h"
+                try:
+                    exported_include_bytes = exported_include.read_bytes()
+                    source_include_bytes = source_include.read_bytes()
+                    exported_include_hash = hashlib.sha256(
+                        exported_include_bytes
+                    ).hexdigest()
+                    source_include_hash = hashlib.sha256(source_include_bytes).hexdigest()
+                    include_content_matches = (
+                        exported_include_bytes == source_include_bytes
+                    )
+                    include_errors.extend(
+                        validate_include_header_format(
+                            exported_include_bytes.decode("utf-8", errors="replace")
+                        )
+                    )
+                    include_errors.extend(
+                        validate_include_header_format(
+                            source_include_bytes.decode("utf-8", errors="replace")
+                        )
+                    )
+                except Exception as error:
+                    include_errors = [
+                        f"include validation failed closed: {type(error).__name__}: {error}"
+                    ]
+            common_valid = (
+                legacy_record.get("kept") is True
+                and compile_status == "pass"
+                and run_status == "pass"
+                and bool(declared_hash)
+                and current_hash == declared_hash
+                and include_exists
+            )
+            if version == 2:
+                trusted = (
+                    common_valid
+                    and legacy_record.get("workflow_status") == "passed"
+                    and legacy_record.get("exported") is True
+                    and relative is not None
+                    and filtered_test_path is not None
+                    and filtered_test_path.is_file()
+                    and source_current_hash == declared_hash
+                    and source_include_exists
+                    and include_content_matches
+                    and bool(declared_include_hash)
+                    and exported_include_hash == declared_include_hash
+                    and source_include_hash == declared_include_hash
+                    and not format_errors
+                    and not path_errors
+                    and not include_errors
+                )
+            else:
+                trusted = common_valid
+
+            previous_hash = str(record.get("content_sha256", ""))
+            previous_path = str((existing_case or {}).get("test_path", ""))
+            previous_c_input = str(
+                (existing_case or {}).get("c_input_sha256", "")
+            )
+            current_c_input = c_input_sha256(record)
             if (
-                record.get("c_status") in C_TERMINAL_STATUSES
-                and not record.get("legacy_record_sha256")
+                trusted
+                and record.get("legacy_record_sha256") == legacy_fingerprint
+                and record.get("c_status") == "kept"
+                and previous_hash == current_hash
+                and (not previous_path or previous_path == str(test_path))
+                and previous_c_input == current_c_input
             ):
                 imported += 1
                 continue
-            if record.get("legacy_record_sha256") == legacy_fingerprint:
-                imported += 1
-                continue
-            if record.get("c_status") in C_TERMINAL_STATUSES:
-                self.reset_case(record["case_id"])
-            compile_status = str(legacy_record.get("compile", "not_run"))
-            run_status = str(legacy_record.get("run", "not_run"))
-            kept = bool(legacy_record.get("kept")) or (
-                compile_status == "pass" and run_status == "pass"
+            c_input_changed = bool(
+                record.get("rust_status") != "pending"
+                and (
+                    previous_c_input != current_c_input
+                    or previous_hash != current_hash
+                    or (previous_path and previous_path != str(test_path))
+                )
             )
-            if kept:
+            if not trusted or c_input_changed:
+                self._reset_rust_state(self._get_mutable(record["case_id"]))
+
+            if trusted:
                 self.transition(
                     record["case_id"],
                     "c_kept",
@@ -443,6 +708,45 @@ class CaseManifest:
                     legacy_record_sha256=legacy_fingerprint,
                 )
             else:
+                if legacy_record.get("kept") is not True:
+                    failure_type = "manifest_not_kept"
+                elif version == 2 and legacy_record.get("workflow_status") != "passed":
+                    failure_type = "manifest_workflow_not_passed"
+                elif version == 2 and legacy_record.get("exported") is not True:
+                    failure_type = "manifest_not_exported"
+                elif compile_status != "pass" or run_status != "pass":
+                    failure_type = "manifest_verification_incomplete"
+                elif not declared_hash:
+                    failure_type = "manifest_content_hash_missing"
+                elif version == 2 and not source_test_path.is_file():
+                    failure_type = "source_test_missing"
+                elif version == 2 and source_current_hash != declared_hash:
+                    failure_type = "source_content_hash_mismatch"
+                elif version == 2 and not source_include_exists:
+                    failure_type = "missing_source_include"
+                elif not test_path.is_file():
+                    failure_type = "exported_test_missing"
+                elif current_hash != declared_hash:
+                    failure_type = "manifest_content_hash_mismatch"
+                elif not include_exists:
+                    failure_type = "missing_include"
+                elif not include_content_matches:
+                    failure_type = "include_content_mismatch"
+                elif include_errors:
+                    failure_type = "include_format_invalid"
+                elif path_errors:
+                    failure_type = "c_test_path_invalid"
+                elif format_errors:
+                    failure_type = "c_test_format_invalid"
+                elif version == 2 and not declared_include_hash:
+                    failure_type = "manifest_include_hash_missing"
+                elif version == 2 and (
+                    exported_include_hash != declared_include_hash
+                    or source_include_hash != declared_include_hash
+                ):
+                    failure_type = "manifest_include_hash_mismatch"
+                else:
+                    failure_type = "untrusted_filter_manifest_record"
                 self.transition(
                     record["case_id"],
                     "c_filtered",
@@ -450,12 +754,51 @@ class CaseManifest:
                     compile=compile_status,
                     run=run_status,
                     kept=False,
-                    failure_type=str(legacy_record.get("failure_type", "legacy_filtered")),
-                    failure_reason="Imported as filtered from legacy cpp-utgen manifest",
+                    failure_type=failure_type,
+                    failure_reason=(
+                        "; ".join(path_errors + include_errors + format_errors)
+                        if path_errors or include_errors or format_errors
+                        else "cpp-utgen filter manifest record did not satisfy "
+                        "the verified C-test import contract"
+                    ),
                     legacy_manifest=str(legacy_path.resolve()),
                     legacy_record_sha256=legacy_fingerprint,
                 )
             imported += 1
+        if version == 2:
+            generated_root = (project_root / f"llm_tests{resolved_test_type}").resolve(
+                strict=False
+            )
+            exported_root = (
+                project_root / f"filtered_tests{resolved_test_type}"
+            ).resolve(strict=False)
+            for existing in self.cases():
+                if (
+                    existing["case_id"] in imported_case_ids
+                    or existing.get("test_type") != resolved_test_type
+                ):
+                    continue
+                existing_path = Path(existing.get("test_path", "")).resolve(
+                    strict=False
+                )
+                if not (
+                    existing_path.is_relative_to(generated_root)
+                    or existing_path.is_relative_to(exported_root)
+                ):
+                    continue
+                self.transition(
+                    existing["case_id"],
+                    "c_filtered",
+                    c_status="filtered",
+                    compile="not_run",
+                    run="not_run",
+                    kept=False,
+                    failure_type="stale_filter_manifest_record",
+                    failure_reason=(
+                        "The C test is absent from the current version 2 filter manifest"
+                    ),
+                    legacy_manifest=str(legacy_path.resolve()),
+                )
         return imported
 
     def reset_case(self, case_id: str) -> dict[str, Any]:
@@ -474,36 +817,40 @@ class CaseManifest:
                 "updated_at": _timestamp(),
             }
         )
-        self._ensure_rust_fields(record)
-        record.update(
-            {
-                "rust_status": "pending",
-                "rust_translation": "not_run",
-                "rust_compile": "not_run",
-                "rust_run": "not_run",
-                "rust_kept": False,
-                "rust_test_path": "",
-                "rust_content_sha256": "",
-                "rust_target_path": "",
-                "rust_target_sha256": "",
-                "rust_failure_type": "",
-                "rust_failure_reason": "",
-            }
-        )
+        self._reset_rust_state(record)
         path = Path(record["test_path"])
         record["content_sha256"] = file_sha256(path) if path.is_file() else ""
+        record["c_input_sha256"] = c_input_sha256(record)
         self.save()
         return deepcopy(record)
 
     def transition(self, case_id: str, state: str, **updates: Any) -> dict[str, Any]:
         record = self._get_mutable(case_id)
+        previous_c_hash = str(record.get("content_sha256", ""))
+        previous_c_input = str(record.get("c_input_sha256", ""))
+        had_rust_progress = bool(
+            record.get("rust_status", "pending") != "pending"
+            or record.get("rust_translation", "not_run") != "not_run"
+            or record.get("rust_compile", "not_run") != "not_run"
+            or record.get("rust_run", "not_run") != "not_run"
+            or record.get("rust_test_path")
+        )
         record["state"] = state
         for key, value in updates.items():
             record[key] = deepcopy(value)
         record["updated_at"] = _timestamp()
-        if record.get("c_status") in C_TERMINAL_STATUSES:
+        if "c_status" in updates and record.get("c_status") in C_TERMINAL_STATUSES:
             path = Path(record["test_path"])
-            record["content_sha256"] = file_sha256(path) if path.is_file() else ""
+            current_c_hash = file_sha256(path) if path.is_file() else ""
+            current_c_input = c_input_sha256(record)
+            if (
+                record.get("c_status") != "kept"
+                or (previous_c_hash and previous_c_hash != current_c_hash)
+                or (had_rust_progress and previous_c_input != current_c_input)
+            ):
+                self._reset_rust_state(record)
+            record["content_sha256"] = current_c_hash
+            record["c_input_sha256"] = current_c_input
         if record.get("rust_translation") == "pass" or record.get(
             "rust_status"
         ) in RUST_TERMINAL_STATUSES:
@@ -544,7 +891,10 @@ class CaseManifest:
         if stage == "rust":
             return record.get("rust_status") in RUST_TERMINAL_STATUSES
         if stage == "translate":
-            return record.get("rust_translation") == "pass"
+            return (
+                record.get("rust_translation") == "pass"
+                and record.get("rust_compile") == "pass"
+            )
         raise ValueError(f"Unsupported terminal-stage check: {stage}")
 
     def should_process(
@@ -554,6 +904,8 @@ class CaseManifest:
         resume: bool = True,
         stage: str = "c",
     ) -> bool:
+        if stage in {"rust", "translate"} and self.invalidate_changed_c(case_id):
+            return True
         if not resume or not self.is_terminal(case_id, stage=stage):
             return True
         record = self._get_mutable(case_id)
@@ -561,7 +913,7 @@ class CaseManifest:
             path = Path(record["test_path"])
             expected_hash = record.get("content_sha256", "")
             current_hash = file_sha256(path) if path.is_file() else ""
-            return current_hash != expected_hash
+            return not expected_hash or current_hash != expected_hash
 
         if stage in {"rust", "translate"}:
             path = Path(record.get("rust_test_path", ""))
@@ -578,6 +930,47 @@ class CaseManifest:
             )
 
         raise ValueError(f"Unsupported processing stage: {stage}")
+
+    def invalidate_changed_c(self, case_id: str) -> bool:
+        """Drop C and Rust trust when a previously kept C test has changed."""
+
+        record = self._get_mutable(case_id)
+        if record.get("c_status") != "kept":
+            return False
+        path = Path(record["test_path"])
+        expected_hash = str(record.get("content_sha256", ""))
+        current_hash = file_sha256(path) if path.is_file() else ""
+        expected_input = str(record.get("c_input_sha256", ""))
+        current_input = c_input_sha256(record)
+        if (
+            expected_hash
+            and current_hash == expected_hash
+            and expected_input
+            and current_input == expected_input
+        ):
+            return False
+        record.update(
+            {
+                "state": "c_content_changed",
+                "c_status": "pending",
+                "compile": "not_run",
+                "run": "not_run",
+                "kept": False,
+                "failure_type": "c_content_changed",
+                "failure_reason": (
+                    "The verified C test, include.h, or translation context "
+                    "no longer matches its C-input fingerprint"
+                ),
+                "content_sha256": current_hash,
+                "c_input_sha256": current_input,
+                "attempts": {"compile": [], "run": []},
+                "logs": [],
+                "updated_at": _timestamp(),
+            }
+        )
+        self._reset_rust_state(record)
+        self.save()
+        return True
 
     def save(self) -> None:
         self._data["schema_version"] = SCHEMA_VERSION

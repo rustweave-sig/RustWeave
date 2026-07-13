@@ -1,11 +1,15 @@
 PROMPT = """You are a software testing programmer. Please complete the unit test function based on the information below.
 Assuming the context is implemented and is already correctly included. Do not add or create the context of the focal function to the answer.
-Remember to output only the code with signatures, along with the necessary include files and namespaces, do not change the signature, do not use markdown:\n
+Output only optional helper code and the TEST function. Do not output any
+#include/#define directive: the generator owns include.h and all production
+headers. Do not change the TEST signature and do not use markdown:\n
 """
 
 NOREQ = """You are a software testing programmer. Please generate unit test functions as many as possible to cover all line and branch based on the information below.
 Assuming the context is implemented and is already correctly included. Do not add or create the context of the focal function to the answer.
-Remember to output only the code with signatures, along with the necessary include files and namespaces, do not change the signature, do not use markdown:\n
+Output only optional helper code and TEST functions. Do not output any
+#include/#define directive: the generator owns include.h and all production
+headers. Do not change TEST signatures and do not use markdown:\n
 """
 
 TEST_INCLUDE = """// test file

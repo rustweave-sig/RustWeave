@@ -9,6 +9,7 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
 from test_translation import (  # noqa: E402
+    CTestFormatContract,
     TestValidationError,
     build_test_translation_prompt,
     clean_rust_test_response,
@@ -16,7 +17,9 @@ from test_translation import (  # noqa: E402
     test_translation as translate_test_case,
     validate_c_oracles_preserved,
     validate_c_string_oracles_preserved,
+    validate_c_test_for_translation,
     validate_rust_test,
+    validate_translation_inputs,
 )
 
 
@@ -28,6 +31,21 @@ fn add_works() {
     assert_eq!(actual, 3, "1 + 2");
 }
 """
+
+VALID_C_TEST = """#include "include.h"
+TEST(Add, Works) {
+    EXPECT_EQ(add(1, 2), 3);
+}
+"""
+
+VALID_C_CONTRACT = CTestFormatContract(
+    test_path="/project/llm_tests/math.c/int_add_int_int_/test_001.cpp",
+    include_source="int add(int, int);\n",
+    project="/project",
+    test_type="none",
+    source_name="math.c",
+    focal_signature="int add(int, int)",
+)
 
 
 class RustTestValidationTests(unittest.TestCase):
@@ -97,6 +115,31 @@ class RustTestValidationTests(unittest.TestCase):
         for name, code in cases.items():
             with self.subTest(name=name):
                 self.assertTrue(validate_rust_test(code, "add"))
+
+    def test_rejects_assertion_unrelated_to_discarded_focal_result(self):
+        unrelated = """#[test]
+fn add_works() {
+    let _ = crate::mod_math::add(1, 2);
+    let unrelated = 3;
+    assert_eq!(unrelated, 3);
+}
+"""
+        self.assertIn(
+            "Rust assertion actual is not data-related to the focal call result or output",
+            validate_rust_test(unrelated, "crate::mod_math::add"),
+        )
+
+    def test_accepts_assertion_on_mutable_output_argument(self):
+        output_test = """#[test]
+fn fill_works() {
+    let mut output = 0;
+    crate::ffi::fill_value(&mut output);
+    assert_eq!(output, 7);
+}
+"""
+        self.assertEqual(
+            validate_rust_test(output_test, "crate::ffi::fill_value"), ()
+        )
 
     def test_rejects_every_test_body_control_transfer(self):
         for keyword in ("return", "break", "continue"):
@@ -370,26 +413,42 @@ class TranslationApiTests(unittest.TestCase):
     def test_injected_llm_is_called_and_candidate_is_validated(self):
         llm = Mock(return_value=f"```rust\n{VALID_TEST}```")
         result = translate_test_case(
-            "TEST(Add, Works) {}",
+            VALID_C_TEST,
             "pub fn add() {}",
             "model-x",
             object(),
             "add",
+            c_test_contract=VALID_C_CONTRACT,
             llm_call=llm,
         )
         self.assertEqual(result, VALID_TEST.strip())
         self.assertEqual(llm.call_count, 1)
         self.assertIn("TEST(Add, Works)", llm.call_args.args[0])
 
-    def test_invalid_llm_candidate_raises(self):
-        llm = Mock(return_value="#[test]\nfn fake() { assert!(true); }")
-        with self.assertRaises(TestValidationError):
+    def test_translation_requires_full_c_artifact_contract(self):
+        llm = Mock(return_value=VALID_TEST)
+        with self.assertRaises(TestValidationError) as raised:
             translate_test_case(
-                "TEST(Add, Works) {}",
+                VALID_C_TEST,
                 "pub fn add() {}",
                 "model-x",
                 object(),
                 "add",
+                llm_call=llm,
+            )
+        self.assertIn("full C test format contract", str(raised.exception))
+        llm.assert_not_called()
+
+    def test_invalid_llm_candidate_raises(self):
+        llm = Mock(return_value="#[test]\nfn fake() { assert!(true); }")
+        with self.assertRaises(TestValidationError):
+            translate_test_case(
+                VALID_C_TEST,
+                "pub fn add() {}",
+                "model-x",
+                object(),
+                "add",
+                c_test_contract=VALID_C_CONTRACT,
                 llm_call=llm,
             )
 
@@ -399,13 +458,255 @@ class TranslationApiTests(unittest.TestCase):
 
         with self.assertRaises(TestValidationError):
             translate_test_case(
-                "TEST(Add, Works) { EXPECT_EQ(add(1, 2), 3); }",
+                VALID_C_TEST,
                 "pub fn add(a: i32, b: i32) -> i32 { a + b }",
                 "model-x",
                 object(),
                 "add",
+                c_test_contract=VALID_C_CONTRACT,
                 llm_call=llm,
             )
+
+    def test_c_input_contract_is_checked_before_llm(self):
+        invalid_cases = {
+            "missing include": "TEST(Add, Works) { EXPECT_EQ(add(1, 2), 3); }",
+            "multiple tests": VALID_C_TEST
+            + "TEST(Add, Twice) { EXPECT_EQ(add(2, 2), 4); }\n",
+            "invalid name": '#include "include.h"\nTEST(Add-Test, Works) { EXPECT_EQ(add(1, 2), 3); }',
+            "missing focal": '#include "include.h"\nTEST(Add, Works) { EXPECT_EQ(1, 2); }',
+            "missing oracle": '#include "include.h"\nTEST(Add, Works) { (void)add(1, 2); }',
+        }
+        for name, c_test in invalid_cases.items():
+            with self.subTest(name=name):
+                llm = Mock(return_value=VALID_TEST)
+                with self.assertRaises(TestValidationError):
+                    translate_test_case(
+                        c_test,
+                        "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+                        "model-x",
+                        object(),
+                        "crate::mod_math::add",
+                        c_test_contract=VALID_C_CONTRACT,
+                        llm_call=llm,
+                    )
+                llm.assert_not_called()
+
+    def test_unsupported_c_oracles_are_explicitly_filtered_before_llm(self):
+        oracle_bodies = {
+            "throw": "EXPECT_THROW(add(1, 2), std::runtime_error);",
+            "no throw": "EXPECT_NO_THROW(add(1, 2));",
+            "mock": "EXPECT_CALL(reader, Read()); (void)add(1, 2);",
+            "comparison": "EXPECT_LT(add(1, 2), 4);",
+        }
+        for name, body in oracle_bodies.items():
+            with self.subTest(name=name):
+                c_test = f'#include "include.h"\nTEST(Add, Works) {{ {body} }}\n'
+                llm = Mock(return_value=VALID_TEST)
+                with self.assertRaises(TestValidationError) as raised:
+                    translate_test_case(
+                        c_test,
+                        "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+                        "model-x",
+                        object(),
+                        "crate::mod_math::add",
+                        c_test_contract=VALID_C_CONTRACT,
+                        llm_call=llm,
+                    )
+                if name in {"no throw", "mock"}:
+                    self.assertIn("observably related", str(raised.exception))
+                else:
+                    self.assertIn("unsupported_c_oracle", str(raised.exception))
+                llm.assert_not_called()
+
+    def test_c_required_behavior_must_be_eagerly_executed(self):
+        cases = {
+            "if block": "if (false) { EXPECT_EQ(add(1, 2), 3); }",
+            "if statement": "if (false) EXPECT_EQ(add(1, 2), 3);",
+            "switch": (
+                "switch (0) { case 1: EXPECT_EQ(add(1, 2), 3); break; "
+                "default: break; }"
+            ),
+            "while": "while (false) { EXPECT_EQ(add(1, 2), 3); }",
+            "for": "for (int i = 0; i < 0; ++i) EXPECT_EQ(add(1, 2), 3);",
+            "do loop": "do { EXPECT_EQ(add(1, 2), 3); } while (false);",
+            "uncalled lambda": (
+                "auto deferred = []() { EXPECT_EQ(add(1, 2), 3); }; "
+                "(void)deferred;"
+            ),
+            "short circuit": "false && (add(1, 2) == 3); EXPECT_NE(1, 2);",
+            "ternary": "false ? add(1, 2) : 3; EXPECT_NE(1, 2);",
+            "unevaluated": "EXPECT_EQ(sizeof(add(1, 2)), sizeof(int));",
+            "requires expression": "requires { add(1, 2); }; EXPECT_NE(1, 2);",
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                c_test = f'#include "include.h"\nTEST(Add, Works) {{ {body} }}\n'
+                errors = validate_c_test_for_translation(c_test, "add")
+                self.assertTrue(
+                    any(
+                        "conditional, loop, deferred, or unevaluated" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_conditional_behavior_is_rejected_before_llm(self):
+        c_test = (
+            '#include "include.h"\nTEST(Add, Works) { '
+            "int actual = add(1, 2); if (false) { EXPECT_EQ(actual, 3); } }\n"
+        )
+        llm = Mock(return_value=VALID_TEST)
+        with self.assertRaises(TestValidationError) as raised:
+            translate_test_case(
+                c_test,
+                "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+                "model-x",
+                object(),
+                "crate::mod_math::add",
+                c_test_contract=VALID_C_CONTRACT,
+                llm_call=llm,
+            )
+        self.assertIn("test oracles must execute eagerly", str(raised.exception))
+        llm.assert_not_called()
+
+    def test_local_callable_cannot_shadow_focal_function(self):
+        bodies = {
+            "function object": (
+                "std::function<int(int, int)> add = std::plus<int>(); "
+                "EXPECT_EQ(add(1, 2), 3);"
+            ),
+            "function pointer": (
+                "int (*add)(int, int) = fake_add; EXPECT_EQ(add(1, 2), 3);"
+            ),
+            "callable object": "Adder add; EXPECT_EQ(add(1, 2), 3);",
+        }
+        for name, body in bodies.items():
+            with self.subTest(name=name):
+                c_test = f'#include "include.h"\nTEST(Add, Works) {{ {body} }}\n'
+                self.assertIn(
+                    "local declaration shadows focal function 'add'",
+                    validate_c_test_for_translation(c_test, "add"),
+                )
+
+    def test_c_free_focal_does_not_accept_same_named_member_or_scope(self):
+        invalid_bodies = (
+            "OtherCalculator other; EXPECT_EQ(other.add(1, 2), 3);",
+            "OtherCalculator *other = nullptr; EXPECT_EQ(other->add(1, 2), 3);",
+            "EXPECT_EQ(fake::add(1, 2), 3);",
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                c_test = f'#include "include.h"\nTEST(Add, Works) {{ {body} }}\n'
+                self.assertIn(
+                    "C TEST body must call the focal function 'add'",
+                    validate_c_test_for_translation(c_test, "add"),
+                )
+
+        global_call = VALID_C_TEST.replace("add(1, 2)", "::add(1, 2)")
+        self.assertEqual(validate_c_test_for_translation(VALID_C_TEST, "add"), ())
+        self.assertEqual(validate_c_test_for_translation(global_call, "add"), ())
+
+    def test_c_oracle_rejects_comma_operator_but_not_call_arguments(self):
+        invalid_bodies = (
+            "EXPECT_EQ((add(1, 2), 3), 3);",
+            "EXPECT_TRUE((add(1, 2), true));",
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                c_test = f'#include "include.h"\nTEST(Add, Works) {{ {body} }}\n'
+                self.assertIn(
+                    "comma operator is forbidden in C oracle expressions",
+                    validate_c_test_for_translation(c_test, "add"),
+                )
+
+        nested_call = (
+            '#include "include.h"\n'
+            "TEST(Add, Works) { EXPECT_EQ(combine(add(1, 2), 0), 3); }\n"
+        )
+        self.assertEqual(validate_c_test_for_translation(nested_call, "add"), ())
+
+        templated_value = (
+            '#include "include.h"\n'
+            "TEST(Add, Works) { "
+            "EXPECT_EQ((std::pair<int, int>{add(1, 2), 0}), expected); "
+            "}\n"
+        )
+        self.assertFalse(
+            any(
+                "comma operator" in error
+                for error in validate_c_test_for_translation(
+                    templated_value, "add"
+                )
+            )
+        )
+
+    def test_no_enforceable_c_oracle_never_fails_open(self):
+        no_oracle = '#include "include.h"\nTEST(Add, Works) { (void)add(1, 2); }\n'
+        self.assertTrue(validate_c_oracles_preserved(no_oracle, VALID_TEST))
+
+    def test_clamp_expected_local_is_resolved_and_must_remain_expected(self):
+        c_test = """#include "include.h"
+TEST(ClampValueTest, int_clamp_value_int_int_int_001) {
+    const int value = -2;
+    const int low = 0;
+    const int high = 10;
+    const int actual = clamp_value(value, low, high);
+    EXPECT_EQ(actual, low);
+}
+"""
+        rust_test = """#[test]
+fn clamp_low() {
+    let value = -2;
+    let low = 0;
+    let high = 10;
+    let actual = crate::math::clamp_value(value, low, high);
+    assert_eq!(actual, low);
+}
+"""
+        self.assertEqual(
+            validate_c_test_for_translation(c_test, "crate::math::clamp_value"),
+            (),
+        )
+        self.assertEqual(
+            validate_translation_inputs(
+                c_test, rust_test, "crate::math::clamp_value"
+            ),
+            (),
+        )
+        self.assertEqual(
+            validate_c_oracles_preserved(
+                c_test, rust_test, "crate::math::clamp_value"
+            ),
+            (),
+        )
+
+        literal_substitution = rust_test.replace("actual, low", "actual, 0")
+        changed_low = rust_test.replace("let low = 0", "let low = 1")
+        self.assertTrue(
+            validate_c_oracles_preserved(
+                c_test, literal_substitution, "crate::math::clamp_value"
+            )
+        )
+        self.assertTrue(
+            validate_translation_inputs(
+                c_test, changed_low, "crate::math::clamp_value"
+            )
+        )
+
+    def test_translation_rejects_changed_focal_argument(self):
+        changed_input = VALID_TEST.replace("add(1, 2)", "add(1, 9)")
+        llm = Mock(return_value=changed_input)
+        with self.assertRaises(TestValidationError) as raised:
+            translate_test_case(
+                VALID_C_TEST,
+                "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+                "model-x",
+                object(),
+                "crate::mod_math::add",
+                c_test_contract=VALID_C_CONTRACT,
+                llm_call=llm,
+            )
+        self.assertIn("changed a verifiable C input", str(raised.exception))
 
 
 if __name__ == "__main__":

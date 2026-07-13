@@ -68,6 +68,55 @@ class IncludeRecoveryTests(unittest.TestCase):
             self.assertIn('#include "sample.h"', include_content)
             self.assertEqual(generated, [str(function_dir / "test_001.cpp")])
 
+    def test_headerless_c_function_uses_declaration_not_source_include(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_cxt" / "sample.c"
+            function = Function(
+                "add",
+                "int add(int, int)",
+                "",
+                False,
+                "sample.c",
+                None,
+                (1, 3),
+                "",
+            )
+            function._Function__body = "int add(int left, int right) { return left + right; }"
+            function._Function__include_set = {"stddef.h", "dependency.c"}
+
+            function.gen_include_file(str(parent))
+
+            include_path = parent / format_sig(function.get_sig()) / "include.h"
+            content = include_path.read_text(encoding="utf-8")
+            self.assertIn('extern "C" { int add(int left, int right); }', content)
+            self.assertIn("#include <stddef.h>", content)
+            self.assertNotIn('#include "sample.c"', content)
+            self.assertNotIn("dependency.c", content)
+
+    def test_headerless_cpp_or_static_c_function_fails_closed(self) -> None:
+        variants = (
+            ("sample.cpp", "int add(int left, int right) { return left + right; }"),
+            ("sample.c", "static int add(int left, int right) { return left + right; }"),
+        )
+        for decl_file, body in variants:
+            with self.subTest(decl_file=decl_file), tempfile.TemporaryDirectory() as tmp:
+                parent = Path(tmp) / "llm_tests_cxt" / Path(decl_file).name
+                function = Function(
+                    "add",
+                    "int add(int, int)",
+                    "",
+                    False,
+                    decl_file,
+                    None,
+                    (1, 3),
+                    "",
+                )
+                function._Function__body = body
+                function._Function__include_set = set()
+
+                with self.assertRaisesRegex(ValueError, "Cannot safely declare"):
+                    function.gen_include_file(str(parent))
+
     def test_cached_include_recovery_failure_does_not_abort_generation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             parent = Path(tmp) / "llm_tests_cxt" / "sample.c"

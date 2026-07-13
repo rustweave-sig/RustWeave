@@ -261,7 +261,7 @@ def write_cmake_file(
         return False
     path = Path(test_dir)
     rela_path = ""
-    if not is_header(source_file.get_path()) and is_header(func._Function__decl_file):
+    if not is_header(source_file.get_path()):
         rela_path = os.path.relpath(source_file.get_path(), test_dir)
     if not test_file_list or len(test_file_list) == 0:
         with open(f"{test_dir}/.notest", "w"):

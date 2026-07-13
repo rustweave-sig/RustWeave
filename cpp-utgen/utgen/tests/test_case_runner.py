@@ -1,4 +1,6 @@
 import subprocess
+import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -15,8 +17,20 @@ from case_runner import (  # noqa: E402
     classify_build_failure,
     count_executed_tests,
 )
-from compile_repair import repair_record_once  # noqa: E402
-from rust_assistant import compilation_fix_assistant_for_an_error  # noqa: E402
+from compile_repair import (  # noqa: E402
+    candidate_guard,
+    get_refined_marker,
+    repair_record_once,
+    repair_with_legacy_scan,
+    verified_by_existing_marker,
+)
+from rust_assistant import (  # noqa: E402
+    compilation_fix_assistant_for_an_error,
+    compilation_fix_assistant_for_source_file,
+    compilation_fix_assistant_for_test_file,
+    refined_marker_is_valid,
+    write_refined_marker,
+)
 from test_repair import repair_record  # noqa: E402
 
 
@@ -25,7 +39,7 @@ def make_record(project: Path) -> dict:
     function_dir.mkdir(parents=True)
     test_path = function_dir / "test_001.cpp"
     test_path.write_text(
-        '#include "include.h"\nTEST(Target, Works) { EXPECT_EQ(1, 2); }\n',
+        '#include "include.h"\nTEST(Target, Works) { EXPECT_EQ(target(), 1); }\n',
         encoding="utf-8",
     )
     (function_dir / "include.h").write_text(
@@ -68,6 +82,23 @@ class SingleTestSessionTests(unittest.TestCase):
                 '<testsuite name="Suite" tests="2" disabled="1">'
                 '<testcase name="Runs" status="run" result="completed"/>'
                 '<testcase name="DISABLED_Test" status="notrun" result="suppressed"/>'
+                "</testsuite></testsuites>"
+            )
+
+            self.assertEqual(count_executed_tests(str(xml_path)), 1)
+
+    def test_enabled_environment_cannot_make_disabled_xml_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            xml_path = Path(tmp) / "result.xml"
+            xml_path.write_text(
+                '<testsuites tests="3">'
+                '<testsuite name="Suite" tests="3">'
+                '<testcase name="DISABLED_ByName" classname="Suite" '
+                'status="run" result="completed"/>'
+                '<testcase name="Runs" classname="DISABLED_Suite" '
+                'status="run" result="completed"/>'
+                '<testcase name="Runs" classname="Suite" '
+                'status="run" result="completed"/>'
                 "</testsuite></testsuites>"
             )
 
@@ -219,15 +250,20 @@ class SingleTestSessionTests(unittest.TestCase):
                 )
 
             self.assertTrue(result.passed)
-            assistant.assert_called_once_with(
-                record["test_path"],
-                compile_cmd,
-                record["function_dir"],
-                "build",
-                choices=3,
-                max_errors=1,
-                max_iterations=1,
+            assistant.assert_called_once()
+            self.assertEqual(
+                assistant.call_args.args,
+                (
+                    record["test_path"],
+                    compile_cmd,
+                    record["function_dir"],
+                    "build",
+                ),
             )
+            self.assertEqual(assistant.call_args.kwargs["choices"], 3)
+            self.assertEqual(assistant.call_args.kwargs["max_errors"], 1)
+            self.assertEqual(assistant.call_args.kwargs["max_iterations"], 1)
+            self.assertTrue(callable(assistant.call_args.kwargs["candidate_validator"]))
 
     def test_object_compile_pass_is_classified_as_link_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -308,6 +344,304 @@ class SingleTestSessionTests(unittest.TestCase):
 
         llm.assert_called_once()
 
+    def test_compile_error_rejects_candidate_before_applying_when_guard_fails(self) -> None:
+        error = MagicMock()
+        error.compile_error_message_construct.return_value = ["compile error"]
+        validator = MagicMock(return_value=(False, "format violation"))
+        with (
+            patch("rust_assistant.get_fixes_from_LLM", return_value=["candidate"]),
+            patch("rust_assistant.llm_return_content_parser", return_value=[]),
+            patch(
+                "rust_assistant.changelog_validate", return_value="replacement source"
+            ),
+            patch("rust_assistant.apply_file_into_disk_and_compile") as apply_candidate,
+        ):
+            compilation_fix_assistant_for_an_error(
+                error,
+                ["int value;"],
+                set(),
+                "test.cpp",
+                (["compile"], "c++ test.cpp"),
+                "build",
+                choices=1,
+                max_iterations=1,
+                candidate_validator=validator,
+            )
+
+        validator.assert_called_once_with("replacement source")
+        apply_candidate.assert_not_called()
+
+    def test_refined_marker_is_bound_to_content_and_format_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            test_path = Path(tmp) / "test_001.cpp"
+            marker = Path(tmp) / ".test_001.cpp.refined"
+            include_path = Path(tmp) / "include.h"
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n",
+                encoding="utf-8",
+            )
+            include_path.write_text('#include "gtest/gtest.h"\n', encoding="utf-8")
+            validator = MagicMock(return_value=(True, ""))
+
+            self.assertTrue(
+                write_refined_marker(marker, test_path, include_path, validator)
+            )
+            self.assertTrue(
+                refined_marker_is_valid(marker, test_path, include_path, validator)
+            )
+
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            test_path.write_text(
+                '#include "include.h"\n\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n",
+                encoding="utf-8",
+            )
+            marker_data["content_sha256"] = "0" * 64
+            marker.write_text(json.dumps(marker_data), encoding="utf-8")
+            self.assertFalse(
+                refined_marker_is_valid(marker, test_path, include_path, validator)
+            )
+
+    def test_legacy_boolean_refined_marker_is_never_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            function_dir = Path(tmp)
+            test_path = function_dir / "test_001.cpp"
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n",
+                encoding="utf-8",
+            )
+            marker = get_refined_marker(str(test_path), str(function_dir))
+            marker.write_text("1", encoding="utf-8")
+            (function_dir / "include.h").write_text(
+                '#include "gtest/gtest.h"\n', encoding="utf-8"
+            )
+            validator = MagicMock(return_value=(True, ""))
+
+            with patch("compile_repair.compile_target_passes") as compile_check:
+                trusted = verified_by_existing_marker(
+                    str(test_path),
+                    str(function_dir),
+                    (["compile"], "c++ test.cpp"),
+                    validator,
+                )
+
+            self.assertFalse(trusted)
+            self.assertFalse(marker.exists())
+            compile_check.assert_not_called()
+
+    def test_refined_marker_rejects_moved_test_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            original_dir = project / "llm_tests" / "sample.c" / "target_void_"
+            original_dir.mkdir(parents=True)
+            test_path = original_dir / "test_001.cpp"
+            include_path = original_dir / "include.h"
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n",
+                encoding="utf-8",
+            )
+            include_path.write_text('#include "gtest/gtest.h"\n', encoding="utf-8")
+            marker = original_dir / ".test_001.cpp.refined"
+            validator = candidate_guard(
+                str(test_path),
+                "target(void)",
+                "",
+                project_path=str(project),
+                source_name="sample.c",
+            )
+            self.assertTrue(
+                write_refined_marker(marker, test_path, include_path, validator)
+            )
+
+            wrong_dir = project / "llm_tests" / "wrong.c" / "wrong_function"
+            wrong_dir.mkdir(parents=True)
+            moved_test = wrong_dir / test_path.name
+            moved_include = wrong_dir / include_path.name
+            shutil.copy(test_path, moved_test)
+            shutil.copy(include_path, moved_include)
+            moved_validator = candidate_guard(
+                str(moved_test),
+                "target(void)",
+                "",
+                project_path=str(project),
+                source_name="sample.c",
+            )
+            valid, reason = moved_validator(moved_test.read_text(encoding="utf-8"))
+
+            self.assertFalse(valid)
+            self.assertIn("expected source/function directory", reason)
+            self.assertFalse(
+                refined_marker_is_valid(
+                    marker, moved_test, moved_include, moved_validator
+                )
+            )
+
+    def test_refined_marker_rejects_changed_invalid_include(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            function_dir = project / "llm_tests" / "sample.c" / "target_void_"
+            function_dir.mkdir(parents=True)
+            test_path = function_dir / "test_001.cpp"
+            include_path = function_dir / "include.h"
+            marker = function_dir / ".test_001.cpp.refined"
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n",
+                encoding="utf-8",
+            )
+            include_path.write_text('#include "gtest/gtest.h"\n', encoding="utf-8")
+            validator = candidate_guard(
+                str(test_path),
+                "target(void)",
+                "",
+                project_path=str(project),
+                source_name="sample.c",
+            )
+            self.assertTrue(
+                write_refined_marker(marker, test_path, include_path, validator)
+            )
+
+            include_path.write_text('#include "sample.cpp"\n', encoding="utf-8")
+            valid, reason = validator(test_path.read_text(encoding="utf-8"))
+
+            self.assertFalse(valid)
+            self.assertIn("must not include production source files", reason)
+            self.assertFalse(
+                refined_marker_is_valid(
+                    marker, test_path, include_path, validator
+                )
+            )
+
+    def test_compiled_test_without_section_85_guard_is_not_marked_refined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            function_dir = Path(tmp)
+            test_path = function_dir / "test_001.cpp"
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_TRUE(true); }\n",
+                encoding="utf-8",
+            )
+            successful_compile = subprocess.CompletedProcess(["compile"], 0, "", "")
+
+            with patch(
+                "rust_assistant.run_command", return_value=successful_compile
+            ) as compile_test:
+                success = compilation_fix_assistant_for_test_file(
+                    str(test_path),
+                    (["compile"], "c++ test.cpp"),
+                    str(function_dir),
+                    str(function_dir),
+                    candidate_validator=None,
+                )
+
+            self.assertFalse(success)
+            compile_test.assert_not_called()
+            self.assertFalse(
+                (function_dir / ".test_001.cpp.refined").exists()
+            )
+
+    def test_compiled_test_with_rejecting_guard_is_not_marked_refined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            function_dir = (
+                project / "llm_tests" / "sample.c" / "target_void_"
+            )
+            function_dir.mkdir(parents=True)
+            test_path = function_dir / "test_001.cpp"
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_TRUE(true); }\n",
+                encoding="utf-8",
+            )
+            (function_dir / "include.h").write_text(
+                '#include "gtest/gtest.h"\n', encoding="utf-8"
+            )
+            successful_compile = subprocess.CompletedProcess(["compile"], 0, "", "")
+            validator = MagicMock(
+                side_effect=candidate_guard(
+                    str(test_path),
+                    "target(void)",
+                    "",
+                    project_path=str(project),
+                    source_name="sample.c",
+                )
+            )
+
+            with patch(
+                "rust_assistant.run_command", return_value=successful_compile
+            ):
+                success = compilation_fix_assistant_for_test_file(
+                    str(test_path),
+                    (["compile"], "c++ test.cpp"),
+                    str(function_dir),
+                    str(function_dir),
+                    candidate_validator=validator,
+                )
+
+            self.assertFalse(success)
+            validator.assert_called_once()
+            self.assertFalse(
+                (function_dir / ".test_001.cpp.refined").exists()
+            )
+
+    def test_legacy_full_scan_passes_guard_to_test_file_repairer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent_dir = Path(tmp) / "llm_tests_cxt"
+            source_dir = parent_dir / "sample.c"
+            source_dir.mkdir(parents=True)
+            test_path = source_dir / "target_void_" / "test_001.cpp"
+            test_path.parent.mkdir()
+            test_path.write_text(
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n",
+                encoding="utf-8",
+            )
+
+            function = MagicMock()
+            function._Function__sig = "target(void)"
+            function.is_operator.return_value = False
+            function.cond_chain_num.return_value = 3
+            function.min_cover_num.return_value = 1
+            source_file = MagicMock()
+            source_file.get_name.return_value = "sample.c"
+            source_file.get_functions.return_value = {"target(void)": function}
+            project = MagicMock()
+            project._Project__project_path = str(Path(tmp) / "project")
+            project._Project__build_path = str(Path(tmp) / "build")
+            validator = MagicMock(return_value=(True, ""))
+            factory = MagicMock(return_value=validator)
+            compile_cmd = (["compile"], "c++ test.cpp")
+
+            with (
+                patch(
+                    "rust_assistant.get_origin_tests_of_function",
+                    return_value=[str(test_path)],
+                ),
+                patch("rust_assistant.cmake_config"),
+                patch(
+                    "rust_assistant.get_compile_cmds",
+                    return_value={str(test_path): compile_cmd},
+                ),
+                patch(
+                    "rust_assistant.compilation_fix_assistant_for_test_file"
+                ) as repairer,
+            ):
+                compilation_fix_assistant_for_source_file(
+                    source_file,
+                    str(parent_dir),
+                    project,
+                    test_type="_cxt",
+                    candidate_validator_factory=factory,
+                )
+
+            factory.assert_called_once_with(
+                str(test_path), "sample.c", "target(void)", "_cxt"
+            )
+            self.assertIs(repairer.call_args.kwargs["candidate_validator"], validator)
+
     def test_compile_repair_reports_compile_database_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"
@@ -329,12 +663,38 @@ class SingleTestSessionTests(unittest.TestCase):
             self.assertFalse(result.passed)
             self.assertEqual(result.failure_type, "missing_compile_command")
 
+    def test_legacy_scan_supplies_section_85_candidate_guard_factory(self) -> None:
+        project = MagicMock()
+        with (
+            patch("compile_repair.Project", return_value=project),
+            patch("compile_repair.compilation_fix_assistant") as assistant,
+            patch("compile_repair.candidate_guard") as guard,
+        ):
+            repair_with_legacy_scan("/project", "/build", ["_cxt"])
+            assistant.assert_called_once()
+            factory = assistant.call_args.kwargs["candidate_validator_factory"]
+            candidate_validator = factory(
+                "/project/llm_tests_cxt/source.c/function/test_001.cpp",
+                "source.c",
+                "int target(void)",
+                "_cxt",
+            )
+            guard.assert_called_once_with(
+                "/project/llm_tests_cxt/source.c/function/test_001.cpp",
+                "int target(void)",
+                "_cxt",
+                project_path="/project",
+                source_name="source.c",
+            )
+            self.assertIs(candidate_validator, guard.return_value)
+
     def test_test_repair_accepts_shared_session_and_start_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"
             record = make_record(project)
             fixed_content = (
-                '#include "include.h"\nTEST(Target, Works) { EXPECT_EQ(1, 1); }\n'
+                '#include "include.h"\n'
+                "TEST(Target, Works) { EXPECT_EQ(target(), 1); }\n"
             )
 
             class FakeSession:

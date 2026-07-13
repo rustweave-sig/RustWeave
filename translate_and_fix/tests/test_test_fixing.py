@@ -25,6 +25,12 @@ fn parse_works() {
 }
 """
 
+VALID_C_PARSE_TEST = """#include "include.h"
+TEST(Parse, Works) {
+    EXPECT_EQ(parse_value("42"), 42);
+}
+"""
+
 
 class FailureClassificationTests(unittest.TestCase):
     def test_classifies_assertion_mismatch_as_semantic(self):
@@ -128,7 +134,7 @@ fn valid_works() {
         candidate = ORIGINAL.replace("assert_eq!(actual, 42)", "assert_eq!(actual as i32, 42)")
         llm = Mock(return_value=f"```rust\n{candidate}```")
         result = fix_test_case(
-            "TEST(Parse, Works) {}",
+            VALID_C_PARSE_TEST,
             ORIGINAL,
             "error[E0308]: mismatched types",
             "model-x",
@@ -143,7 +149,7 @@ fn valid_works() {
         llm = Mock(return_value=ORIGINAL)
         with self.assertRaises(SemanticMismatchError):
             fix_test_case(
-                "TEST(Parse, Works) {}",
+                VALID_C_PARSE_TEST,
                 ORIGINAL,
                 "assertion `left == right` failed: left: 41 right: 42",
                 "model-x",
@@ -157,7 +163,7 @@ fn valid_works() {
         llm = Mock(return_value=ORIGINAL.replace("actual, 42", "actual, 41"))
         with self.assertRaises(TestValidationError):
             fix_test_case(
-                "TEST(Parse, Works) {}",
+                VALID_C_PARSE_TEST,
                 ORIGINAL,
                 "error[E0308]: mismatched types",
                 "model-x",
@@ -171,6 +177,40 @@ fn valid_works() {
         changed = original.replace("assert_eq!(42, actual)", "assert_eq!(41, actual)")
 
         self.assertTrue(validate_test_fix(original, changed, "parse_value"))
+
+    def test_rejects_repair_that_changes_focal_call_argument(self):
+        changed = ORIGINAL.replace('parse_value("42")', 'parse_value("41")')
+        self.assertIn(
+            "focal call arguments or their setup inputs were changed",
+            validate_test_fix(ORIGINAL, changed, "parse_value"),
+        )
+
+    def test_rejects_repair_that_changes_focal_setup_input(self):
+        original = ORIGINAL.replace(
+            'let actual = crate::parser::parse_value("42");',
+            'let input = "42";\n'
+            "    let actual = crate::parser::parse_value(input);",
+        )
+        changed = original.replace('let input = "42"', 'let input = "41"')
+        self.assertIn(
+            "focal call arguments or their setup inputs were changed",
+            validate_test_fix(original, changed, "parse_value"),
+        )
+
+    def test_c_input_guard_runs_before_fix_llm(self):
+        llm = Mock(return_value=ORIGINAL)
+        with self.assertRaises(TestValidationError) as raised:
+            fix_test_case(
+                "TEST(Parse, Works) {}",
+                ORIGINAL,
+                "error[E0308]: mismatched types",
+                "model-x",
+                object(),
+                "parse_value",
+                llm_call=llm,
+            )
+        self.assertIn("unsupported_c_oracle", str(raised.exception))
+        llm.assert_not_called()
 
     def test_compile_fix_allows_equivalent_c_string_oracle_representation(self):
         c_test = (

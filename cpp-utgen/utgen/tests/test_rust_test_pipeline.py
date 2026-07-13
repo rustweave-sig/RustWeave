@@ -274,7 +274,9 @@ class RustCasePipelineTests(unittest.TestCase):
                 manifest,
                 RustTargetResolver(rust_dir),
                 RustTestRegistry(rust_dir),
-                RustTestVerifier(rust_dir, runner=FakeRunner([])),
+                RustTestVerifier(
+                    rust_dir, runner=FakeRunner([CommandResult(("cargo",), 0)])
+                ),
                 translate=lambda context: calls.append(context) or translated,
             )
 
@@ -282,10 +284,104 @@ class RustCasePipelineTests(unittest.TestCase):
             second = pipeline.run_case(case_id, verify_case=False, resume=True)
 
             self.assertEqual(first["rust_translation"], "pass")
+            self.assertEqual(first["rust_compile"], "pass")
             self.assertEqual(second["rust_translation"], "pass")
             self.assertEqual(len(calls), 1)
             self.assertIn("int add(int, int);", calls[0].c_context)
             self.assertIn("return a + b", calls[0].c_context)
+
+    def test_translate_only_repairs_and_compiles_before_marking_pass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, rust_dir, manifest, case_id = self.create_workspace(temporary)
+            runner = FakeRunner(
+                [
+                    CommandResult(("cargo",), 101, stderr="error[E0133]: unsafe call"),
+                    CommandResult(("cargo",), 0),
+                ]
+            )
+            original = (
+                "#[test]\nfn add_matches_c() { "
+                "assert_eq!(crate::mod_math::add(1, 2), 3); }\n"
+            )
+            repaired = original.replace("crate::", "unsafe { crate::").replace(
+                "add(1, 2),", "add(1, 2) },"
+            )
+            pipeline = RustCasePipeline(
+                manifest,
+                RustTargetResolver(rust_dir),
+                RustTestRegistry(rust_dir),
+                RustTestVerifier(rust_dir, runner=runner),
+                translate=lambda _context: original,
+                repair=lambda _context: repaired,
+            )
+
+            record = pipeline.run_case(case_id, verify_case=False)
+
+            self.assertEqual(record["rust_translation"], "pass")
+            self.assertEqual(record["rust_compile"], "pass")
+            self.assertEqual(record["rust_run"], "not_run")
+            self.assertEqual(len(runner.commands), 2)
+
+    def test_missing_include_revokes_c_trust_before_translation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, rust_dir, manifest, case_id = self.create_workspace(temporary)
+            (root / "include.h").unlink()
+            translate_calls = []
+            runner = FakeRunner([])
+            pipeline = RustCasePipeline(
+                manifest,
+                RustTargetResolver(rust_dir),
+                RustTestRegistry(rust_dir),
+                RustTestVerifier(rust_dir, runner=runner),
+                translate=lambda context: translate_calls.append(context) or "unused",
+            )
+
+            record = pipeline.run_case(case_id)
+
+            self.assertEqual(record["state"], "c_content_changed")
+            self.assertEqual(record["c_status"], "pending")
+            self.assertEqual(record["rust_translation"], "not_run")
+            self.assertEqual(record["failure_type"], "c_content_changed")
+            self.assertEqual(translate_calls, [])
+            self.assertEqual(runner.commands, [])
+
+    def test_changed_c_test_revokes_kept_rust_registration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, rust_dir, manifest, case_id = self.create_workspace(temporary)
+            runner = FakeRunner(
+                [
+                    CommandResult(("cargo",), 0),
+                    CommandResult(
+                        ("cargo",),
+                        0,
+                        stdout=successful_exact_output(case_id, "add_matches_c"),
+                    ),
+                ]
+            )
+            pipeline = RustCasePipeline(
+                manifest,
+                RustTargetResolver(rust_dir),
+                RustTestRegistry(rust_dir),
+                RustTestVerifier(rust_dir, runner=runner),
+                translate=lambda _context: (
+                    "#[test]\nfn add_matches_c() { "
+                    "assert_eq!(crate::mod_math::add(1, 2), 3); }\n"
+                ),
+            )
+            self.assertEqual(pipeline.run_case(case_id)["rust_status"], "kept")
+            (root / "test_add.cpp").write_text(
+                "TEST(Add, Changed) { EXPECT_EQ(add(2, 2), 4); }\n"
+            )
+
+            record = pipeline.run_case(case_id, resume=True)
+
+            self.assertEqual(record["c_status"], "pending")
+            self.assertEqual(record["rust_status"], "pending")
+            self.assertNotIn(
+                case_module_name(case_id),
+                (rust_dir / "src/c2rust_generated_tests/mod.rs").read_text(),
+            )
+            self.assertEqual(len(runner.commands), 2)
 
     def test_existing_translation_is_validated_before_cargo(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -490,6 +586,7 @@ class RustCasePipelineCargoFixtureTests(unittest.TestCase):
         (module / "fun_add.rs").write_text(
             "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
         )
+        (root / "include.h").write_text("int add(int, int);\n")
         manifest = CaseManifest(feature / "testgen/manifest.json", project_root=root)
         registry = RustTestRegistry(rust_dir)
         return root, rust_dir, manifest, registry

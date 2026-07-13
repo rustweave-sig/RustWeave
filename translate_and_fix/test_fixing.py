@@ -22,6 +22,9 @@ from test_translation import (
     ensure_valid_rust_test,
     extract_assertions,
     extract_c_assertions,
+    focal_input_snapshot,
+    ensure_valid_c_test_for_translation,
+    validate_translation_inputs,
     validate_c_oracles_preserved,
     validate_rust_test,
 )
@@ -234,6 +237,20 @@ def validate_test_fix(
         errors.append("focal function calls were deleted")
     elif candidate_calls > original_calls:
         errors.append("focal function calls were added")
+
+    if focal_input_snapshot(original, focal_function) != focal_input_snapshot(
+        candidate, focal_function
+    ):
+        errors.append("focal call arguments or their setup inputs were changed")
+    if c_test_code:
+        errors.extend(
+            validate_translation_inputs(c_test_code, candidate, focal_function)
+        )
+        errors.extend(
+            validate_c_oracles_preserved(
+                c_test_code, candidate, focal_function
+            )
+        )
     return tuple(dict.fromkeys(errors))
 
 
@@ -298,6 +315,7 @@ def test_fixing(
         raise SemanticMismatchError(
             "Rust assertion mismatch is a semantic_mismatch and must not be repaired"
         )
+    ensure_valid_c_test_for_translation(c_test_code, focal_function)
     ensure_valid_rust_test(rust_test_code, focal_function)
     prompt = build_test_fix_prompt(
         c_test_code,

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 import tempfile
@@ -380,6 +381,51 @@ class CaseManifestTests(unittest.TestCase):
             rust_target.write_text("pub fn y() { todo!() }\n", encoding="utf-8")
             self.assertTrue(manifest.should_process(case_id, stage="rust", resume=True))
 
+    def test_c_content_change_revokes_c_and_rust_resume_trust(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            c_test = root / "test.cpp"
+            rust_test = root / "case.rs"
+            rust_target = root / "fun_y.rs"
+            c_test.write_text("TEST(X, Y) {}\n", encoding="utf-8")
+            rust_test.write_text("#[test]\nfn y() {}\n", encoding="utf-8")
+            rust_target.write_text("pub fn y() {}\n", encoding="utf-8")
+            manifest = CaseManifest(root / "manifest.json", project_root=root)
+            record = manifest.register_case(c_test, function="void y(void)")
+            case_id = record["case_id"]
+            manifest.transition(
+                case_id,
+                "c_kept",
+                c_status="kept",
+                compile="pass",
+                run="pass",
+                kept=True,
+            )
+            expected_c_hash = manifest.get(case_id)["content_sha256"]
+            manifest.transition(
+                case_id,
+                "rust_kept",
+                rust_status="kept",
+                rust_translation="pass",
+                rust_compile="pass",
+                rust_run="pass",
+                rust_kept=True,
+                rust_test_path=str(rust_test),
+                rust_target_path=str(rust_target),
+            )
+
+            c_test.write_text("TEST(X, Changed) {}\n", encoding="utf-8")
+
+            self.assertEqual(manifest.get(case_id)["content_sha256"], expected_c_hash)
+            self.assertTrue(
+                manifest.should_process(case_id, stage="translate", resume=True)
+            )
+            invalidated = manifest.get(case_id)
+            self.assertEqual(invalidated["state"], "c_content_changed")
+            self.assertEqual(invalidated["c_status"], "pending")
+            self.assertEqual(invalidated["rust_status"], "pending")
+            self.assertFalse(invalidated["rust_kept"])
+
     def test_imports_legacy_filter_manifest_for_translation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -389,6 +435,8 @@ class CaseManifestTests(unittest.TestCase):
             filtered_test = test_root / "test_filtered.cpp"
             kept_test.write_text("TEST(X, Kept) {}\n", encoding="utf-8")
             filtered_test.write_text("TEST(X, Filtered) {}\n", encoding="utf-8")
+            (test_root / "include.h").write_text("int kept(void);\n", encoding="utf-8")
+            kept_hash = hashlib.sha256(kept_test.read_bytes()).hexdigest()
             legacy_path = test_root / "filter_manifest.json"
             legacy_path.write_text(
                 json.dumps(
@@ -404,6 +452,7 @@ class CaseManifestTests(unittest.TestCase):
                                 "compile": "pass",
                                 "run": "pass",
                                 "kept": True,
+                                "content_hash": kept_hash,
                             },
                             {
                                 "test_path": str(filtered_test),
@@ -445,6 +494,446 @@ class CaseManifestTests(unittest.TestCase):
                 legacy_path, test_type="_req_cxt"
             )
             self.assertEqual(manifest.get(kept["case_id"])["state"], "rust_kept")
+
+    def test_legacy_manifest_without_hash_never_silently_keeps_case(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            test_root = root / "llm_tests"
+            test_root.mkdir()
+            test_path = test_root / "test_001.cpp"
+            test_path.write_text("TEST(X, Y) {}\n", encoding="utf-8")
+            (test_root / "include.h").write_text("int y(void);\n", encoding="utf-8")
+            filter_manifest = test_root / "filter_manifest.json"
+            filter_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "test_root": str(test_root),
+                        "tests": [
+                            {
+                                "test_path": str(test_path),
+                                "compile": "pass",
+                                "run": "pass",
+                                "kept": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = CaseManifest(root / "manifest.json", project_root=root)
+
+            manifest.import_legacy_filter_manifest(filter_manifest)
+
+            record = manifest.cases()[0]
+            self.assertEqual(record["c_status"], "filtered")
+            self.assertFalse(record["kept"])
+            self.assertEqual(record["failure_type"], "manifest_content_hash_missing")
+
+    def test_v2_manifest_trusts_only_matching_exported_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            relative = Path("sample.c/int_y_void_/test_001_1.cpp")
+            source_test = root / "llm_tests_req_cxt" / relative
+            exported_test = root / "filtered_tests_req_cxt" / relative
+            source_test.parent.mkdir(parents=True)
+            exported_test.parent.mkdir(parents=True)
+            content = (
+                '#include "include.h"\n\n'
+                "/*\nTEST(YTest, int_y_void_001)\n"
+                "Input parameter: none.\nPrecondition: y is callable.\n"
+                "Expected result: y returns 1.\n*/\n"
+                "TEST(YTest, int_y_void_001) {\n"
+                "    const int actual = y();\n"
+                "    EXPECT_EQ(actual, 1);\n"
+                "}\n"
+            )
+            source_test.write_text(content, encoding="utf-8")
+            exported_test.write_text(content, encoding="utf-8")
+            (source_test.parent / "include.h").write_text(
+                "int y(void);\n", encoding="utf-8"
+            )
+            (exported_test.parent / "include.h").write_text(
+                "int y(void);\n", encoding="utf-8"
+            )
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+            include_hash = hashlib.sha256(b"int y(void);\n").hexdigest()
+            filter_manifest = root / "llm_tests_req_cxt/filter_manifest.json"
+            filter_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "test_type": "_req_cxt",
+                        "test_root": str(filter_manifest.parent),
+                        "tests": [
+                            {
+                                "test_path": str(source_test),
+                                "relative_path": relative.as_posix(),
+                                "source_file": "sample.c",
+                                "function": "int y(void)",
+                                "function_body": "int y(void) { return 1; }",
+                                "decl_file": "sample.h",
+                                "expected_test_signature": (
+                                    "TEST(YTest, int_y_void_001)"
+                                ),
+                                "workflow_status": "passed",
+                                "compile": "pass",
+                                "run": "pass",
+                                "kept": True,
+                                "exported": True,
+                                "content_hash": content_hash,
+                                "include_hash": include_hash,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = CaseManifest(root / "manifest.json", project_root=root)
+
+            manifest.import_legacy_filter_manifest(filter_manifest)
+
+            record = manifest.cases()[0]
+            self.assertEqual(record["c_status"], "kept")
+            self.assertEqual(Path(record["test_path"]), exported_test)
+            self.assertEqual(record["content_sha256"], content_hash)
+            self.assertEqual(
+                record["metadata"]["function_body"], "int y(void) { return 1; }"
+            )
+            self.assertEqual(record["metadata"]["decl_file"], "sample.h")
+
+    def test_v2_kept_false_is_not_promoted_by_passing_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            relative = Path("sample.c/int_y_void_/test_001.cpp")
+            source_test = root / "llm_tests" / relative
+            exported_test = root / "filtered_tests" / relative
+            source_test.parent.mkdir(parents=True)
+            exported_test.parent.mkdir(parents=True)
+            content = (
+                '#include "include.h"\n\n'
+                "TEST(YTest, Works) {\n"
+                "    const int actual = y();\n"
+                "    EXPECT_EQ(actual, 1);\n"
+                "}\n"
+            )
+            source_test.write_text(content, encoding="utf-8")
+            exported_test.write_text(content, encoding="utf-8")
+            (source_test.parent / "include.h").write_text(
+                "int y(void);\n", encoding="utf-8"
+            )
+            (exported_test.parent / "include.h").write_text(
+                "int y(void);\n", encoding="utf-8"
+            )
+            filter_manifest = root / "llm_tests/filter_manifest.json"
+            filter_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "test_root": str(filter_manifest.parent),
+                        "tests": [
+                            {
+                                "test_path": str(source_test),
+                                "relative_path": relative.as_posix(),
+                                "source_file": "sample.c",
+                                "function": "int y(void)",
+                                "workflow_status": "passed",
+                                "compile": "pass",
+                                "run": "pass",
+                                "kept": False,
+                                "exported": True,
+                                "content_hash": hashlib.sha256(
+                                    content.encode()
+                                ).hexdigest(),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = CaseManifest(root / "manifest.json", project_root=root)
+
+            manifest.import_legacy_filter_manifest(filter_manifest)
+
+            record = manifest.cases()[0]
+            self.assertEqual(record["c_status"], "filtered")
+            self.assertFalse(record["kept"])
+            self.assertEqual(record["failure_type"], "manifest_not_kept")
+
+    def test_v2_rejects_missing_or_stale_declared_include_hash(self):
+        for mutation in ("missing", "stale", "changed_both"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                relative = Path("sample.c/int_y_void_/test_001.cpp")
+                source_test = root / "llm_tests" / relative
+                exported_test = root / "filtered_tests" / relative
+                source_test.parent.mkdir(parents=True)
+                exported_test.parent.mkdir(parents=True)
+                content = (
+                    '#include "include.h"\n'
+                    "TEST(YTest, Works) { EXPECT_EQ(y(), 1); }\n"
+                )
+                for path in (source_test, exported_test):
+                    path.write_text(content, encoding="utf-8")
+                    (path.parent / "include.h").write_text(
+                        "int y(void);\n", encoding="utf-8"
+                    )
+                include_hash = hashlib.sha256(b"int y(void);\n").hexdigest()
+                if mutation == "missing":
+                    include_hash = ""
+                elif mutation == "stale":
+                    include_hash = "0" * 64
+                else:
+                    for path in (source_test, exported_test):
+                        (path.parent / "include.h").write_text(
+                            "int y(void); // changed\n", encoding="utf-8"
+                        )
+                record = {
+                    "test_path": str(source_test),
+                    "relative_path": relative.as_posix(),
+                    "source_file": "sample.c",
+                    "function": "int y(void)",
+                    "workflow_status": "passed",
+                    "compile": "pass",
+                    "run": "pass",
+                    "kept": True,
+                    "exported": True,
+                    "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+                    "include_hash": include_hash,
+                }
+                if mutation == "missing":
+                    record.pop("include_hash")
+                filter_manifest = root / "llm_tests/filter_manifest.json"
+                filter_manifest.write_text(
+                    json.dumps({"version": 2, "tests": [record]}),
+                    encoding="utf-8",
+                )
+                manifest = CaseManifest(root / "manifest.json", project_root=root)
+
+                manifest.import_legacy_filter_manifest(filter_manifest)
+
+                imported = manifest.cases()[0]
+                self.assertEqual(imported["c_status"], "filtered")
+                self.assertEqual(
+                    imported["failure_type"],
+                    "manifest_include_hash_missing"
+                    if mutation == "missing"
+                    else "manifest_include_hash_mismatch",
+                )
+
+    def test_v2_reimport_resets_rust_when_verified_c_input_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            relative = Path("sample.c/int_y_void_/test_001.cpp")
+            source_test = root / "llm_tests" / relative
+            exported_test = root / "filtered_tests" / relative
+            source_test.parent.mkdir(parents=True)
+            exported_test.parent.mkdir(parents=True)
+            content = (
+                '#include "include.h"\n'
+                "TEST(YTest, Works) { EXPECT_EQ(y(), 1); }\n"
+            )
+            for path in (source_test, exported_test):
+                path.write_text(content, encoding="utf-8")
+
+            filter_manifest = root / "llm_tests/filter_manifest.json"
+
+            def write_verified_manifest(include_content: str) -> None:
+                for path in (source_test, exported_test):
+                    (path.parent / "include.h").write_text(
+                        include_content, encoding="utf-8"
+                    )
+                filter_manifest.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "test_type": "",
+                            "tests": [
+                                {
+                                    "test_path": str(source_test),
+                                    "relative_path": relative.as_posix(),
+                                    "source_file": "sample.c",
+                                    "source_path": str(root / "sample.c"),
+                                    "function": "int y(void)",
+                                    "function_body": "int y(void) { return 1; }",
+                                    "workflow_status": "passed",
+                                    "compile": "pass",
+                                    "run": "pass",
+                                    "kept": True,
+                                    "exported": True,
+                                    "content_hash": hashlib.sha256(
+                                        content.encode()
+                                    ).hexdigest(),
+                                    "include_hash": hashlib.sha256(
+                                        include_content.encode()
+                                    ).hexdigest(),
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            write_verified_manifest("int y(void);\n")
+            manifest = CaseManifest(root / "manifest.json", project_root=root)
+            manifest.import_legacy_filter_manifest(filter_manifest)
+            case_id = manifest.cases()[0]["case_id"]
+            rust_test = root / "case.rs"
+            rust_test.write_text("#[test]\nfn case() {}\n", encoding="utf-8")
+            manifest.transition(
+                case_id,
+                "rust_kept",
+                rust_status="kept",
+                rust_translation="pass",
+                rust_compile="pass",
+                rust_run="pass",
+                rust_kept=True,
+                rust_test_path=str(rust_test),
+            )
+
+            write_verified_manifest("int y(void); // regenerated\n")
+            manifest.import_legacy_filter_manifest(filter_manifest)
+
+            record = manifest.get(case_id)
+            self.assertEqual(record["c_status"], "kept")
+            self.assertEqual(record["rust_status"], "pending")
+            self.assertEqual(record["rust_translation"], "not_run")
+            self.assertFalse(record["rust_kept"])
+            self.assertEqual(record["rust_test_path"], "")
+
+    def test_v2_rejects_relative_path_outside_source_function_layout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            relative = Path("wrong.c/wrong_function/test_001.cpp")
+            source_test = root / "llm_tests" / relative
+            exported_test = root / "filtered_tests" / relative
+            source_test.parent.mkdir(parents=True)
+            exported_test.parent.mkdir(parents=True)
+            content = (
+                '#include "include.h"\n\n'
+                "TEST(YTest, Works) {\n"
+                "    const int actual = y();\n"
+                "    EXPECT_EQ(actual, 1);\n"
+                "}\n"
+            )
+            for path in (source_test, exported_test):
+                path.write_text(content)
+                (path.parent / "include.h").write_text("int y(void);\n")
+            filter_manifest = root / "llm_tests/filter_manifest.json"
+            filter_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "test_root": str(filter_manifest.parent),
+                        "tests": [
+                            {
+                                "test_path": str(source_test),
+                                "relative_path": relative.as_posix(),
+                                "source_file": "sample.c",
+                                "function": "int y(void)",
+                                "workflow_status": "passed",
+                                "compile": "pass",
+                                "run": "pass",
+                                "kept": True,
+                                "exported": True,
+                                "content_hash": hashlib.sha256(
+                                    content.encode()
+                                ).hexdigest(),
+                            }
+                        ],
+                    }
+                )
+            )
+            manifest = CaseManifest(root / "manifest.json", project_root=root)
+
+            manifest.import_legacy_filter_manifest(filter_manifest)
+
+            record = manifest.cases()[0]
+            self.assertEqual(record["c_status"], "filtered")
+            self.assertEqual(record["failure_type"], "c_test_path_invalid")
+
+    def test_v2_rejects_changed_source_or_export_and_missing_include(self):
+        failure_mutations = {
+            "source": lambda source, exported: source.write_text("changed\n"),
+            "export": lambda source, exported: exported.write_text("changed\n"),
+            "include": lambda source, exported: (
+                exported.parent / "include.h"
+            ).unlink(),
+            "include_content": lambda source, exported: (
+                exported.parent / "include.h"
+            ).write_text("// changed\n"),
+            "include_format": lambda source, exported: (
+                (source.parent / "include.h").write_text('#include "sample.c"\n'),
+                (exported.parent / "include.h").write_text(
+                    '#include "sample.c"\n'
+                ),
+            ),
+        }
+        expected_failures = {
+            "source": "source_content_hash_mismatch",
+            "export": "manifest_content_hash_mismatch",
+            "include": "missing_include",
+            "include_content": "include_content_mismatch",
+            "include_format": "include_format_invalid",
+        }
+        for mutation_name, mutate in failure_mutations.items():
+            with self.subTest(mutation=mutation_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                relative = Path("sample.c/int_y_void_/test_001.cpp")
+                source_test = root / "llm_tests" / relative
+                exported_test = root / "filtered_tests" / relative
+                source_test.parent.mkdir(parents=True)
+                exported_test.parent.mkdir(parents=True)
+                content = (
+                    '#include "include.h"\n\n'
+                    "TEST(YTest, Works) {\n"
+                    "    const int actual = y();\n"
+                    "    EXPECT_EQ(actual, 1);\n"
+                    "}\n"
+                )
+                source_test.write_text(content, encoding="utf-8")
+                exported_test.write_text(content, encoding="utf-8")
+                (source_test.parent / "include.h").write_text(
+                    "int y(void);\n", encoding="utf-8"
+                )
+                (exported_test.parent / "include.h").write_text(
+                    "int y(void);\n", encoding="utf-8"
+                )
+                content_hash = hashlib.sha256(content.encode()).hexdigest()
+                mutate(source_test, exported_test)
+                filter_manifest = root / "llm_tests/filter_manifest.json"
+                filter_manifest.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "test_root": str(filter_manifest.parent),
+                            "tests": [
+                                {
+                                    "test_path": str(source_test),
+                                    "relative_path": relative.as_posix(),
+                                    "source_file": "sample.c",
+                                    "function": "int y(void)",
+                                    "workflow_status": "passed",
+                                    "compile": "pass",
+                                    "run": "pass",
+                                    "kept": True,
+                                    "exported": True,
+                                    "content_hash": content_hash,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                manifest = CaseManifest(root / "manifest.json", project_root=root)
+
+                manifest.import_legacy_filter_manifest(filter_manifest)
+
+                record = manifest.cases()[0]
+                self.assertEqual(record["c_status"], "filtered")
+                self.assertEqual(
+                    record["failure_type"], expected_failures[mutation_name]
+                )
 
 
 class CTestVerifierTests(unittest.TestCase):

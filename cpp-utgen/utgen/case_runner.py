@@ -80,11 +80,7 @@ class SingleTestSession:
     def _source_files(self) -> list[str]:
         source_files = [self.test_path]
         source_path = self.record.get("source_path", "")
-        if (
-            source_path
-            and not is_header(source_path)
-            and self.record.get("decl_in_header")
-        ):
+        if source_path and not is_header(source_path):
             source_files.append(source_path)
         deps_path = f"{self.project}/project_info/deps_dict.json"
         if source_path and os.path.isfile(deps_path):
