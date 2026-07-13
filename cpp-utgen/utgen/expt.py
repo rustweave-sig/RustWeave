@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -12,8 +13,18 @@ from typing import Any
 import xmltodict
 
 from linecounter import count_code_lines
-from utils import (SETUP_COV, ExptFileData, clear_directory, cmake_config,
-                   format_sig, is_header, run_command)
+from utils import (
+    SETUP_COV,
+    ExptFileData,
+    atomic_write_json,
+    clear_directory,
+    cmake_config,
+    count_executed_tests,
+    format_sig,
+    is_header,
+    run_command,
+    write_text_best_effort,
+)
 
 try:
     from config_private import CPU_COUNT
@@ -210,6 +221,10 @@ class FunctionData:
                 "repair_rounds": 0,
                 "repair_log": "",
                 "exported": False,
+                "workflow_status": "pending",
+                "repair_stage": "",
+                "terminal_reason": "",
+                "content_hash": "",
             }
 
     def get_sig(self) -> str:
@@ -244,6 +259,10 @@ class FunctionData:
             record["failure_type"] = ""
             record["build_log"] = ""
             record["run_log"] = ""
+            record["workflow_status"] = "pending"
+            record["repair_stage"] = ""
+            record["terminal_reason"] = ""
+            record["exported"] = False
 
     def get_can_compile_list(self) -> list[str]:
         return self.__can_compile
@@ -265,11 +284,83 @@ class FunctionData:
     def get_test_records(self) -> dict[str, dict[str, Any]]:
         return self.__test_records
 
+    @staticmethod
+    def __content_hash(record: dict[str, Any]) -> str:
+        try:
+            return hashlib.sha256(Path(record["test_path"]).read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def __invalidate_changed_record(
+        record: dict[str, Any], content_hash: str, reason: str = "content_changed"
+    ) -> None:
+        record.update(
+            {
+                "compile": "not_run",
+                "coverage_build": "not_run",
+                "run": "not_run",
+                "kept": False,
+                "failure_type": "",
+                "compile_log": "",
+                "build_log": "",
+                "run_log": "",
+                "repair_status": "not_attempted",
+                "repair_rounds": 0,
+                "repair_log": "",
+                "exported": False,
+                "workflow_status": "interrupted",
+                "repair_stage": "",
+                "terminal_reason": reason,
+                "content_hash": content_hash,
+            }
+        )
+
+    def __mark_missing_include(self) -> str:
+        log_path = f"{self.__test_dir_path}/missing_include.log"
+        message = (
+            f"Required generated header is missing: {self.__test_dir_path}/include.h\n"
+        )
+        self.__can_compile = []
+        for record in self.__test_records.values():
+            record["compile"] = "fail"
+            record["coverage_build"] = "fail"
+            record["run"] = "not_run"
+            record["kept"] = False
+            record["failure_type"] = "missing_include"
+            record["compile_log"] = ""
+            record["build_log"] = ""
+            record["run_log"] = ""
+            record["repair_status"] = "skipped_missing_include"
+            record["repair_log"] = message.strip()
+            record["exported"] = False
+            record["workflow_status"] = "filtered"
+            record["terminal_reason"] = "missing_include"
+        if write_text_best_effort(log_path, message):
+            for record in self.__test_records.values():
+                record["compile_log"] = log_path
+                record["build_log"] = log_path
+                record["repair_log"] = log_path
+            return log_path
+        return ""
+
+    def __has_include(self) -> bool:
+        if os.path.isfile(f"{self.__test_dir_path}/include.h"):
+            return True
+        self.__mark_missing_include()
+        return False
+
     def load_manifest_records(self, records_by_path: dict[str, dict[str, Any]]) -> None:
         can_compile = []
         for test_file_name, record in self.__test_records.items():
             old_record = records_by_path.get(record["test_path"])
             if old_record is None:
+                continue
+            current_hash = self.__content_hash(record)
+            if not old_record.get("content_hash") or old_record.get(
+                "content_hash"
+            ) != current_hash:
+                self.__invalidate_changed_record(record, current_hash)
                 continue
             for key in (
                 "compile",
@@ -285,6 +376,11 @@ class FunctionData:
                 "repair_log",
                 "repair_failure_type",
                 "exported",
+                "workflow_status",
+                "repair_stage",
+                "terminal_reason",
+                "content_hash",
+                "run_command",
             ):
                 if key in old_record:
                     record[key] = old_record[key]
@@ -297,7 +393,10 @@ class FunctionData:
     ) -> list[dict[str, Any]]:
         records = []
         for test_file_name in sorted(self.__test_records):
-            record = dict(self.__test_records[test_file_name])
+            source_record = self.__test_records[test_file_name]
+            if os.path.isfile(source_record["test_path"]):
+                source_record["content_hash"] = self.__content_hash(source_record)
+            record = dict(source_record)
             record.update(
                 {
                     "source_file": source_name,
@@ -318,7 +417,30 @@ class FunctionData:
     def export_filtered_tests(self, project: str, export_parent_dir: str) -> bool:
         for record in self.__test_records.values():
             record["exported"] = False
-        kept_files = self.get_kept_list()
+        if not any(record["kept"] for record in self.__test_records.values()):
+            return False
+        if not self.__has_include():
+            return False
+        kept_files = []
+        for test_file_name, record in self.__test_records.items():
+            if not record["kept"]:
+                continue
+            current_hash = self.__content_hash(record)
+            if (
+                record["compile"] == "pass"
+                and record["run"] == "pass"
+                and record.get("content_hash")
+                and record["content_hash"] == current_hash
+            ):
+                kept_files.append(test_file_name)
+                continue
+            reason = (
+                "content_changed"
+                if not record.get("content_hash")
+                or record["content_hash"] != current_hash
+                else "unverified_state"
+            )
+            self.__invalidate_changed_record(record, current_hash, reason)
         if len(kept_files) == 0:
             return False
         export_dir = f"{export_parent_dir}/{Path(self.__test_dir_path).name}"
@@ -484,6 +606,8 @@ class FunctionData:
 
     def collect_line_branch(self, project: str, build: str, llm_cov_dir: str) -> None:
         """use an empty test file to collect line and branch coverage"""
+        if not self.__has_include():
+            return
         if os.path.exists(f"{self.__test_dir_path}/build_empty_test_err.log"):
             os.remove(f"{self.__test_dir_path}/build_empty_test_err.log")
         build_cov_dir = f"{build}/coverage"
@@ -586,6 +710,8 @@ class FunctionData:
     def __prepare_coverage_dir(
         self, project: str, build: str, llm_cov_dir: str, test_file_list: list[str]
     ) -> list[tuple[str, str]]:
+        if not self.__has_include():
+            return []
         clear_directory(llm_cov_dir)
         target_list = self.__write_coverage_cmake(project, llm_cov_dir, test_file_list)
         shutil.copy(f"{llm_cov_dir}/CMakeLists.txt", f"{self.__test_dir_path}/cov_cmake.txt")
@@ -640,6 +766,10 @@ class FunctionData:
             return False
         run_cmd = [exe_path, f"--gtest_output=xml:{xml_path}"]
         try:
+            os.remove(xml_path)
+        except FileNotFoundError:
+            pass
+        try:
             res = subprocess.run(
                 run_cmd,
                 cwd=build,
@@ -656,14 +786,29 @@ class FunctionData:
                 f"STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}\n"
             )
             write_text_file(log_path, log_content)
+            record["run_log"] = log_path
             if res.returncode == 0:
+                try:
+                    tests_run = count_executed_tests(xml_path)
+                except (OSError, ET.ParseError) as exc:
+                    with open(log_path, "a") as log_file:
+                        log_file.write(f"Invalid GoogleTest XML result: {exc}\n")
+                    record["run"] = "fail"
+                    record["kept"] = False
+                    record["failure_type"] = "invalid_test_result"
+                    return False
+                if tests_run == 0:
+                    with open(log_path, "a") as log_file:
+                        log_file.write("GoogleTest executed zero valid tests.\n")
+                    record["run"] = "fail"
+                    record["kept"] = False
+                    record["failure_type"] = "empty_test_failure"
+                    return False
                 record["run"] = "pass"
-                record["run_log"] = log_path
                 record["kept"] = True
                 record["failure_type"] = ""
                 return True
             record["run"] = "fail"
-            record["run_log"] = log_path
             record["kept"] = False
             record["failure_type"] = classify_failure(output, res.returncode)
             return False
@@ -682,8 +827,17 @@ class FunctionData:
             record["failure_type"] = "timeout_failure"
             return False
 
-    def gen_covtest_result(self, project: str, build: str, llm_cov_dir: str) -> None:
+    def gen_covtest_result(
+        self,
+        project: str,
+        build: str,
+        llm_cov_dir: str,
+        kept_only: bool = False,
+    ) -> None:
         # print(f"  Generating coverage and test result for {self.__sig} ...")
+        if not self.__has_include():
+            self.__test_result = TestResult(0, 0)
+            return
         if os.path.exists(f"{self.__test_dir_path}/coverage_failed.log"):
             os.remove(f"{self.__test_dir_path}/coverage_failed.log")
         if os.path.exists(f"{self.__test_dir_path}/build_test_err.log"):
@@ -694,7 +848,11 @@ class FunctionData:
             for test_file in path.iterdir()
             if test_file.is_file()
             and test_file.suffix == ".cpp"
-            and test_file.name in self.__can_compile
+            and (
+                self.__test_records.get(test_file.name, {}).get("kept", False)
+                if kept_only
+                else test_file.name in self.__can_compile
+            )
         ]
         if len(test_file_list) == 0:
             self.collect_line_branch(project, build, llm_cov_dir)
@@ -708,6 +866,15 @@ class FunctionData:
         for test_file_name, target_name in target_list:
             if self.__build_test_target(build, test_file_name, target_name):
                 build_pass_targets.append((test_file_name, target_name))
+            elif kept_only:
+                record = self.__test_records[test_file_name]
+                record["kept"] = False
+                record["workflow_status"] = "filtered"
+                record["terminal_reason"] = "final_build_failure"
+            else:
+                record = self.__test_records[test_file_name]
+                record["workflow_status"] = "interrupted"
+                record["terminal_reason"] = "build_failure"
         if len(build_pass_targets) == 0:
             self.__test_result = TestResult(0, 0)
             self.collect_line_branch(project, build, llm_cov_dir)
@@ -717,8 +884,21 @@ class FunctionData:
         for test_file_name, target_name in build_pass_targets:
             if self.__run_test_target(build, test_file_name, target_name):
                 run_pass_files.append(test_file_name)
+                if not kept_only:
+                    record = self.__test_records[test_file_name]
+                    record["workflow_status"] = "passed"
+                    record["terminal_reason"] = ""
             else:
                 run_failed += 1
+                if kept_only:
+                    record = self.__test_records[test_file_name]
+                    record["kept"] = False
+                    record["workflow_status"] = "filtered"
+                    record["terminal_reason"] = "final_run_failure"
+                else:
+                    record = self.__test_records[test_file_name]
+                    record["workflow_status"] = "interrupted"
+                    record["terminal_reason"] = record["failure_type"]
         self.__test_result = TestResult(len(build_pass_targets), run_failed)
         if len(run_pass_files) == 0:
             self.collect_line_branch(project, build, llm_cov_dir)
@@ -730,6 +910,14 @@ class FunctionData:
             for test_file_name, target_name in target_list:
                 if not self.__build_test_target(build, test_file_name, target_name):
                     self.__test_records[test_file_name]["kept"] = False
+                    if kept_only:
+                        record = self.__test_records[test_file_name]
+                        record["workflow_status"] = "filtered"
+                        record["terminal_reason"] = "final_coverage_build_failure"
+                    else:
+                        record = self.__test_records[test_file_name]
+                        record["workflow_status"] = "interrupted"
+                        record["terminal_reason"] = "coverage_build_failure"
             run_pass_files = [
                 test_file_name
                 for test_file_name in run_pass_files
@@ -813,10 +1001,16 @@ class FileData:
             failed += fail
         return success, failed
 
-    def gen_covtest_result(self, project: str, build: str, llm_cov_dir: str) -> None:
+    def gen_covtest_result(
+        self,
+        project: str,
+        build: str,
+        llm_cov_dir: str,
+        kept_only: bool = False,
+    ) -> None:
         # print(f"Generating coverage result for {self.__name}")
         for func_data in self.__data:
-            func_data.gen_covtest_result(project, build, llm_cov_dir)
+            func_data.gen_covtest_result(project, build, llm_cov_dir, kept_only)
 
     def export_filtered_tests(self, project: str, export_root: str) -> bool:
         export_file_dir = f"{export_root}/{self.__name}"
@@ -882,6 +1076,8 @@ class Expt:
             "timeout": 0,
             "kept": 0,
             "exported": 0,
+            "filtered": 0,
+            "interrupted": 0,
         }
         for record in tests:
             if record["compile"] == "pass":
@@ -898,8 +1094,12 @@ class Expt:
                 summary["kept"] += 1
             if record["exported"]:
                 summary["exported"] += 1
+            if record.get("workflow_status") == "filtered":
+                summary["filtered"] += 1
+            elif record.get("workflow_status") == "interrupted":
+                summary["interrupted"] += 1
         return {
-            "version": 1,
+            "version": 2,
             "test_type": self.__type,
             "test_root": self.__test_dir_path,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -908,9 +1108,7 @@ class Expt:
         }
 
     def dump_manifest(self) -> None:
-        os.makedirs(self.__test_dir_path, exist_ok=True)
-        with open(self.get_manifest_path(), "w") as manifest_file:
-            json.dump(self.gen_manifest_data(), manifest_file, indent=2)
+        atomic_write_json(self.get_manifest_path(), self.gen_manifest_data())
 
     def init(self, expt_dict: dict[str, ExptFileData]) -> None:
         path = Path(self.__test_dir_path)
@@ -1004,11 +1202,15 @@ class Expt:
         self.__compile_result = CompileResult(success, failed)
         print(f"Compile result: {success} success, {failed} failed, pass rate: {self.__compile_result.pass_rate()}")
 
-    def gen_covtest_result(self, project: str, build: str) -> None:
+    def gen_covtest_result(
+        self, project: str, build: str, kept_only: bool = False
+    ) -> None:
         cmake_config(project, build)
         print(f"Generating coverage and test result for llm_tests{self.__type} ...")
         for file_data in self.__data:
-            file_data.gen_covtest_result(project, build, self.__llm_cov_dir)
+            file_data.gen_covtest_result(
+                project, build, self.__llm_cov_dir, kept_only
+            )
 
     def export_filtered_tests(self) -> None:
         export_root = f"{self.__project}/filtered_tests{self.__type}"

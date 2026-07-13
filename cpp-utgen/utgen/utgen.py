@@ -4,7 +4,7 @@ import re
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import clang.cindex
 
@@ -25,6 +25,7 @@ from utils import (
     is_test_or_build_file,
     remove_macros,
     run_command,
+    write_text_best_effort,
 )
 
 try:
@@ -38,6 +39,43 @@ from prompt import NOREQ, PROMPT, TEST_CXT, TEST_INCLUDE
 
 MIN_CHAIN_NUM = 2
 MAX_MIN_COVER = 20
+TEST_FUNCTION_PATTERN = re.compile(
+    r"\b(?:TEST(?:_F|_P)?|TYPED_TEST(?:_P)?)\s*\("
+)
+COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
+
+
+def atomic_write_text(file_path: str, content: str) -> None:
+    path = Path(file_path)
+    os.makedirs(path.parent, exist_ok=True)
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(content)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def is_valid_test_content(content: str) -> bool:
+    code = COMMENT_PATTERN.sub("", content)
+    return bool(code.strip() and TEST_FUNCTION_PATTERN.search(code))
+
+
+def is_valid_test_file(file_path: str) -> bool:
+    try:
+        return is_valid_test_content(Path(file_path).read_text())
+    except (OSError, UnicodeError):
+        return False
+
+
+def log_include_failure(test_dir: str, exc: Exception) -> None:
+    message = f"Failed to regenerate include.h: {exc}\n"
+    write_text_best_effort(f"{test_dir}/include_recovery.log", message)
 
 
 def extract_functions_index(node, cpp_code: str) -> list[tuple[int, int]]:
@@ -98,6 +136,9 @@ class Function:
 
     def get_loc(self) -> tuple[int, int]:
         return self.__loc
+
+    def get_sig(self) -> str:
+        return self.__sig
 
     def cond_chain_num(self) -> int:
         return len(self.__cond_chains)
@@ -198,36 +239,90 @@ class Function:
 
     def gen_include_file(self, parent_test_dir: str) -> None:
         test_dir = f"{parent_test_dir}/{format_sig(self.__sig)}"
-        with open(f"{test_dir}/include.h", "w") as file:
-            file.write(
-                '#include "gmock/gmock.h"\n#include "gtest/gtest.h"\n#define private public\n#define protected public\n\n'
-            )
-            include_set = self.get_includes()
-            for include in include_set:
-                if "/" in include:
-                    # rela_path = os.path.relpath(include, test_dir)
-                    file.write(f'#include "{include}"\n')
-                else:
-                    file.write(f"#include <{include}>\n")
-            # rela_path = os.path.relpath(self.__decl_file, test_dir)
-            file.write(f'#include "{self.__decl_file}"\n')
-            # add namespace used in the function
-            if self.__namespace:
-                file.write("\n")
-                file.write(self.gen_namespaces())
+        os.makedirs(test_dir, exist_ok=True)
+        include_path = f"{test_dir}/include.h"
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=test_dir, prefix=".include.", delete=False
+            ) as file:
+                temp_path = file.name
+                file.write(
+                    '#include "gmock/gmock.h"\n#include "gtest/gtest.h"\n#define private public\n#define protected public\n\n'
+                )
+                include_set = self.get_includes()
+                for include in include_set:
+                    if "/" in include:
+                        file.write(f'#include "{include}"\n')
+                    else:
+                        file.write(f"#include <{include}>\n")
+                file.write(f'#include "{self.__decl_file}"\n')
+                if self.__namespace:
+                    file.write("\n")
+                    file.write(self.gen_namespaces())
+            os.replace(temp_path, include_path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
-    def gen_unit_test(self, test_type: str, parent_test_dir: str) -> None:
+    def ensure_include_file(self, parent_test_dir: str) -> bool:
         if self.__focal_cxt is None:
-            return
+            return False
         test_dir = f"{parent_test_dir}/{format_sig(self.__sig)}"
+        if not os.path.isdir(test_dir):
+            return False
+        include_path = f"{test_dir}/include.h"
+        if os.path.isfile(include_path):
+            return True
+        self.gen_req_list()
+        self.gen_include_file(parent_test_dir)
+        return True
+
+    def gen_unit_test(
+        self,
+        test_type: str,
+        parent_test_dir: str,
+        on_test_generated: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        if self.__focal_cxt is None:
+            return []
+        test_dir = f"{parent_test_dir}/{format_sig(self.__sig)}"
+        generated_tests: list[str] = []
+
+        def notify(test_path: str) -> None:
+            generated_tests.append(test_path)
+            if on_test_generated is not None:
+                on_test_generated(test_path)
+
         if os.path.exists(f"{test_dir}/.generated"):
-            return
+            cached_tests = sorted(Path(test_dir).glob("test_*.cpp"))
+            try:
+                include_ready = self.ensure_include_file(parent_test_dir)
+            except Exception as exc:
+                include_ready = False
+                log_include_failure(test_dir, exc)
+            if not include_ready:
+                for test_file in cached_tests:
+                    notify(str(test_file))
+                return generated_tests
+            if cached_tests and all(
+                is_valid_test_file(str(test_file)) for test_file in cached_tests
+            ):
+                for test_file in cached_tests:
+                    notify(str(test_file))
+                return generated_tests
+            os.remove(f"{test_dir}/.generated")
         last_result = ""
         require_list = self.gen_req_list()
         focal_cxt = self.gen_focal_cxt()
         test_cxt = self.gen_test_cxt()
         function_body = self.get_function_body()
         os.makedirs(test_dir, exist_ok=True)
+        try:
+            self.gen_include_file(parent_test_dir)
+        except Exception as exc:
+            log_include_failure(test_dir, exc)
+            return generated_tests
         prompt_dir = f"{test_dir}/prompt"
         os.makedirs(prompt_dir, exist_ok=True)
         # print(f"    Generating unit tests for {self.__sig} ...")
@@ -251,10 +346,27 @@ class Function:
                 prompt += last_result + require + "\n"
                 with open(f"{prompt_dir}/{num:0>3}.txt", "w") as file:
                     file.write(prompt)
-                test_func_list = get_test_from_LLM(prompt, 2)
-                i = 0
-                for test_func in test_func_list:
-                    i += 1
+                response_paths = [
+                    f"{prompt_dir}/{num:0>3}_response_{i}.txt" for i in (1, 2)
+                ]
+                expected_tests = [f"{test_dir}/test_{num:0>3}_{i}.cpp" for i in (1, 2)]
+                if all(is_valid_test_file(path) for path in response_paths):
+                    test_func_list = [Path(path).read_text() for path in response_paths]
+                elif all(is_valid_test_file(path) for path in expected_tests):
+                    test_func_list = [Path(path).read_text() for path in expected_tests]
+                else:
+                    test_func_list = get_test_from_LLM(prompt, 2)
+                    if len(test_func_list) != 2 or not all(
+                        is_valid_test_content(content) for content in test_func_list
+                    ):
+                        atomic_write_text(
+                            f"{test_dir}/generation_error.log",
+                            f"Invalid LLM response for requirement {num}.\n",
+                        )
+                        return generated_tests
+                    for response_path, test_func in zip(response_paths, test_func_list):
+                        atomic_write_text(response_path, test_func)
+                for i, test_func in enumerate(test_func_list, start=1):
                     with tempfile.NamedTemporaryFile(
                         suffix=".cpp", delete=False
                     ) as temp_file:
@@ -270,11 +382,13 @@ class Function:
                         end = indices[0][1]
                         test_func = test_func[:end]
                     test_file_path = f"{test_dir}/test_{num:0>3}_{i}.cpp"
-                    with open(test_file_path, "w") as file:
-                        file.write(
+                    if not is_valid_test_file(test_file_path):
+                        atomic_write_text(
+                            test_file_path,
                             f'#include "include.h"\n/*\n{require}*/\n\n'
-                            + remove_macros(test_func)
+                            + remove_macros(test_func),
                         )
+                    notify(test_file_path)
                 last_result = f"Below are some example test cases, you should generate your own class if needed:\n{test_func_list[0]}\n{test_func_list[1]}\n"
                 # last_result = ""
         else:
@@ -289,7 +403,18 @@ class Function:
             prompt += TEST_CXT
             with open(f"{prompt_dir}/prompt.txt", "w") as file:
                 file.write(prompt)
-            test_func = get_test_from_LLM(prompt, 1)[0]
+            response_path = f"{prompt_dir}/response.txt"
+            if is_valid_test_file(response_path):
+                test_func = Path(response_path).read_text()
+            else:
+                test_func = get_test_from_LLM(prompt, 1)[0]
+                if not is_valid_test_content(test_func):
+                    atomic_write_text(
+                        f"{test_dir}/generation_error.log",
+                        "Invalid LLM response for function-level generation.\n",
+                    )
+                    return generated_tests
+                atomic_write_text(response_path, test_func)
             with open(f"{test_dir}/origin.cpp", "w") as file:
                 file.write(f"/*\n{test_func}\n*/\n")
             # split the test cases into multiple files
@@ -306,13 +431,37 @@ class Function:
                 func = remove_substrings_by_indices(test_func, temp_indices)
                 func = re.sub(r"\n{3,}", "\n", func)
                 test_file_path = f"{test_dir}/test_{i + 1:0>3}.cpp"
-                with open(test_file_path, "w") as file:
-                    file.write(f'#include "include.h"\n\n' + remove_macros(func))
+                if not is_valid_test_file(test_file_path):
+                    atomic_write_text(
+                        test_file_path,
+                        '#include "include.h"\n\n' + remove_macros(func),
+                    )
+                generated_tests.append(test_file_path)
                 i += 1
-        # generate include.h
-        self.gen_include_file(parent_test_dir)
-        with open(f"{test_dir}/.generated", "w"):
-            pass
+        if "req" not in test_type:
+            if not generated_tests or not all(
+                is_valid_test_file(test_path) for test_path in generated_tests
+            ):
+                atomic_write_text(
+                    f"{test_dir}/generation_error.log",
+                    "No valid test files were generated.\n",
+                )
+                return generated_tests
+            atomic_write_text(f"{test_dir}/.generated", "")
+            if on_test_generated is not None:
+                for test_file_path in generated_tests:
+                    on_test_generated(test_file_path)
+        else:
+            if not generated_tests or not all(
+                is_valid_test_file(test_path) for test_path in generated_tests
+            ):
+                atomic_write_text(
+                    f"{test_dir}/generation_error.log",
+                    "No valid test files were generated.\n",
+                )
+                return generated_tests
+            atomic_write_text(f"{test_dir}/.generated", "")
+        return generated_tests
 
     def only_gen_include(self, parent_test_dir: str) -> None:
         if self.__focal_cxt is None:
@@ -497,7 +646,13 @@ class SourceFile:
                 function.load_focal_cxt(cxt_data)
                 function.set_test_cxt(test_cxt)
 
-    def gen_unit_test(self, test_type: str, parent_test_dir: str) -> None:
+    def gen_unit_test(
+        self,
+        test_type: str,
+        parent_test_dir: str,
+        on_test_generated: Callable[[str, "SourceFile", Function, str], None]
+        | None = None,
+    ) -> None:
         test_dir = f"{parent_test_dir}/{self.__name}"
         os.makedirs(test_dir, exist_ok=True)
         # print(f"  Generating unit tests for {self.__name} ...")
@@ -509,8 +664,26 @@ class SourceFile:
                 and function.cond_chain_num() > MIN_CHAIN_NUM
                 and function.min_cover_num() <= MAX_MIN_COVER
             ):
-                function.gen_unit_test(test_type, test_dir)
+                callback = None
+                if on_test_generated is not None:
+                    callback = lambda test_path, func=function: on_test_generated(
+                        test_type, self, func, test_path
+                    )
+                function.gen_unit_test(test_type, test_dir, callback)
                 # function.only_gen_include(test_dir)
+
+    def ensure_test_includes(self, parent_test_dir: str) -> None:
+        test_dir = f"{parent_test_dir}/{self.__name}"
+        if not os.path.isdir(test_dir):
+            return
+        for function in self.__functions.values():
+            function_dir = f"{test_dir}/{format_sig(function.get_sig())}"
+            if not os.path.isdir(function_dir):
+                continue
+            try:
+                function.ensure_include_file(test_dir)
+            except Exception as exc:
+                log_include_failure(function_dir, exc)
 
     def write_cmake_file(self, test_type: str, parent_test_dir: str) -> bool:
         test_dir = f"{parent_test_dir}/{self.__name}"
@@ -660,12 +833,17 @@ class Project:
             source_files = self.__get_source_files()
             comment_out(source_files, ["main", "test", "tests"])
 
-    def gen_unit_test(self, test_type) -> None:
+    def gen_unit_test(
+        self,
+        test_type: str,
+        on_test_generated: Callable[[str, SourceFile, Function, str], None]
+        | None = None,
+    ) -> None:
         test_dir = f"{self.__project_path}/llm_tests{test_type}"
         os.makedirs(test_dir, exist_ok=True)
         print(f"Generating unit tests for llm_tests{test_type} ...")
         for source_file in self.__source_files:
-            source_file.gen_unit_test(test_type, test_dir)
+            source_file.gen_unit_test(test_type, test_dir, on_test_generated)
 
     def run_gen_ut_workers(
         self, function: Function, test_type: str, parent_test_dir: str
@@ -720,7 +898,12 @@ class Project:
         do_compile: bool = True,
         do_test: bool = True,
         do_export: bool = False,
+        kept_only: bool = False,
     ) -> None:
+        for test_type in test_types:
+            test_dir = f"{self.__project_path}/llm_tests{test_type}"
+            for source_file in self.__source_files:
+                source_file.ensure_test_includes(test_dir)
         self.__expts = [
             Expt(test_type, self.__project_path) for test_type in test_types
         ]
@@ -734,7 +917,9 @@ class Project:
                 expt.gen_compile_result_concurrent(self.__build_path)
                 expt.dump_manifest()
             if do_test:
-                expt.gen_covtest_result(self.__project_path, self.__build_path)
+                expt.gen_covtest_result(
+                    self.__project_path, self.__build_path, kept_only
+                )
                 expt.dump_manifest()
             if do_export:
                 expt.export_filtered_tests()

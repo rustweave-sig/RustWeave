@@ -1,17 +1,16 @@
 #! /usr/bin/python3
 
 import argparse
+import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from expt import classify_failure, get_deps_set, safe_target_name
+from case_runner import SingleTestSession
 from prompt import (
     RUSTASSISTANT_INSTRUCTIONS_AND_EXAMPLES_FOR_FORMATTING_THE_CHANGELOG_OUTPUT,
     TEST_REPAIR_PROMPT,
@@ -21,7 +20,7 @@ from rust_assistant import (
     get_fixes_from_LLM,
     llm_return_content_parser,
 )
-from utils import clear_directory, cmake_config, is_header, run_command
+from utils import atomic_write_json
 
 
 DEFAULT_TEST_TYPES = ["", "_cxt", "_req", "_req_cxt"]
@@ -204,104 +203,20 @@ def validate_candidate(
     return True, ""
 
 
-def get_relative_source_and_deps(
-    project: str, base_dir: str, record: dict[str, Any]
-) -> tuple[str, list[str]]:
-    source_path = record.get("source_path", "")
-    rela_path = ""
-    if source_path and not is_header(source_path) and record.get("decl_in_header"):
-        rela_path = os.path.relpath(source_path, base_dir)
-    deps_set = set()
-    deps_file_path = f"{project}/project_info/deps_dict.json"
-    if source_path and os.path.exists(deps_file_path):
-        with open(deps_file_path, "r") as deps_file:
-            deps_dict = json.load(deps_file)
-            deps_set = get_deps_set(source_path, deps_dict)
-    deps_list = [os.path.relpath(dep, base_dir) for dep in deps_set]
-    return rela_path, deps_list
-
-
 def verify_candidate(
     project: str,
     build: str,
     record: dict[str, Any],
     attempt_id: str,
     timeout: int,
+    session: SingleTestSession | None = None,
 ) -> tuple[bool, str, str]:
-    llm_cov_dir = f"{project}/llm_coverage"
-    clear_directory(llm_cov_dir)
-    os.makedirs(llm_cov_dir, exist_ok=True)
-    test_path = record["test_path"]
-    test_file_name = Path(test_path).name
-    target_name = safe_target_name("repair_test", f"{test_path}:{attempt_id}")
-    log_path = f"{record['function_dir']}/test_repair_{Path(test_file_name).stem}_{attempt_id}.log"
-    include_path = f"{record['function_dir']}/include.h"
-    shutil.copy(include_path, f"{llm_cov_dir}/include.h")
-    shutil.copy(test_path, f"{llm_cov_dir}/{test_file_name}")
-    rela_path, deps_list = get_relative_source_and_deps(project, llm_cov_dir, record)
-    deps = " ".join(deps_list)
-    with open(f"{llm_cov_dir}/CMakeLists.txt", "w") as cmake_file:
-        cmake_file.write(
-            f"add_executable({target_name} {test_file_name} {rela_path} {deps})\n"
+    if session is None:
+        session = SingleTestSession(
+            project, build, record, timeout, log_prefix="test_repair"
         )
-        cmake_file.write(f"target_link_libraries({target_name} gmock_main)\n")
-    try:
-        clear_directory(build, exclude_dirs=["_deps"])
-        cmake_config(project, build)
-    except Exception as exc:
-        write_text(log_path, f"CMake configure failed:\n{exc}\n")
-        return False, log_path, "build_failure"
-
-    build_cmd = ["cmake", "--build", build, "--target", target_name]
-    build_result = run_command(build_cmd)
-    if build_result.returncode != 0:
-        write_text(
-            log_path,
-            f"Build command: {' '.join(build_cmd)}\n"
-            f"Return code: {build_result.returncode}\n\n"
-            f"STDOUT:\n{build_result.stdout}\n\nSTDERR:\n{build_result.stderr}\n",
-        )
-        return False, log_path, "build_failure"
-
-    exe_path = f"{build}/llm_coverage/{target_name}"
-    if os.name == "nt":
-        exe_path += ".exe"
-    run_cmd = [
-        exe_path,
-        f"--gtest_output=xml:{record['function_dir']}/test_repair_{Path(test_file_name).stem}_{attempt_id}.xml",
-    ]
-    try:
-        run_result = subprocess.run(
-            run_cmd,
-            cwd=build,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="backslashreplace",
-            timeout=timeout,
-        )
-        output = f"{run_result.stdout}{run_result.stderr}"
-        write_text(
-            log_path,
-            f"Build command: {' '.join(build_cmd)}\n"
-            f"Run command: {' '.join(run_cmd)}\n"
-            f"Return code: {run_result.returncode}\n\n"
-            f"STDOUT:\n{run_result.stdout}\n\nSTDERR:\n{run_result.stderr}\n",
-        )
-        if run_result.returncode == 0:
-            return True, log_path, ""
-        return False, log_path, classify_failure(output, run_result.returncode)
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        write_text(
-            log_path,
-            f"Build command: {' '.join(build_cmd)}\n"
-            f"Run command: {' '.join(run_cmd)}\n"
-            f"Timed out after {timeout} seconds.\n\n"
-            f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n",
-        )
-        return False, log_path, "timeout_failure"
+    result = session.verify(attempt_id)
+    return result.passed, result.log_path, result.failure_type
 
 
 def apply_llm_candidate(
@@ -341,8 +256,15 @@ def recompute_summary(manifest: dict[str, Any]) -> None:
         "timeout": 0,
         "kept": 0,
         "exported": 0,
+        "filtered": 0,
+        "interrupted": 0,
     }
     for record in manifest.get("tests", []):
+        test_path = record.get("test_path", "")
+        if test_path and Path(test_path).is_file():
+            record["content_hash"] = hashlib.sha256(
+                Path(test_path).read_bytes()
+            ).hexdigest()
         if record.get("compile") == "pass":
             summary["compile_pass"] += 1
         elif record.get("compile") == "fail":
@@ -357,14 +279,17 @@ def recompute_summary(manifest: dict[str, Any]) -> None:
             summary["kept"] += 1
         if record.get("exported"):
             summary["exported"] += 1
+        if record.get("workflow_status") == "filtered":
+            summary["filtered"] += 1
+        elif record.get("workflow_status") == "interrupted":
+            summary["interrupted"] += 1
     manifest["summary"] = summary
 
 
 def dump_manifest(manifest_path: str, manifest: dict[str, Any]) -> None:
     recompute_summary(manifest)
     manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    with open(manifest_path, "w") as manifest_file:
-        json.dump(manifest, manifest_file, indent=2)
+    atomic_write_json(manifest_path, manifest)
 
 
 def repair_record(
@@ -374,18 +299,47 @@ def repair_record(
     choices: int,
     max_rounds: int,
     timeout: int,
+    session: SingleTestSession | None = None,
+    start_round: int = 1,
 ) -> bool:
     test_path = record["test_path"]
     if not os.path.exists(test_path):
         record["repair_status"] = "skipped_missing_file"
         return False
+    include_path = f"{record['function_dir']}/include.h"
+    if not os.path.isfile(include_path):
+        record["repair_status"] = "skipped_missing_include"
+        record["compile"] = "fail"
+        record["coverage_build"] = "fail"
+        record["run"] = "not_run"
+        record["failure_type"] = "missing_include"
+        record["kept"] = False
+        record["exported"] = False
+        record["run_log"] = ""
+        record["repair_log"] = f"Required generated header is missing: {include_path}"
+        record["compile_log"] = record["repair_log"]
+        record["workflow_status"] = "filtered"
+        record["terminal_reason"] = "missing_include"
+        return False
     original_content = read_text(test_path)
     original_failure_type = record.get("failure_type", "unknown_failure")
-    previous_result = ""
+    if session is None:
+        session = SingleTestSession(
+            project, build, record, timeout, log_prefix="test_repair"
+        )
     last_repair_log = record.get("repair_log", "")
+    previous_result = ""
+    if start_round > 1 and last_repair_log:
+        if os.path.isfile(last_repair_log):
+            previous_detail = truncate_text(read_text(last_repair_log), 6000)
+        else:
+            previous_detail = str(last_repair_log)
+        previous_result = (
+            f"Previous repair attempt log: {last_repair_log}.\n{previous_detail}"
+        )
     last_failure_type = original_failure_type
     changelog_format = RUSTASSISTANT_INSTRUCTIONS_AND_EXAMPLES_FOR_FORMATTING_THE_CHANGELOG_OUTPUT
-    for round_index in range(1, max_rounds + 1):
+    for round_index in range(start_round, start_round + max_rounds):
         record["repair_rounds"] = round_index
         prompt = build_prompt(record, previous_result, changelog_format)
         try:
@@ -411,7 +365,7 @@ def repair_record(
             failure_type = "repair_error"
             try:
                 passed, log_path, failure_type = verify_candidate(
-                    project, build, record, attempt_id, timeout
+                    project, build, record, attempt_id, timeout, session
                 )
             except Exception:
                 log_path = (
@@ -435,6 +389,8 @@ def repair_record(
                 record["run_log"] = log_path
                 record["repair_log"] = log_path
                 record["repair_status"] = "repaired"
+                record["workflow_status"] = "passed"
+                record["terminal_reason"] = ""
                 record.pop("repair_failure_type", None)
                 return True
             last_repair_log = log_path
@@ -451,6 +407,12 @@ def repair_record(
     write_text(test_path, original_content)
     if record.get("repair_status") != "llm_error":
         record["repair_status"] = "failed"
+    record["workflow_status"] = "interrupted"
+    record["terminal_reason"] = (
+        "llm_error"
+        if record.get("repair_status") == "llm_error"
+        else record.get("repair_failure_type", "test_repair_failed")
+    )
     record["kept"] = False
     return False
 

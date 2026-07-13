@@ -25,7 +25,7 @@ PALM 的整体思路是把程序分析结果纳入 Prompt 构建过程：先用 
 1. 测试需求提取：`brinfo` 基于 Clang AST 构建被测函数 CFG，遍历分支和循环路径，提取路径条件链、返回值和 Mock 需求，输出 `llm_reqs/*_req.json`。
 2. 上下文构建：`focxt` 分析项目中的类型、函数、宏、include、全局变量、构造函数、方法和调用依赖，输出 `project_cxt.json`。
 3. Prompt 设计与生成：`utgen` 读取条件链和上下文，将其填充到 Prompt 模板中，形成无需求、上下文增强、需求增强、需求+上下文增强四类生成配置。
-4. 单元测试生成、筛选与修复：`utgen` 调用 LLM 生成 GoogleTest 测试文件，写入 `llm_tests*` 目录，生成 CMake 目标，编译、运行、统计覆盖率；后处理阶段会记录 `filter_manifest.json`，只保留编译和运行均通过的测试进入覆盖率和 `filtered_tests*` 导出；可选地用 `compile_repair.py` 修复编译错误，用 `test_repair.py` 修复运行失败测试。
+4. 单元测试生成、筛选与修复：`utgen` 每生成一个 GoogleTest 文件，就立即为该文件建立独立目标并执行编译、编译修复、运行和测试修复；单测试默认最多共享 10 轮修复，每轮最多一次逻辑 LLM 请求。状态逐轮写入 `filter_manifest.json`，最终只保留编译和运行均通过且实际执行了测试的文件统计覆盖率并导出到 `filtered_tests*`。
 
 ```mermaid
 flowchart LR
@@ -41,14 +41,18 @@ flowchart LR
     I --> J
     G --> J
     J --> K["LLM 生成 GoogleTest"]
-    K --> L["llm_tests / llm_tests_cxt / llm_tests_req / llm_tests_req_cxt"]
-    L --> M["CMake 编译筛选"]
-    M --> N["运行筛选: run_pass/run_fail"]
-    M --> O["LLM 编译错误修复"]
+    K --> L["写入单个 test_*.cpp"]
+    L --> M["单用例 CMake 编译与链接"]
+    M -->|"通过"| N["立即运行当前测试"]
+    M -->|"失败"| O["LLM 编译错误修复一轮（一次请求）"]
     O --> M
-    N --> Q["LLM 测试失败修复"]
-    Q --> N
-    N --> R["仅 run_pass 覆盖率"]
+    N -->|"失败"| Q["LLM 测试失败修复一轮（一次请求）"]
+    Q --> M
+    N -->|"通过"| T["kept=true"]
+    M -->|"达到上限"| U["kept=false"]
+    N -->|"达到上限"| U
+    T --> R["仅 kept=true 覆盖率"]
+    U --> R
     R --> P["result*.csv + filter_manifest.json"]
     P --> S["filtered_tests*"]
 ```
@@ -186,7 +190,7 @@ TEST(SomeClassTest, bool_SomeClass_find_int_int_001)
 
 ![编译错误修复流程](assets/palm-cpp-fix-flow.png)
 
-项目中有两套编译修复相关实现：
+项目中有两类底层编译修复实现和一个面向当前流程的命令行入口：
 
 - `chattester.py`：借鉴 ChatTester 思路，先让模型推断函数意图并生成基础测试，再用编译错误中的 `<Buggy Line>` 迭代生成完整修复版测试文件。
 - `rust_assistant.py`：名称是历史遗留，实际用于 C/C++ GoogleTest 编译错误修复。它读取编译器 JSON 错误、抽取相关源码片段，要求模型返回 `ChangeLog`，再验证并应用修改。
@@ -202,7 +206,7 @@ add_compile_options(-fdiagnostics-format=json-file)
 
 ### 3.7 运行失败修复
 
-`test_repair.py` 用于修复已经通过编译但运行失败的生成测试。它读取 `llm_tests*/filter_manifest.json` 中 `compile=pass` 且 `run=fail` 或 `run=timeout` 的记录，为每个失败测试构造一个诊断式 Prompt，输入包括：
+`test_repair.py` 用于修复已经通过编译但运行失败的生成测试。默认在线流程直接调用其中的单轮修复接口；独立运行该脚本时，它读取 `llm_tests*/filter_manifest.json` 中 `compile=pass` 且 `run=fail` 或 `run=timeout` 的记录，为每个失败测试构造一个诊断式 Prompt，输入包括：
 
 - GoogleTest/运行失败日志。
 - 当前可编辑的 `test_*.cpp`，带行号。
@@ -231,6 +235,8 @@ Prompt 明确要求模型只修改当前 `test_*.cpp`，并禁止删除 `TEST`�
 | `utgen/condchain.py` | 将 `brinfo` JSON 条件链和 Mock 需求转成 Prompt 文本。 |
 | `utgen/context.py` | 将 `focxt` JSON 上下文转成 C/C++ 上下文片段。 |
 | `utgen/expt.py` | 编译通过率、运行通过率、行覆盖率、分支覆盖率统计。 |
+| `utgen/case_runner.py` | 单测试增量构建会话；为当前测试生成稳定 CMake 目标，并提供构建、运行和日志结果。 |
+| `utgen/case_workflow.py` | 逐用例编译/运行/修复状态机、总轮数控制、原子 manifest 和断点续跑。 |
 | `utgen/chattester.py` | ChatTester 风格基线和简单编译修复流程。 |
 | `utgen/rust_assistant.py` | 基于编译器 JSON 错误和 ChangeLog 的编译修复助手。 |
 | `utgen/compile_repair.py` | 编译修复命令行入口，封装历史 `rust_assistant.py` 能力。 |
@@ -425,10 +431,10 @@ Python 层的 `utils.collect_includes` 会在 `Project.__get_source_files` 中�
 `utgen/main.py` 支持：
 
 ```text
-python main.py -p <project-path> -b <build-path> [--no-analysis] [--post-analysis] [--compile-only] [--test-only] [--export-only] [-s <source>] [-c <class>] [-f <function>]
+python main.py -p <project-path> -b <build-path> [--no-analysis] [--post-analysis] [--compile-only] [--test-only] [--export-only] [--batch-workflow] [--max-repair-rounds N] [--repair-choices N] [--test-timeout N] [-s <source>] [-c <class>] [-f <function>]
 ```
 
-当前项目级主流程实际使用的是 `-p`、`-b`、`--no-analysis`、`--post-analysis`、`--compile-only`、`--test-only` 和 `--export-only`。`-s/-c/-f` 会进入参数对象，但当前 `main.py` 没有基于它们切换单文件或单函数流程；单函数分析应直接调用底层 `brinfo` 和 `focxt`。
+默认启用逐用例在线流程。`--max-repair-rounds` 设置编译修复和测试修复共享的总轮数，默认 10；`--repair-choices` 设置每轮候选数，默认 3；`--test-timeout` 设置单测试运行超时，默认 600 秒。`--batch-workflow` 可回退到历史的全部生成后统一检查流程。`-s/-c/-f` 会进入参数对象，但当前 `main.py` 没有基于它们切换单文件或单函数流程；单函数分析应直接调用底层 `brinfo` 和 `focxt`。
 
 主流程中的四类测试类型固定为：
 
@@ -441,11 +447,12 @@ test_types = ["", "_cxt", "_req", "_req_cxt"]
 1. `project.prepare(test_types, just_load=False)`
 2. 如未指定 `--no-analysis`，执行 `project.analyze()`
 3. `project.init_data()`
-4. 对四类测试类型分别 `gen_unit_test_concurrent`
-5. 对四类测试类型分别 `write_cmake_file`
-6. `project.post_analysis(test_types)`
+4. 对四类测试类型分别串行生成函数测试；每写出一个 `test_*.cpp`，立即调用 `CaseWorkflow.process_generated_test`
+5. 单测试执行“构建、编译修复、运行、测试修复”，达到通过状态或总轮数上限后才继续下一个测试
+6. 对四类测试类型分别 `write_cmake_file`
+7. 以 `kept_only=True` 执行最终复验、覆盖率统计和 `filtered_tests*` 自动导出
 
-指定 `--post-analysis` 时，只加载已有产物并重新统计结果，不重新分析和生成测试。指定 `--compile-only`、`--test-only` 或 `--export-only` 时，会自动进入 post-analysis 模式，只执行对应阶段。
+指定 `--post-analysis` 时，只加载已有产物并重新统计结果，不重新分析和生成测试。指定 `--compile-only`、`--test-only` 或 `--export-only` 时，会自动进入 post-analysis 模式，只执行对应阶段。指定 `--batch-workflow` 时使用原有的 `gen_unit_test_concurrent` 和全量 post-analysis。
 
 ### 8.2 项目准备
 
@@ -480,6 +487,11 @@ test_types = ["", "_cxt", "_req", "_req_cxt"]
 - 如果路径需求中包含 Mock，则加入 `TEST_CXT` 中的 gMock 示例。
 - LLM 返回结果会去掉 Markdown 代码块标记。
 - 使用 libclang 解析返回代码，提取 `TEST` 函数并拆分为单独文件。
+- `*_req*` 模式会先保存本轮两个原始响应，再逐个处理对应测试；两个测试检查完成后才发起下一条条件链请求。
+- 非 `req` 模式会先完整拆分一次响应、写入 `.generated`，再逐个检查拆分后的测试。
+- LLM 响应和拆分测试通过临时文件加 `os.replace` 原子写入；重启时会复用有效缓存，空文件、截断文件或只有注释而没有测试宏的文件会重新生成。
+- `.generated` 只在至少产生一个有效 `test_*.cpp` 后创建；已有有效测试不会被覆盖，从而保留已经完成的修复。
+- `.generated` 存在但 `include.h` 缺失时，只补建头文件，不重新调用 LLM；补建异常会记录后继续处理后续测试。
 
 每个函数目录下会生成：
 
@@ -487,13 +499,200 @@ test_types = ["", "_cxt", "_req", "_req_cxt"]
 | --- | --- |
 | `include.h` | 通用测试头，包含 gtest/gmock、`#define private public`、`#define protected public`、依赖 include 和命名空间。 |
 | `prompt/` | 每条条件链或无需求配置对应的 Prompt 文本。 |
+| `prompt/*_response_*.txt` | 为中断恢复保存的原始 LLM 响应。 |
 | `origin.cpp` | 无需求模式下模型原始返回内容。 |
 | `test_*.cpp` | 拆分后的单个测试文件。 |
 | `CMakeLists.txt` | 该函数对应的测试目标。 |
-| `.generated` | 已生成标记，避免重复请求 LLM。 |
+| `.generated` | 有效测试已完整生成的标记，避免重复请求 LLM。 |
 | `.notest` | 没有有效测试时的标记。 |
 
-### 8.5 CMake 目标生成
+### 8.5 单元测试用例格式规范
+
+本节描述 `utgen` 生成、检查、修复和最终导出的 C/C++ 单元测试文件格式。这里的“测试用例”是一个可独立编译和运行的 GoogleTest 源文件；即使被测文件是 `.c`，生成测试也统一使用 `.cpp`，以便使用 GoogleTest/GoogleMock。正常情况下，每个 `test_*.cpp` 只承载一个主要 `TEST` 测试函数，所需的局部辅助类型或 Mock 可以和该测试放在同一文件中。
+
+#### 8.5.1 保存目录和文件命名
+
+生成测试保存在 `-p/--project` 指定的目标项目中，而不是 `cpp-utgen` 仓库中。目录结构如下：
+
+```text
+<project>/
+├── llm_tests<type>/
+│   └── <source-file>/
+│       └── <formatted-function-signature>/
+│           ├── include.h
+│           ├── test_*.cpp
+│           ├── CMakeLists.txt
+│           └── prompt/
+└── filtered_tests<type>/
+    └── <source-file>/
+        └── <formatted-function-signature>/
+            ├── include.h
+            ├── test_*.cpp
+            └── CMakeLists.txt
+```
+
+其中 `<type>` 可以为空、`_cxt`、`_req` 或 `_req_cxt`。`llm_tests*` 保存原始生成文件、修复结果和失败记录；`filtered_tests*` 只保存最终满足保留条件的测试，是后续集成和 C2Rust 流程应优先使用的目录。
+
+测试文件命名规则如下：
+
+| 生成模式 | 文件名示例 | 含义 |
+| --- | --- | --- |
+| 非 `req` | `test_001.cpp` | 模型一次返回多个测试，按拆分顺序使用三位编号。 |
+| `req` | `test_001_1.cpp`、`test_001_2.cpp` | 第一段数字是条件链编号，第二段数字是同一条件链的候选编号。 |
+
+源文件目录保留源文件名；函数目录由 `format_sig()` 把函数签名中的空格、指针、引用和标点转换为可用于路径的形式。文件路径同时也是 manifest 中识别测试状态的主键，因此不建议在流程运行期间手工重命名 `test_*.cpp`。
+
+#### 8.5.2 文件组成
+
+标准生成文件按以下顺序组成：
+
+1. `#include "include.h"`：必需，由生成器统一加入。
+2. 条件链需求注释：仅 `*_req*` 模式存在，记录输入、前置条件和预期结果。
+3. 可选辅助代码：仅在确有需要时定义局部 Mock、测试数据或辅助构造逻辑。
+4. `TEST(TestSuiteName, TestName)`：必需，包含准备、调用被测函数和结果检查。
+
+通用模板如下：
+
+```cpp
+#include "include.h"
+
+/*
+// Input parameter: describe the selected input values.
+// Precondition: describe the path condition covered by this test.
+// Expected result: describe the observable expected behavior.
+*/
+
+TEST(TestSuiteName, TestName) {
+    // Arrange: construct valid inputs, state, and mocks.
+
+    // Act: call the focal function.
+
+    // Assert: check the returned value, state change, or interaction.
+}
+```
+
+`include.h` 由工具维护，通常包含：
+
+```cpp
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#define private public
+#define protected public
+
+// Headers required by the focal function.
+// The focal declaration header.
+// Generated using-namespace declarations when needed.
+```
+
+因此 `test_*.cpp` 通常不需要再次包含 GoogleTest、GoogleMock 或被测头文件，也不应自行定义 `main`。测试目标统一链接 `gmock_main`；需要参与链接的生产 `.c/.cpp` 和依赖源文件由生成的 CMake 目标加入，不应在测试文件中直接 `#include` 实现文件。运行失败修复只允许修改当前 `test_*.cpp`，不会修改 `include.h` 或生产代码。
+
+#### 8.5.3 测试名称和测试体要求
+
+`*_req*` 模式会在 Prompt 中提供形如 `TEST(<ClassName>Test, <formatted-signature>_001)` 的签名，模型和后续修复应保留该签名。非 `req` 模式由模型生成名称，但名称必须是合法的 GoogleTest/C++ 标识符。当前主生成和拆分流程以 `TEST` 作为标准输出形式。
+
+测试体应满足以下要求：
+
+- 至少实际调用一次被测函数或方法，不能只构造对象或验证常量。
+- 输入、对象状态和依赖应满足目标路径的前置条件；指针、数组长度、生命周期和所有权必须有效。
+- 至少检查一个有意义的可观察结果，例如返回值、输出参数、对象状态、异常类型或 Mock 交互。
+- 断言应来源于需求、被测函数语义或运行输出，不能为了通过而改成恒真表达式。
+- 仅在条件链或被测函数依赖确实需要时使用 Mock，并明确返回值、参数匹配和调用次数。
+- 异常路径应使用 `EXPECT_THROW`、`ASSERT_THROW`、`EXPECT_NO_THROW` 等显式检查，不能捕获后忽略异常。
+- 测试必须可重复，不应引入随机数、网络请求、外部服务、无界等待或依赖执行顺序的共享状态。
+- 不得使用 `GTEST_SKIP`、`DISABLED_` 测试名、空测试体、仅含恒真断言的测试，或通过删除被测调用来规避失败。
+
+#### 8.5.4 普通 C/C++ 函数示例
+
+假设 `include.h` 已经包含下面被测函数的声明：
+
+```cpp
+int clamp_value(int value, int low, int high);
+```
+
+覆盖 `value < low` 路径的完整生成测试可以写成：
+
+```cpp
+#include "include.h"
+
+/*
+// Input parameter: value is -2, low is 0, high is 10.
+// Precondition: value < low is true.
+// Expected result: return low.
+*/
+
+TEST(ClampValueTest, int_clamp_value_int_int_int_001) {
+    const int value = -2;
+    const int low = 0;
+    const int high = 10;
+
+    const int actual = clamp_value(value, low, high);
+
+    EXPECT_EQ(actual, low);
+}
+```
+
+这个示例体现了标准的“准备输入、调用被测函数、检查结果”结构。需求注释用于追踪测试对应的条件链，不参与编译，也不能替代测试体中的真实断言。
+
+#### 8.5.5 Mock 示例
+
+假设生产代码定义了 `Reader` 接口和 `run_with_reader(Reader&)`，并且目标路径要求 `Read()` 返回 `7`：
+
+```cpp
+#include "include.h"
+
+class MockReader : public Reader {
+public:
+    MOCK_METHOD(int, Read, (), (override));
+};
+
+TEST(RunWithReaderTest, ReturnsReaderValue) {
+    MockReader reader;
+    EXPECT_CALL(reader, Read())
+        .Times(1)
+        .WillOnce(::testing::Return(7));
+
+    const int actual = run_with_reader(reader);
+
+    EXPECT_EQ(actual, 7);
+}
+```
+
+Mock 测试除了检查返回值，还应通过 `EXPECT_CALL` 描述关键交互。若需求中没有 Mock 条件，应优先使用真实对象和直接输入，避免无必要地重建生产类型或模拟自由函数。
+
+#### 8.5.6 异常路径示例
+
+对于约定在空输入时抛出 `std::invalid_argument` 的函数，可使用：
+
+```cpp
+#include "include.h"
+#include <stdexcept>
+
+TEST(ParseValueTest, RejectsNullInput) {
+    EXPECT_THROW(
+        parse_value(nullptr),
+        std::invalid_argument
+    );
+}
+```
+
+若被测函数本应正常返回，则使用 `EXPECT_NO_THROW` 并继续检查返回值或状态。测试修复不能通过 `catch (...) {}`、信号处理器或跳过测试来掩盖异常、崩溃和超时。
+
+#### 8.5.7 有效性和最终保留条件
+
+生成文件存在并不代表它会进入最终结果。默认在线流程以单个 `test_*.cpp` 为单位执行构建、修复和运行；最终保留测试需要同时满足：
+
+1. `include.h` 存在，且测试能够完成 CMake 配置和目标构建。
+2. `compile=pass`，没有未修复的编译或链接错误。
+3. 测试进程在超时前正常结束，`run=pass`。
+4. 本轮 GoogleTest XML 至少包含一个非禁用、非跳过且已完成的测试。
+5. `kept=true`，最终复验仍然通过。
+6. 测试文件当前 SHA-256 与 manifest 中的 `content_hash` 一致。
+
+常见的不保留原因包括：缺少 `include.h`、没有可执行测试、编译或链接失败、断言失败、Mock 期望失败、未按预期抛出异常、崩溃、超时，以及修复轮数耗尽。失败文件不会从 `llm_tests*` 删除，而是记录为 `kept=false`；只有保留测试会复制到 `filtered_tests*`。
+
+人工修改 `llm_tests*` 中的测试会使旧哈希状态失效，应重新执行编译和测试检查后再导出。`filtered_tests*` 是可重新生成的筛选结果，不应作为人工修改的唯一副本。
+
+### 8.6 CMake 目标生成
 
 `Function.write_cmake_file` 会为每个函数目录写入 CMake 目标：
 
@@ -506,7 +705,7 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 
 如果被测函数声明在头文件中，但需要链接对应 `.cpp` 定义文件，代码会根据情况追加相对源文件路径。外层源文件目录和测试类型目录也会写入 `add_subdirectory`。
 
-### 8.6 编译、运行和覆盖率统计
+### 8.7 编译、运行和覆盖率统计
 
 `expt.py` 负责统计：
 
@@ -520,16 +719,28 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 - 行覆盖数和行覆盖率。
 - 分支数、分支覆盖数和分支覆盖率。
 
-统计流程：
+默认在线统计流程：
 
-1. `Expt.init` 扫描 `llm_tests*` 目录，建立文件和函数数据。
-2. `gen_compile_result_concurrent` 从 `compile_commands.json` 中找测试文件的编译命令，并逐个编译测试文件。
-3. `dump_manifest` 将每个测试的 `compile`、`run`、`kept`、日志路径和修复状态写入 `llm_tests*/filter_manifest.json`。
-4. `gen_covtest_result` 把可编译测试复制到 `llm_coverage`，为每个测试文件生成单独 `add_executable`，逐个构建并运行。
-5. 只有 `compile=pass` 且 `run=pass` 的测试会被标记为 `kept=true`，并进入最终 coverage CMake。
-6. `load_coverage` 解析 SonarQube XML 中的行和分支覆盖率。
-7. `dump_to_csv` 输出 `result*.csv`。
-8. `export_filtered_tests` 可将 `kept=true` 的测试复制到 `filtered_tests*`，并在导出的 CMake 目标中带上被测源文件及其依赖源文件。
+1. `CaseWorkflow` 为当前测试创建或恢复 manifest 记录，并用 `SingleTestSession` 配置稳定的单测试目标。
+2. 首次构建不计入修复轮数；失败后调用现有编译修复能力。在线编译修复每轮只处理一个错误、只发起一次逻辑 LLM 请求，`--repair-choices` 控制该请求返回的候选数量。
+3. 测试对象编译成功但完整目标失败时，链接错误直接终止为 `link_failure_no_progress`；缺少测试编译命令、被测源文件或依赖编译失败则记为基础设施错误并等待重试，不消耗修复轮数，也不会错误过滤测试。
+4. 构建通过后立即运行；断言、Mock、异常、崩溃、超时或零有效测试失败会进入测试修复，每个候选重新经过完整构建和运行。运行前会删除旧 XML；进程返回 0 但本次 GoogleTest XML 缺失、损坏，或不包含至少一个非禁用、非跳过且已完成的测试时，都不会标记为通过。批处理与手动 `--test-only` 使用同一判定规则。
+5. 编译修复和测试修复共享 `repair_rounds`，默认总上限为 10；每轮最多一次逻辑 LLM 请求。通过时设置 `workflow_status=passed` 和 `kept=true`，耗尽上限时设置 `workflow_status=filtered` 和 `kept=false`。
+6. 每个状态变化都以临时文件加 `os.replace` 的方式原子写入 `filter_manifest.json`；最终后分析、编译修复和测试修复脚本使用同一原子写入实现，不会以普通覆盖写破坏可恢复清单。
+7. 全部测试完成后，`gen_covtest_result(..., kept_only=True)` 只复验 `kept=true` 测试；最终复验失败的测试会降级为 `filtered`。
+8. `load_coverage` 解析 SonarQube XML，`dump_to_csv` 输出 `result*.csv`，`export_filtered_tests` 自动生成 `filtered_tests*`。
+
+手动 `--compile-only`、`--test-only` 和独立修复脚本仍保留原有批处理用途。
+
+`filter_manifest.json` 在原字段基础上增加：
+
+| 字段 | 说明 |
+| --- | --- |
+| `workflow_status` | `pending`、`checking`、`passed`、`filtered` 或 `interrupted`。 |
+| `repair_rounds` | 当前测试已消耗的编译/运行共享修复轮数；每轮最多一次逻辑 LLM 请求。 |
+| `repair_stage` | 当前修复阶段，取 `compile`、`test` 或空字符串。 |
+| `terminal_reason` | `max_repair_rounds`、`missing_include`、`final_run_failure` 等终态原因。 |
+| `content_hash` | 测试文件 SHA-256；hash 缺失或人工修改后会重置旧终态并重新检查，不能直接通过 `--export-only` 导出。 |
 
 输出 CSV 包含：
 
@@ -549,7 +760,7 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 | `lines` / `lines_covered` / `line_cov` | 行覆盖统计。 |
 | `branches` / `branches_covered` / `branch_cov` | 分支覆盖统计。 |
 
-### 8.7 依赖关系预处理
+### 8.8 依赖关系预处理
 
 `decldef.py` 用于构建源文件之间的依赖关系，帮助覆盖率阶段把头文件函数对应的实现文件一起编译。
 
@@ -606,12 +817,15 @@ llm_tests_req_cxt/
       include.h
       prompt/
         001.txt
+        001_response_1.txt
+        001_response_2.txt
         002.txt
       test_001_1.cpp
       test_001_2.cpp
       CMakeLists.txt
       .generated
       compile_err.log
+      workflow_*.log
       test_repair_*.log
       result.xml
       coverage.xml
@@ -805,10 +1019,21 @@ python main.py -p <target-project> -b <target-project>/build
 4. 调用 `focxt` 生成 `project_cxt.json`。
 5. 并发调用 `brinfo` 为每个源文件生成 `llm_reqs/*_req.json`。
 6. 加载需求和上下文。
-7. 生成四类测试。
-8. 写入 CMakeLists。
-9. 编译、运行、收集覆盖率。
-10. 输出 `result*.csv`。
+7. 生成四类测试；每生成一个测试文件就立即编译、按需修复并运行。
+8. 单测试默认最多使用 10 轮编译/运行共享修复轮数，每轮最多一次逻辑 LLM 请求；失败测试保留原文件并标记为 `kept=false`。
+9. 写入 CMakeLists，只复验 `kept=true` 测试并收集覆盖率。
+10. 输出 `result*.csv`、`filter_manifest.json` 和 `filtered_tests*`。
+
+可以调整在线流程参数：
+
+```sh
+python main.py -p <target-project> -b <target-project>/build \
+  --max-repair-rounds 10 \
+  --repair-choices 3 \
+  --test-timeout 600
+```
+
+如果需要复现历史流程，可增加 `--batch-workflow`，改为先并发生成全部测试，再统一执行 post-analysis。
 
 如果已经有 `llm_reqs/` 和 `project_cxt.json`，只想重新生成测试和统计：
 
@@ -822,7 +1047,7 @@ python main.py -p <target-project> -b <target-project>/build --no-analysis
 python main.py -p <target-project> -b <target-project>/build --post-analysis
 ```
 
-如果希望在编译、修复、运行和导出之间手动插入步骤，可以使用轻量阶段参数：
+默认流程已经自动执行修复和导出。如果处理的是旧批处理产物，或希望在阶段之间人工介入，可以使用轻量阶段参数：
 
 ```sh
 # 只做编译检查并写入 llm_tests*/filter_manifest.json
@@ -835,7 +1060,7 @@ python main.py -p <target-project> -b <target-project>/build --test-only
 python main.py -p <target-project> -b <target-project>/build --export-only
 ```
 
-`--compile-only`、`--test-only` 和 `--export-only` 会自动进入 post-analysis 模式，不会重新调用 LLM 生成测试。
+`--compile-only`、`--test-only` 和 `--export-only` 会自动进入 post-analysis 模式，不会重新调用 LLM 生成测试。加载 manifest 时会比较测试文件 SHA-256；hash 缺失或内容已变化的记录不会恢复旧 `kept=true`，应先重新执行编译和测试检查，再运行导出。
 
 ### 10.7 单独运行底层分析工具
 
@@ -884,7 +1109,7 @@ python compile_repair.py -p <target-project> -b <target-project>/build -t _req_c
 python test_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
 ```
 
-修复后建议重新运行对应阶段：
+这些独立脚本主要用于旧产物和人工补跑。修复后建议重新运行对应阶段：
 
 ```sh
 python main.py -p <target-project> -b <target-project>/build --compile-only
@@ -908,7 +1133,7 @@ Python 层使用 `clang.cindex` 解析模型返回的测试和目标源码。`LI
 
 ### 11.4 LLM 调用成本较高
 
-项目级生成会对许多函数和路径请求模型。`Function.gen_unit_test` 会通过 `.generated` 避免重复生成，但删除该文件或更换目录后会重新请求。
+项目级生成会对许多函数和路径请求模型。`Function.gen_unit_test` 会原子保存响应和测试，并通过 `.generated` 避免重复生成；无效或截断缓存不会被当作完成结果。在线修复每轮最多一次逻辑 LLM 请求，但网络层在请求异常时仍可能执行一次传输重试。
 
 ### 11.5 不是所有函数都会生成测试
 
@@ -932,6 +1157,24 @@ README 中建议加入 `-fno-exceptions` 和覆盖率配置，但某些项目依
 
 `utgen/.gitignore` 已经忽略 `config_private.py`、`*.json`、`*.xml`、`*.yaml`、`*.csv`、`*.bak` 等常见本地文件。目标项目中的 `llm_tests*`、`llm_coverage`、`project_info`、`result*.csv` 等生成产物是否提交，仍取决于目标项目自己的版本控制策略。
 
+### 11.9 `include.h` 缺失与恢复
+
+`include.h` 是函数级生成产物，测试文件、覆盖率目标和导出目录都会依赖它。当前流程采用两层保护：
+
+1. 新测试会先原子写入 `include.h`，再原子写入响应和测试；`.generated` 只在至少产生一个有效测试后写入。
+2. 加载已有目录时，如果发现 `.generated` 或测试文件存在但 `include.h` 缺失，会根据条件链和函数声明自动补建，不重新请求 LLM。补建过程抛出异常时会写入 `include_recovery.log`；日志不可写时降级输出到控制台，并继续通知工作流。
+
+覆盖率、导出、`compile_repair.py` 和 `test_repair.py` 在使用头文件前还会再次检查。无法补建时，对应记录设置为 `failure_type=missing_include`、`kept=false`，并尝试写入 `missing_include.log`；函数目录不可写时降级输出到控制台，状态更新与后续函数处理不依赖日志文件写入成功，不再因 `shutil.copy` 或日志写入异常中断整个项目。
+
+### 11.10 断点续跑
+
+在线流程每轮都会原子更新 manifest。重新运行同一命令时：
+
+- 文件内容未变化且状态为 `passed` 或 `filtered` 的测试会跳过。
+- `checking` 或 `interrupted` 测试会从已有 `repair_rounds` 继续。
+- 修改过的测试因 `content_hash` 变化会重新从初始检查开始。
+- 如果旧记录因 `max_repair_rounds` 被过滤，提高新的轮数上限后会继续使用新增轮数。
+
 ## 12. 推荐运行顺序
 
 最小完整流程如下：
@@ -951,25 +1194,9 @@ cmake -B <target-project>/build -G Ninja \
 cd /path/to/cpp-utgen/utgen
 python decldef.py -p <target-project> -b <target-project>/build
 
-# 4. 分析、生成、统计
-python main.py -p <target-project> -b <target-project>/build
-
-# 5. 编译检查并写入 manifest
-python main.py -p <target-project> -b <target-project>/build --compile-only
-
-# 6. 可选：修复编译失败测试
-python compile_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
-python main.py -p <target-project> -b <target-project>/build --compile-only
-
-# 7. 运行测试并只用通过测试统计覆盖率
-python main.py -p <target-project> -b <target-project>/build --test-only
-
-# 8. 可选：修复运行失败测试
-python test_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
-python main.py -p <target-project> -b <target-project>/build --test-only
-
-# 9. 导出最终可用 C 测试
-python main.py -p <target-project> -b <target-project>/build --export-only
+# 4. 分析、逐用例生成/检查/修复、kept-only 覆盖率和导出
+python main.py -p <target-project> -b <target-project>/build \
+  --max-repair-rounds 10 --repair-choices 3 --test-timeout 600
 ```
 
 推荐优先查看最终四个 CSV 和四类 manifest：

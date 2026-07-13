@@ -401,7 +401,13 @@ def get_origin_tests_of_function(func: Function, parent_dir: str) -> list[str]:
 
 
 def compilation_fix_assistant_for_test_file(
-    test_target: str, compile_command: tuple[list, list], test_dir: str, build_dir: str
+    test_target: str,
+    compile_command: tuple[list, list],
+    test_dir: str,
+    build_dir: str,
+    choices: int = 3,
+    max_errors: int = 2,
+    max_iterations: int = 2,
 ) -> None:
 
 
@@ -430,7 +436,7 @@ def compilation_fix_assistant_for_test_file(
     test_file_content = test_file.read().splitlines()
     compile_error_set: set[ErrorMessage] = set(compile_error_parser_from_json_file(test_target, build_dir))
 
-    initial_error_num = min(len(compile_error_set), 2)
+    initial_error_num = min(len(compile_error_set), max_errors)
     if initial_error_num == 0:
         logger.info("\033[31m No errors thrown by gcc, Needed programmers to check the script \033[0m")
         return False
@@ -444,7 +450,16 @@ def compilation_fix_assistant_for_test_file(
         i += 1
         logger.info(f"Fixing compile error of {test_target}  {i}-th time.")
         random_error = compile_error_set.pop()
-        new_error_set, new_error_content = compilation_fix_assistant_for_an_error(random_error, test_file_content, compile_error_set, test_target, compile_command, build_dir)
+        new_error_set, new_error_content = compilation_fix_assistant_for_an_error(
+            random_error,
+            test_file_content,
+            compile_error_set,
+            test_target,
+            compile_command,
+            build_dir,
+            choices,
+            max_iterations,
+        )
         if len(new_error_set) < len(compile_error_set):
             compile_error_set = new_error_set
             test_file_content = new_error_content
@@ -465,7 +480,16 @@ def compilation_fix_assistant_for_test_file(
         
 
 
-def compilation_fix_assistant_for_an_error(error: ErrorMessage, origin_file: list[str], compile_error_set: set[ErrorMessage], test_target: str, compile_command: tuple, build_dir:str):
+def compilation_fix_assistant_for_an_error(
+    error: ErrorMessage,
+    origin_file: list[str],
+    compile_error_set: set[ErrorMessage],
+    test_target: str,
+    compile_command: tuple,
+    build_dir: str,
+    choices: int = 3,
+    max_iterations: int = 2,
+):
     """
         Inner loop of fixing procedure. 
         Targetting at error which is an argument.
@@ -480,12 +504,15 @@ def compilation_fix_assistant_for_an_error(error: ErrorMessage, origin_file: lis
     min_error_set = compile_error_set
     min_error_content = origin_file
     """
-        if all errors have been fixed or the number of errors needed to be fixed exceed 10 or iterates 3 times,
-        break the loop.
+        If all errors have been fixed, the number of errors exceeds 10, or the
+        configured iteration limit is reached, break the loop.
     """
     
-    max_time_to_iterative = 2
-    while len(local_error_group) > 0 and len(local_error_group) < 10 and iterative_time < max_time_to_iterative:
+    while (
+        len(local_error_group) > 0
+        and len(local_error_group) < 10
+        and iterative_time < max_iterations
+    ):
         iterative_time += 1
         current_error = local_error_group.pop() 
         preamble_prompt = RUSTASSISTANT_PREAMBLE.format(compile_command[1])
@@ -506,7 +533,7 @@ def compilation_fix_assistant_for_an_error(error: ErrorMessage, origin_file: lis
         #     f"Final prompt of test file {test_target} for error {current_error}:\n" + final_prompt)
         # input()
         # input()
-        request_choices = get_fixes_from_LLM(final_prompt, 3)
+        request_choices = get_fixes_from_LLM(final_prompt, choices)
         for i in request_choices:
             logger.debug(f"llm return result for test file {test_target} with error {current_error}:\n" + i)
             # input()
@@ -636,5 +663,3 @@ def compile_error_parser_from_json_file(
         if "error" in message["kind"]:
             compile_error_list.append(ErrorMessage(message))
     return compile_error_list
-
-

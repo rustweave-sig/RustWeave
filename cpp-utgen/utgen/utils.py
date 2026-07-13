@@ -3,8 +3,12 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import requests as rq
 
@@ -50,6 +54,10 @@ class UtgenArgs:
     compile_only: bool
     test_only: bool
     export_only: bool
+    batch_workflow: bool
+    max_repair_rounds: int
+    repair_choices: int
+    test_timeout: int
 
 
 @dataclass
@@ -64,6 +72,54 @@ class ExptFileData:
     file_path: str
     # file_dict: {fmt_sig: ExptFuncDict}
     file_dict: dict[str, ExptFuncData]
+
+
+def atomic_write_json(file_path: str, data: Any) -> None:
+    path = Path(file_path)
+    os.makedirs(path.parent, exist_ok=True)
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            json.dump(data, temp_file, indent=2)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def write_text_best_effort(file_path: str, content: str) -> bool:
+    try:
+        path = Path(file_path)
+        os.makedirs(path.parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as output_file:
+            output_file.write(content)
+        return True
+    except OSError as exc:
+        print(f"Failed to write {file_path}: {exc}\n{content.rstrip()}")
+        return False
+
+
+def count_executed_tests(xml_path: str) -> int:
+    root = ET.parse(xml_path).getroot()
+    executed = 0
+    for test_case in root.iter("testcase"):
+        status = test_case.attrib.get("status", "run").lower()
+        result = test_case.attrib.get("result", "completed").lower()
+        if status == "notrun" or result in {"skipped", "suppressed"}:
+            continue
+        if test_case.find("skipped") is not None:
+            continue
+        executed += 1
+    return executed
 
 
 def is_test_or_build_file(file_path: str) -> bool:
