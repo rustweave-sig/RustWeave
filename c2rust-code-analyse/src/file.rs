@@ -708,9 +708,14 @@ impl File {
     fn load_from_json(json_file: &Path) -> Result<Node> {
         let content =
             fs::read_to_string(json_file).log_err(&format!("read {}", json_file.display()))?;
-        let node: Node =
-            serde_json::from_str(&content).log_err(&format!("parse {}", json_file.display()))?;
-        Ok(node)
+        Self::parse_node_json(&content, &format!("parse {}", json_file.display()))
+    }
+
+    fn parse_node_json(json: &str, err_msg: &str) -> Result<Node> {
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        deserializer.disable_recursion_limit();
+        let deserializer = serde_stacker::Deserializer::new(&mut deserializer);
+        <Node as serde::Deserialize>::deserialize(deserializer).log_err(err_msg)
     }
 
     fn with_c_file(root: &Path, path: &Path) -> Result<Self> {
@@ -814,7 +819,7 @@ impl File {
             err_msg = String::from_utf8_lossy(&output.stderr).to_string();
         }
         let json = String::from_utf8_lossy(&output.stdout);
-        let mut node = serde_json::from_str(&json).log_err(&err_msg)?;
+        let mut node = Self::parse_node_json(&json, &err_msg)?;
         let js = path.with_extension("json.tmp");
         if js.exists() {
             let _ = fs::write(path.with_extension("js2"), json.as_bytes());
@@ -1207,6 +1212,37 @@ mod tests {
             }),
             inner: vec![],
         }
+    }
+
+    fn make_deep_compound_node(depth: usize) -> Node {
+        let mut node = Node {
+            id: clang_ast::Id::NULL,
+            kind: Kind::CompoundStmt,
+            inner: vec![],
+        };
+        for _ in 0..depth {
+            node = Node {
+                id: clang_ast::Id::NULL,
+                kind: Kind::CompoundStmt,
+                inner: vec![node],
+            };
+        }
+        node
+    }
+
+    #[test]
+    fn test_parse_node_json_handles_deep_clang_ast() {
+        let root = test_helpers::make_translation_unit(vec![make_deep_compound_node(200)]);
+        let json = serde_json::to_string(&root).unwrap();
+
+        let default_parse = serde_json::from_str::<Node>(&json);
+        assert!(default_parse
+            .unwrap_err()
+            .to_string()
+            .contains("recursion limit exceeded"));
+
+        let parsed = File::parse_node_json(&json, "parse deep clang ast").unwrap();
+        assert!(matches!(parsed.kind, Kind::TranslationUnitDecl(_)));
     }
 
     #[test]

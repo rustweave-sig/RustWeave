@@ -7,7 +7,8 @@ edition = "2021"
 clang-ast = "0.1.35"
 serde = "1.0.220"
 serde_derive = "1.0.220"
-serde_json = "1.0.99"
+serde_json = { version = "1.0.99", features = ["unbounded_depth"] }
+serde_stacker = "0.1"
 syn = { version = "2.0", features = ["full", "visit", "visit-mut", "extra-traits"] }
 quote = "1.0"
 toml_edit = "0.14"

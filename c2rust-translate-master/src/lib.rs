@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
+use walkdir::WalkDir;
 
 /// Interval (in successfully processed files) at which periodic git GC is triggered.
 /// Increasing this value reduces GC frequency; decreasing it compacts the repo more often.
@@ -246,6 +247,8 @@ pub fn preview_translation_plan(
     let target_files = resolve_target_files_with_output(feature, target_file, target_unit, !json)?;
     let selected_files = preview_selected_files(&rust_dir, target_files.as_deref())?;
     let selected_files = sort_files_by_translation_plan(selected_files, &rust_dir, &plan);
+    let (selected_files, collapsed_duplicates) =
+        collapse_duplicate_translation_inputs_if_allowed(selected_files, target_files.as_deref());
 
     if selected_files.is_empty() {
         let preview = build_work_item_plan_preview(feature, &[], &rust_dir);
@@ -262,6 +265,9 @@ pub fn preview_translation_plan(
 
     let work_items = build_translation_work_items(selected_files, &rust_dir, Some(&plan));
     let preview = build_work_item_plan_preview(feature, &work_items, &rust_dir);
+    if collapsed_duplicates > 0 && !json {
+        print_duplicate_collapse_message(collapsed_duplicates);
+    }
     if json {
         print_work_item_plan_json(&preview)?;
     } else {
@@ -762,6 +768,122 @@ fn sort_files_by_translation_plan(
     files
 }
 
+fn collapse_duplicate_translation_inputs_if_allowed(
+    files: Vec<PathBuf>,
+    target_files: Option<&[String]>,
+) -> (Vec<PathBuf>, usize) {
+    if target_files.is_some() {
+        return (files, 0);
+    }
+    collapse_duplicate_translation_inputs(files)
+}
+
+fn collapse_duplicate_translation_inputs(files: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+    let mut seen = HashSet::<(String, Vec<u8>)>::new();
+    let mut collapsed = 0usize;
+    let mut result = Vec::with_capacity(files.len());
+
+    for file in files {
+        let Some(key) = duplicate_translation_key(&file) else {
+            result.push(file);
+            continue;
+        };
+
+        if seen.insert(key) {
+            result.push(file);
+        } else {
+            collapsed += 1;
+        }
+    }
+
+    (result, collapsed)
+}
+
+fn duplicate_translation_key(rs_file: &Path) -> Option<(String, Vec<u8>)> {
+    let file_name = rs_file.file_name()?.to_str()?.to_string();
+    let c_source = std::fs::read(rs_file.with_extension("c")).ok()?;
+    Some((file_name, c_source))
+}
+
+fn sync_duplicate_translation_outputs(rs_file: &Path) -> Result<usize> {
+    let Some((file_name, source_c)) = duplicate_translation_key(rs_file) else {
+        return Ok(0);
+    };
+    let rust_content = std::fs::read(rs_file)
+        .with_context(|| format!("Failed to read translated Rust file: {}", rs_file.display()))?;
+    if rust_content.is_empty() {
+        return Ok(0);
+    }
+
+    let current_mod_dir = rs_file
+        .parent()
+        .context("Translated Rust file does not have a parent module directory")?;
+    if !is_translation_module_dir(current_mod_dir) {
+        return Ok(0);
+    }
+    let src_dir = current_mod_dir
+        .parent()
+        .context("Translated Rust module does not have a parent src directory")?;
+
+    let mut synced = 0usize;
+    for entry in WalkDir::new(src_dir).min_depth(2).max_depth(2) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let target = entry.path();
+        if target == rs_file {
+            continue;
+        }
+        if target.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        if target.file_name().and_then(|name| name.to_str()) != Some(file_name.as_str()) {
+            continue;
+        }
+        if target
+            .parent()
+            .is_none_or(|dir| !is_translation_module_dir(dir))
+        {
+            continue;
+        }
+
+        let target_content = std::fs::read_to_string(target).with_context(|| {
+            format!(
+                "Failed to read duplicate Rust placeholder: {}",
+                target.display()
+            )
+        })?;
+        if !target_content.trim().is_empty() {
+            continue;
+        }
+
+        let Some((_, target_c)) = duplicate_translation_key(target) else {
+            continue;
+        };
+        if target_c != source_c {
+            continue;
+        }
+
+        std::fs::write(target, &rust_content).with_context(|| {
+            format!(
+                "Failed to sync duplicate Rust translation: {}",
+                target.display()
+            )
+        })?;
+        synced += 1;
+    }
+
+    Ok(synced)
+}
+
+fn is_translation_module_dir(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("mod_"))
+}
+
 fn build_translation_work_items(
     files: Vec<std::path::PathBuf>,
     rust_dir: &Path,
@@ -1104,9 +1226,14 @@ fn step_5_execute_translation_loop(
             break;
         }
 
+        let (empty_rs_files, collapsed_duplicates) =
+            collapse_duplicate_translation_inputs_if_allowed(empty_rs_files, target_files);
         let work_items =
             build_translation_work_items(empty_rs_files.clone(), rust_dir, loaded_plan.as_ref());
         print_files_found_message(empty_rs_files.len());
+        if collapsed_duplicates > 0 {
+            print_duplicate_collapse_message(collapsed_duplicates);
+        }
         print_work_item_summary(&work_items);
 
         // Select files to process
@@ -2197,6 +2324,17 @@ fn print_files_found_message(count: usize) {
     println!(
         "{}",
         format!("Found {} empty .rs file(s) to process", count).cyan()
+    );
+}
+
+fn print_duplicate_collapse_message(count: usize) {
+    println!(
+        "{}",
+        format!(
+            "Collapsed {} duplicate empty .rs file(s) with identical sidecar C input.",
+            count
+        )
+        .bright_yellow()
     );
 }
 
@@ -3390,7 +3528,7 @@ where
                 );
                 // tests_passed=false: tests ran but failed; we're only accepting because
                 // C2RUST_TEST_CONTINUE_ON_ERROR is set — this must not emit --build-success.
-                finalize_file_processing(feature, file_name, format_progress, false)?;
+                finalize_file_processing(feature, file_name, rs_file, format_progress, false)?;
                 // C2RUST_TEST_CONTINUE_ON_ERROR was set: tests ran (and failed) but we're
                 // treating the failure as non-fatal and accepting the translation anyway.
                 Ok((true, true))
@@ -3489,6 +3627,7 @@ where
         finalize_file_processing(
             feature,
             file_name,
+            rs_file,
             format_progress,
             matches!(test_status, TestStatus::Passed),
         )?;
@@ -3528,7 +3667,7 @@ where
             match choice {
                 interaction::CompileSuccessChoice::Accept => {
                     println!("│ {}", "You chose: Accept this code".bright_cyan());
-                    finalize_file_processing(feature, file_name, format_progress, false)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, false)?;
                 }
                 interaction::CompileSuccessChoice::AutoAccept => {
                     println!(
@@ -3536,7 +3675,7 @@ where
                         "You chose: Auto-accept all subsequent translations".bright_cyan()
                     );
                     interaction::enable_auto_accept_mode();
-                    finalize_file_processing(feature, file_name, format_progress, false)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, false)?;
                 }
                 interaction::CompileSuccessChoice::ManualFix => {
                     println!("│ {}", "You chose: Manual fix".bright_cyan());
@@ -3553,7 +3692,7 @@ where
                         "│ {}",
                         "✓ Build passes after manual changes (tests skipped)".bright_green()
                     );
-                    finalize_file_processing(feature, file_name, format_progress, false)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, false)?;
                 }
                 interaction::CompileSuccessChoice::Exit => {
                     println!("│ {}", "You chose: Exit".yellow());
@@ -3590,7 +3729,7 @@ where
             let tests_ran = match choice {
                 interaction::CompileSuccessChoice::Accept => {
                     println!("│ {}", "You chose: Accept this code".bright_cyan());
-                    finalize_file_processing(feature, file_name, format_progress, false)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, false)?;
                     false
                 }
                 interaction::CompileSuccessChoice::AutoAccept => {
@@ -3599,7 +3738,7 @@ where
                         "You chose: Auto-accept all subsequent translations".bright_cyan()
                     );
                     interaction::enable_auto_accept_mode();
-                    finalize_file_processing(feature, file_name, format_progress, false)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, false)?;
                     false
                 }
                 interaction::CompileSuccessChoice::ManualFix => {
@@ -3617,7 +3756,7 @@ where
                         "│ {}",
                         "✓ All builds and tests pass after manual changes".bright_green()
                     );
-                    finalize_file_processing(feature, file_name, format_progress, true)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, true)?;
                     true // tests actually ran
                 }
                 interaction::CompileSuccessChoice::Exit => {
@@ -3649,7 +3788,7 @@ where
             match choice {
                 interaction::CompileSuccessChoice::Accept => {
                     println!("│ {}", "You chose: Accept this code".bright_cyan());
-                    finalize_file_processing(feature, file_name, format_progress, true)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, true)?;
                 }
                 interaction::CompileSuccessChoice::AutoAccept => {
                     println!(
@@ -3657,7 +3796,7 @@ where
                         "You chose: Auto-accept all subsequent translations".bright_cyan()
                     );
                     interaction::enable_auto_accept_mode();
-                    finalize_file_processing(feature, file_name, format_progress, true)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, true)?;
                 }
                 interaction::CompileSuccessChoice::ManualFix => {
                     println!("│ {}", "You chose: Manual fix".bright_cyan());
@@ -3673,7 +3812,7 @@ where
                         "│ {}",
                         "✓ All builds and tests pass after manual changes".bright_green()
                     );
-                    finalize_file_processing(feature, file_name, format_progress, true)?;
+                    finalize_file_processing(feature, file_name, rs_file, format_progress, true)?;
                 }
                 interaction::CompileSuccessChoice::Exit => {
                     println!("│ {}", "You chose: Exit".yellow());
@@ -3699,12 +3838,25 @@ where
 fn finalize_file_processing<F>(
     feature: &str,
     file_name: &str,
+    rs_file: &Path,
     format_progress: &F,
     tests_passed: bool,
 ) -> Result<()>
 where
     F: Fn(&str) -> String,
 {
+    let synced_duplicates = sync_duplicate_translation_outputs(rs_file)?;
+    if synced_duplicates > 0 {
+        println!(
+            "│ {}",
+            format!(
+                "Synced {} duplicate translation output(s) with identical C input.",
+                synced_duplicates
+            )
+            .bright_green()
+        );
+    }
+
     // Commit changes
     println!("│");
     println!("│ {}", format_progress("Commit").bright_magenta().bold());
@@ -4532,6 +4684,112 @@ found fn pointer"#;
                 "src/mod_a/fun_a.rs".to_string(),
                 "src/mod_z/fun_z.rs".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_collapse_duplicate_translation_inputs_keeps_first_identical_sidecar() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(src_dir.join("mod_a")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_b")).unwrap();
+
+        let first = src_dir.join("mod_b").join("fun___bswap_16.rs");
+        let duplicate = src_dir.join("mod_a").join("fun___bswap_16.rs");
+        fs::write(&first, "").unwrap();
+        fs::write(&duplicate, "").unwrap();
+        fs::write(
+            first.with_extension("c"),
+            "int __bswap_16(int x) { return x; }\n",
+        )
+        .unwrap();
+        fs::write(
+            duplicate.with_extension("c"),
+            "int __bswap_16(int x) { return x; }\n",
+        )
+        .unwrap();
+
+        let (collapsed, duplicate_count) =
+            collapse_duplicate_translation_inputs(vec![first.clone(), duplicate]);
+
+        assert_eq!(duplicate_count, 1);
+        assert_eq!(collapsed, vec![first]);
+    }
+
+    #[test]
+    fn test_collapse_duplicate_translation_inputs_keeps_different_sidecar() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(src_dir.join("mod_a")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_b")).unwrap();
+
+        let first = src_dir.join("mod_a").join("fun_foo.rs");
+        let different = src_dir.join("mod_b").join("fun_foo.rs");
+        fs::write(&first, "").unwrap();
+        fs::write(&different, "").unwrap();
+        fs::write(first.with_extension("c"), "int foo(void) { return 1; }\n").unwrap();
+        fs::write(
+            different.with_extension("c"),
+            "int foo(void) { return 2; }\n",
+        )
+        .unwrap();
+
+        let (collapsed, duplicate_count) =
+            collapse_duplicate_translation_inputs(vec![first.clone(), different.clone()]);
+
+        assert_eq!(duplicate_count, 0);
+        assert_eq!(collapsed, vec![first, different]);
+    }
+
+    #[test]
+    fn test_sync_duplicate_translation_outputs_copies_identical_empty_targets() {
+        let dir = tempdir().unwrap();
+        let rust_dir = dir.path().join("rust");
+        let src_dir = rust_dir.join("src");
+        fs::create_dir_all(src_dir.join("mod_a")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_b")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_c")).unwrap();
+        fs::create_dir_all(src_dir.join("mod_d")).unwrap();
+
+        let source = src_dir.join("mod_a").join("fun_foo.rs");
+        let same_empty = src_dir.join("mod_b").join("fun_foo.rs");
+        let different_c = src_dir.join("mod_c").join("fun_foo.rs");
+        let already_done = src_dir.join("mod_d").join("fun_foo.rs");
+
+        fs::write(&source, "pub unsafe extern \"C\" fn foo() -> i32 { 1 }\n").unwrap();
+        fs::write(&same_empty, "").unwrap();
+        fs::write(&different_c, "").unwrap();
+        fs::write(&already_done, "pub fn keep() {}\n").unwrap();
+        fs::write(source.with_extension("c"), "int foo(void) { return 1; }\n").unwrap();
+        fs::write(
+            same_empty.with_extension("c"),
+            "int foo(void) { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            different_c.with_extension("c"),
+            "int foo(void) { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(
+            already_done.with_extension("c"),
+            "int foo(void) { return 1; }\n",
+        )
+        .unwrap();
+
+        let synced = sync_duplicate_translation_outputs(&source).unwrap();
+
+        assert_eq!(synced, 1);
+        assert_eq!(
+            fs::read_to_string(&same_empty).unwrap(),
+            fs::read_to_string(&source).unwrap()
+        );
+        assert!(fs::read_to_string(&different_c).unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(&already_done).unwrap(),
+            "pub fn keep() {}\n"
         );
     }
 
