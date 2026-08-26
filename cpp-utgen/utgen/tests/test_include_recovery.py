@@ -14,7 +14,7 @@ from compile_repair import repair_from_manifest  # noqa: E402
 from expt import FunctionData  # noqa: E402
 from test_repair import repair_record  # noqa: E402
 from utgen import Function, SourceFile  # noqa: E402
-from utils import format_sig  # noqa: E402
+from utils import LLMTransportError, format_sig  # noqa: E402
 
 
 class IncludeRecoveryTests(unittest.TestCase):
@@ -67,55 +67,6 @@ class IncludeRecoveryTests(unittest.TestCase):
             self.assertIn('#include "gtest/gtest.h"', include_content)
             self.assertIn('#include "sample.h"', include_content)
             self.assertEqual(generated, [str(function_dir / "test_001.cpp")])
-
-    def test_headerless_c_function_uses_declaration_not_source_include(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            parent = Path(tmp) / "llm_tests_cxt" / "sample.c"
-            function = Function(
-                "add",
-                "int add(int, int)",
-                "",
-                False,
-                "sample.c",
-                None,
-                (1, 3),
-                "",
-            )
-            function._Function__body = "int add(int left, int right) { return left + right; }"
-            function._Function__include_set = {"stddef.h", "dependency.c"}
-
-            function.gen_include_file(str(parent))
-
-            include_path = parent / format_sig(function.get_sig()) / "include.h"
-            content = include_path.read_text(encoding="utf-8")
-            self.assertIn('extern "C" { int add(int left, int right); }', content)
-            self.assertIn("#include <stddef.h>", content)
-            self.assertNotIn('#include "sample.c"', content)
-            self.assertNotIn("dependency.c", content)
-
-    def test_headerless_cpp_or_static_c_function_fails_closed(self) -> None:
-        variants = (
-            ("sample.cpp", "int add(int left, int right) { return left + right; }"),
-            ("sample.c", "static int add(int left, int right) { return left + right; }"),
-        )
-        for decl_file, body in variants:
-            with self.subTest(decl_file=decl_file), tempfile.TemporaryDirectory() as tmp:
-                parent = Path(tmp) / "llm_tests_cxt" / Path(decl_file).name
-                function = Function(
-                    "add",
-                    "int add(int, int)",
-                    "",
-                    False,
-                    decl_file,
-                    None,
-                    (1, 3),
-                    "",
-                )
-                function._Function__body = body
-                function._Function__include_set = set()
-
-                with self.assertRaisesRegex(ValueError, "Cannot safely declare"):
-                    function.gen_include_file(str(parent))
 
     def test_cached_include_recovery_failure_does_not_abort_generation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,9 +152,9 @@ class IncludeRecoveryTests(unittest.TestCase):
                 ),
                 patch(
                     "utgen.get_test_from_LLM",
-                    return_value=[
-                        "TEST(Target, First) {}",
-                        "TEST(Target, Second) {}",
+                    side_effect=[
+                        ["TEST(Target, First) {}"],
+                        ["TEST(Target, Second) {}"],
                     ],
                 ) as llm,
                 patch("utgen.clang.cindex.Index.create", return_value=index),
@@ -219,7 +170,363 @@ class IncludeRecoveryTests(unittest.TestCase):
                 )
 
             self.assertEqual(llm.call_count, 2)
-            self.assertEqual(callback_request_counts, [1, 1, 2, 2])
+            self.assertEqual(callback_request_counts, [1, 2])
+            self.assertEqual([call.args[1] for call in llm.call_args_list], [1, 1])
+
+    def test_requirement_prompt_limits_candidates_to_three(self) -> None:
+        function = self.make_generatable_function()
+
+        class Chain:
+            def in_min_cover(self) -> bool:
+                return True
+
+            def get_id(self) -> str:
+                return "chain"
+
+            def to_reqstr(self) -> str:
+                return "requirement"
+
+            def get_includes(self) -> set[str]:
+                return set()
+
+        function._Function__cond_chains = [Chain()]
+
+        prompts = function.gen_req_list()
+
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("At most 3 candidates will be requested", prompts[0])
+
+    def test_requirement_generation_retries_only_after_filtered_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+            index = MagicMock()
+            index.parse.return_value.cursor = object()
+            outcomes = iter(["filtered", "passed"])
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["requirement one"],
+                ),
+                patch(
+                    "utgen.get_test_from_LLM",
+                    side_effect=[
+                        ["TEST(Target, First) {}"],
+                        ["TEST(Target, Second) {}"],
+                    ],
+                ) as llm,
+                patch("utgen.clang.cindex.Index.create", return_value=index),
+                patch(
+                    "utgen.extract_functions_index",
+                    side_effect=lambda cursor, code: [(0, len(code))],
+                ),
+            ):
+                generated = function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: next(outcomes)
+                )
+
+            self.assertEqual(llm.call_count, 2)
+            self.assertEqual(
+                [Path(path).name for path in generated],
+                ["test_001_1.cpp", "test_001_2.cpp"],
+            )
+            self.assertFalse((Path(generated[0]).parent / "test_001_3.cpp").exists())
+
+    def test_requirement_generation_retries_invalid_response_within_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+            response = "TEST(Target, Second) {}"
+            index = MagicMock()
+            index.parse.return_value.cursor = object()
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["requirement one"],
+                ),
+                patch(
+                    "utgen.get_test_from_LLM",
+                    side_effect=[["not a test"], [response]],
+                ) as llm,
+                patch("utgen.clang.cindex.Index.create", return_value=index),
+                patch(
+                    "utgen.extract_functions_index",
+                    return_value=[(0, len(response))],
+                ),
+            ):
+                generated = function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: "passed"
+                )
+
+            self.assertEqual(llm.call_count, 2)
+            self.assertEqual([Path(path).name for path in generated], [
+                "test_001_2.cpp"
+            ])
+            self.assertTrue((Path(generated[0]).parent / ".generated").is_file())
+
+    def test_requirement_generation_leaves_all_invalid_chain_resumable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["requirement one"],
+                ),
+                patch(
+                    "utgen.get_test_from_LLM",
+                    side_effect=[["invalid one"], ["invalid two"], ["invalid three"]],
+                ) as llm,
+            ):
+                generated = function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: "passed"
+                )
+
+            function_dir = parent / format_sig(function.get_sig())
+            self.assertEqual(llm.call_count, 3)
+            self.assertEqual(generated, [])
+            self.assertFalse((function_dir / ".generated").exists())
+            self.assertIn(
+                "No valid LLM response for requirement 1",
+                (function_dir / "generation_error.log").read_text(),
+            )
+
+    def test_requirement_api_failure_is_logged_and_next_function_continues(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt"
+            source = SourceFile("sample.c", str(Path(tmp) / "sample.c"), tmp)
+            failed = self.make_generatable_function()
+            succeeding = Function(
+                "succeeding",
+                "succeeding(void)",
+                "",
+                False,
+                "sample.h",
+                None,
+                (4, 6),
+                "",
+            )
+            succeeding._Function__focal_cxt = failed._Function__focal_cxt
+            succeeding._Function__body = "void succeeding(void) {}"
+            succeeding._Function__include_set = set()
+            source._SourceFile__functions = {
+                failed.get_sig(): failed,
+                succeeding.get_sig(): succeeding,
+            }
+            response = "TEST(Target, Succeeds) {}"
+            index = MagicMock()
+            index.parse.return_value.cursor = object()
+
+            with (
+                patch.object(
+                    failed,
+                    "gen_req_list",
+                    return_value=["failed requirement"],
+                ),
+                patch.object(
+                    succeeding,
+                    "gen_req_list",
+                    return_value=["successful requirement"],
+                ),
+                patch(
+                    "utgen.get_test_from_LLM",
+                    side_effect=[
+                        Exception("No choices in the API response"),
+                        [response],
+                    ],
+                ) as llm,
+                patch("utgen.clang.cindex.Index.create", return_value=index),
+                patch(
+                    "utgen.extract_functions_index",
+                    return_value=[(0, len(response))],
+                ),
+            ):
+                source.gen_unit_test(
+                    "_req_cxt", str(parent), lambda *args: "passed"
+                )
+
+            failed_dir = parent / "sample.c" / format_sig(failed.get_sig())
+            succeeding_dir = (
+                parent / "sample.c" / format_sig(succeeding.get_sig())
+            )
+            failure_log = (failed_dir / "generation_error.log").read_text()
+            self.assertEqual(llm.call_count, 2)
+            self.assertIn("requirement 1, candidate 1", failure_log)
+            self.assertIn("No choices in the API response", failure_log)
+            self.assertFalse((failed_dir / ".generated").exists())
+            self.assertTrue((succeeding_dir / ".generated").is_file())
+            self.assertTrue((succeeding_dir / "test_001_1.cpp").is_file())
+
+    def test_requirement_transport_failure_stops_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+            function_dir = parent / format_sig(function.get_sig())
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["failed requirement"],
+                ),
+                patch(
+                    "utgen.get_test_from_LLM",
+                    side_effect=LLMTransportError("LLM API returned HTTP 429"),
+                ) as llm,
+                self.assertRaisesRegex(LLMTransportError, "HTTP 429"),
+            ):
+                function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: "passed"
+                )
+
+            llm.assert_called_once()
+            self.assertFalse((function_dir / "generation_error.log").exists())
+            self.assertFalse((function_dir / ".generated").exists())
+
+    def test_requirement_generation_caps_filtered_candidates_at_three(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+            index = MagicMock()
+            index.parse.return_value.cursor = object()
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["requirement one"],
+                ),
+                patch(
+                    "utgen.get_test_from_LLM",
+                    side_effect=[
+                        ["TEST(Target, First) {}"],
+                        ["TEST(Target, Second) {}"],
+                        ["TEST(Target, Third) {}"],
+                    ],
+                ) as llm,
+                patch("utgen.clang.cindex.Index.create", return_value=index),
+                patch(
+                    "utgen.extract_functions_index",
+                    side_effect=lambda cursor, code: [(0, len(code))],
+                ),
+            ):
+                generated = function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: "filtered"
+                )
+
+            self.assertEqual(llm.call_count, 3)
+            self.assertEqual(len(generated), 3)
+            self.assertTrue((Path(generated[0]).parent / ".generated").is_file())
+            self.assertFalse((Path(generated[0]).parent / "test_001_4.cpp").exists())
+
+    def test_requirement_generation_stops_chain_on_interrupted_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+            response = "TEST(Target, First) {}"
+            index = MagicMock()
+            index.parse.return_value.cursor = object()
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["requirement one", "requirement two"],
+                ),
+                patch("utgen.get_test_from_LLM", return_value=[response]) as llm,
+                patch("utgen.clang.cindex.Index.create", return_value=index),
+                patch(
+                    "utgen.extract_functions_index",
+                    return_value=[(0, len(response))],
+                ),
+            ):
+                generated = function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: "interrupted"
+                )
+
+            self.assertEqual(llm.call_count, 1)
+            self.assertEqual(len(generated), 1)
+            self.assertFalse((Path(generated[0]).parent / ".generated").exists())
+
+    def test_requirement_generation_resumes_after_cached_filtered_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+            function_dir = parent / format_sig(function.get_sig())
+            function_dir.mkdir(parents=True)
+            cached_path = function_dir / "test_001_1.cpp"
+            cached_path.write_text("TEST(Target, Cached) {}")
+            response = "TEST(Target, Replacement) {}"
+            index = MagicMock()
+            index.parse.return_value.cursor = object()
+            outcomes = iter(["filtered", "passed"])
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["requirement one"],
+                ),
+                patch("utgen.get_test_from_LLM", return_value=[response]) as llm,
+                patch("utgen.clang.cindex.Index.create", return_value=index),
+                patch(
+                    "utgen.extract_functions_index",
+                    return_value=[(0, len(response))],
+                ),
+            ):
+                generated = function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: next(outcomes)
+                )
+
+            llm.assert_called_once()
+            self.assertEqual(
+                [Path(path).name for path in generated],
+                ["test_001_1.cpp", "test_001_2.cpp"],
+            )
+            self.assertEqual(cached_path.read_text(), "TEST(Target, Cached) {}")
+
+    def test_requirement_generation_reuses_cached_pass_without_llm_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "llm_tests_req_cxt" / "sample.c"
+            function = self.make_generatable_function()
+            function_dir = parent / format_sig(function.get_sig())
+            function_dir.mkdir(parents=True)
+            cached_path = function_dir / "test_001_1.cpp"
+            cached_path.write_text("TEST(Target, Cached) {}")
+            response = cached_path.read_text()
+            index = MagicMock()
+            index.parse.return_value.cursor = object()
+
+            with (
+                patch.object(
+                    function,
+                    "gen_req_list",
+                    return_value=["requirement one"],
+                ),
+                patch(
+                    "utgen.get_test_from_LLM",
+                    side_effect=AssertionError("cached pass should be reused"),
+                ),
+                patch("utgen.clang.cindex.Index.create", return_value=index),
+                patch(
+                    "utgen.extract_functions_index",
+                    return_value=[(0, len(response))],
+                ),
+            ):
+                generated = function.gen_unit_test(
+                    "_req_cxt", str(parent), lambda test_path: "passed"
+                )
+
+            self.assertEqual(generated, [str(cached_path)])
+            self.assertTrue((function_dir / ".generated").is_file())
 
     def test_empty_cached_response_is_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

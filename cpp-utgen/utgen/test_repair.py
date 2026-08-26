@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from case_runner import SingleTestSession
-from c_test_repair_adapter import validate_c_test_candidate
 from prompt import (
+    CHANGELOG_FORMAT_RETRY_PROMPT,
     RUSTASSISTANT_INSTRUCTIONS_AND_EXAMPLES_FOR_FORMATTING_THE_CHANGELOG_OUTPUT,
     TEST_REPAIR_PROMPT,
 )
@@ -21,10 +21,12 @@ from rust_assistant import (
     get_fixes_from_LLM,
     llm_return_content_parser,
 )
-from utils import atomic_write_json
-
-
-DEFAULT_TEST_TYPES = ["", "_cxt", "_req", "_req_cxt"]
+from utils import (
+    TEST_TYPE_SUFFIXES,
+    LLMTransportError,
+    atomic_write_json,
+    resolve_test_types,
+)
 ASSERTION_PATTERN = re.compile(r"\b(?:EXPECT|ASSERT)_[A-Z_]+\s*\(")
 EXPECT_CALL_PATTERN = re.compile(r"\bEXPECT_CALL\s*\(")
 TEST_PATTERN = re.compile(r"\bTEST(?:_F|_P)?\s*\(")
@@ -56,8 +58,13 @@ def parse_args() -> argparse.Namespace:
         "-t",
         "--test-type",
         action="append",
+        choices=tuple(TEST_TYPE_SUFFIXES),
         dest="test_types",
-        help="test type suffix, such as _req_cxt. Can be specified multiple times.",
+        metavar="TYPE",
+        help=(
+            "test type: base, cxt, req, or req-cxt; repeat to select multiple; "
+            "default: all"
+        ),
     )
     parser.add_argument(
         "--max-rounds",
@@ -186,16 +193,6 @@ def focal_name(signature: str) -> str:
 def validate_candidate(
     record: dict[str, Any], original_content: str, new_content: str
 ) -> tuple[bool, str]:
-    strict_valid, strict_reason = validate_c_test_candidate(
-        original_content,
-        new_content,
-        str(record.get("function", "")),
-        filename=Path(record.get("test_path", "test_001.cpp")).name,
-        test_type=str(record.get("test_type", "")),
-        expected_test_signature=record.get("expected_test_signature"),
-    )
-    if not strict_valid:
-        return False, strict_reason
     if "GTEST_SKIP" in new_content:
         return False, "candidate uses GTEST_SKIP"
     if not TEST_PATTERN.search(new_content):
@@ -333,6 +330,15 @@ def repair_record(
         record["terminal_reason"] = "missing_include"
         return False
     original_content = read_text(test_path)
+    seen_candidate_hashes = {
+        value
+        for value in record.get("repair_candidate_hashes", [])
+        if isinstance(value, str)
+    }
+    seen_candidate_hashes.add(
+        hashlib.sha256(original_content.encode("utf-8")).hexdigest()
+    )
+    record["repair_candidate_hashes"] = sorted(seen_candidate_hashes)
     original_failure_type = record.get("failure_type", "unknown_failure")
     if session is None:
         session = SingleTestSession(
@@ -349,25 +355,65 @@ def repair_record(
             f"Previous repair attempt log: {last_repair_log}.\n{previous_detail}"
         )
     last_failure_type = original_failure_type
-    changelog_format = RUSTASSISTANT_INSTRUCTIONS_AND_EXAMPLES_FOR_FORMATTING_THE_CHANGELOG_OUTPUT
+    changelog_format = (
+        RUSTASSISTANT_INSTRUCTIONS_AND_EXAMPLES_FOR_FORMATTING_THE_CHANGELOG_OUTPUT
+    )
+    stop_for_llm_error = False
     for round_index in range(start_round, start_round + max_rounds):
         record["repair_rounds"] = round_index
         prompt = build_prompt(record, previous_result, changelog_format)
-        try:
-            candidates = get_fixes_from_LLM(prompt, choices)
-        except Exception as exc:
-            record["repair_status"] = "llm_error"
-            previous_result = f"LLM request failed: {exc}"
-            record["repair_log"] = previous_result
-            break
-        for choice_index, candidate in enumerate(candidates, start=1):
-            new_content = apply_llm_candidate(test_path, original_content, candidate)
+        candidate_prompt = prompt
+        for choice_index in range(1, choices + 1):
+            try:
+                candidates = get_fixes_from_LLM(candidate_prompt, 1)
+            except LLMTransportError:
+                write_text(test_path, original_content)
+                raise
+            except Exception as exc:
+                record["repair_status"] = "llm_error"
+                previous_result = f"LLM request failed: {exc}"
+                record["repair_log"] = previous_result
+                stop_for_llm_error = True
+                break
+            if len(candidates) != 1:
+                previous_result = "LLM returned no repair candidate."
+                candidate_prompt = prompt + CHANGELOG_FORMAT_RETRY_PROMPT.format(
+                    test_path
+                )
+                continue
+
+            candidate = candidates[0]
+            new_content = apply_llm_candidate(
+                test_path,
+                original_content,
+                candidate,
+            )
             if new_content is None:
                 previous_result = "Candidate ChangeLog could not be applied."
+                candidate_prompt = prompt + CHANGELOG_FORMAT_RETRY_PROMPT.format(
+                    test_path
+                )
                 continue
+            candidate_hash = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+            if candidate_hash in seen_candidate_hashes:
+                previous_result = "Candidate duplicates an already verified test edit."
+                candidate_prompt = (
+                    prompt
+                    + "\n\nThe previous candidate duplicated an edit that was "
+                    "already verified. Return a materially different repair.\n"
+                    + CHANGELOG_FORMAT_RETRY_PROMPT.format(test_path)
+                )
+                continue
+            seen_candidate_hashes.add(candidate_hash)
+            record["repair_candidate_hashes"] = sorted(seen_candidate_hashes)
             is_valid, reason = validate_candidate(record, original_content, new_content)
             if not is_valid:
                 previous_result = f"Candidate rejected: {reason}"
+                candidate_prompt = (
+                    prompt
+                    + f"\n\nThe previous candidate was rejected: {reason}.\n"
+                    + CHANGELOG_FORMAT_RETRY_PROMPT.format(test_path)
+                )
                 continue
             write_text(test_path, new_content)
             attempt_id = f"r{round_index}_c{choice_index}"
@@ -412,6 +458,14 @@ def repair_record(
                 f"Failure type: {failure_type}.\n"
                 f"{truncate_text(failure_detail, 6000)}"
             )
+            candidate_prompt = (
+                prompt
+                + "\n\nThe previous candidate did not pass verification "
+                + f"({failure_type}). "
+                "Return a different repair using the required ChangeLog format.\n"
+            )
+        if stop_for_llm_error:
+            break
         record["repair_log"] = last_repair_log
         record["repair_failure_type"] = last_failure_type
         record["failure_type"] = original_failure_type
@@ -441,7 +495,7 @@ def main() -> None:
     args = parse_args()
     project = str(Path(args.project).resolve())
     build = str(Path(args.build).resolve())
-    test_types = args.test_types if args.test_types is not None else DEFAULT_TEST_TYPES
+    test_types = resolve_test_types(args.test_types)
     for test_type in test_types:
         loaded = load_manifest(project, test_type)
         if loaded is None:

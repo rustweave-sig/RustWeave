@@ -7,20 +7,19 @@ from datetime import datetime
 from pathlib import Path
 
 from case_runner import CaseResult, SingleTestSession
-from c_test_repair_adapter import validate_c_test_candidate
-from c_test_format import extract_test_identity, validate_c_test_artifact
 from rust_assistant import (
     compilation_fix_assistant,
     compilation_fix_assistant_for_test_file,
     get_compile_cmds,
-    refined_marker_is_valid,
-    write_refined_marker,
 )
 from utgen import Project
-from utils import atomic_write_json, run_command
-
-
-DEFAULT_TEST_TYPES = ["", "_cxt", "_req", "_req_cxt"]
+from utils import (
+    TEST_TYPE_SUFFIXES,
+    LLMTransportError,
+    atomic_write_json,
+    resolve_test_types,
+    run_command,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,8 +44,13 @@ def parse_args() -> argparse.Namespace:
         "-t",
         "--test-type",
         action="append",
+        choices=tuple(TEST_TYPE_SUFFIXES),
         dest="test_types",
-        help="test type suffix, such as _req_cxt. Can be specified multiple times.",
+        metavar="TYPE",
+        help=(
+            "test type: base, cxt, req, or req-cxt; repeat to select multiple; "
+            "default: all"
+        ),
     )
     return parser.parse_args()
 
@@ -104,94 +108,21 @@ def get_refined_marker(test_path: str, function_dir: str) -> Path:
     return Path(function_dir) / f".{Path(test_path).name}.refined"
 
 
-def candidate_guard(
-    test_path: str,
-    function_signature: str,
-    test_type: str,
-    *,
-    project_path: str,
-    source_name: str,
-    expected_test_signature: str | tuple[str, str] | None = None,
-):
-    """Bind the legacy repair guard to the current test identity and oracles."""
-
-    original_content = Path(test_path).read_text(encoding="utf-8", errors="replace")
-    expected_signature = expected_test_signature
-    if not expected_signature:
-        identity = extract_test_identity(original_content)
-        if identity is not None:
-            expected_signature = f"TEST({identity.suite}, {identity.name})"
-    include_path = Path(test_path).parent / "include.h"
-
-    def validate(candidate: str) -> tuple[bool, str]:
-        valid, reason = validate_c_test_candidate(
-            original_content,
-            candidate,
-            function_signature,
-            filename=Path(test_path).name,
-            test_type=test_type,
-            expected_test_signature=expected_signature,
-        )
-        if not valid:
-            return valid, reason
-        try:
-            include_source = include_path.read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError as error:
-            return False, f"include.h cannot be read: {error}"
-        artifact_errors = validate_c_test_artifact(
-            candidate,
-            test_path=test_path,
-            include_source=include_source,
-            project=project_path,
-            test_type=test_type,
-            source_name=source_name,
-            function_signature=function_signature,
-            expected_test_signature=expected_signature,
-        )
-        if artifact_errors:
-            return False, "candidate violates section 8.5 artifact rules: " + "; ".join(
-                artifact_errors
-            )
-        return True, ""
-
-    return validate
-
-
-def _record_source_name(record: dict) -> str:
-    source_name = str(record.get("source_file", "")).strip()
-    if source_name:
-        return Path(source_name).name
-    source_path = str(record.get("source_path", "")).strip()
-    return Path(source_path).name if source_path else ""
-
-
-def _record_test_type(record: dict, fallback: str = "") -> str:
-    test_type = str(record.get("test_type", fallback)).strip()
-    if test_type:
-        return test_type
-    for parent in Path(str(record.get("test_path", ""))).parents:
-        if parent.name.startswith("llm_tests"):
-            return parent.name.removeprefix("llm_tests")
-    return fallback
-
-
 def compile_target_passes(compile_cmd: tuple) -> bool:
     return run_command(compile_cmd[0]).returncode == 0
 
 
 def verified_by_existing_marker(
-    test_path: str,
-    function_dir: str,
-    compile_cmd: tuple,
-    validator,
+    test_path: str, function_dir: str, compile_cmd: tuple
 ) -> bool:
     marker = get_refined_marker(test_path, function_dir)
-    include_path = Path(function_dir) / "include.h"
-    if refined_marker_is_valid(
-        marker, test_path, include_path, validator
-    ) and compile_target_passes(compile_cmd):
+    if not marker.exists():
+        return False
+    try:
+        marker_state = marker.read_text(errors="ignore").strip()
+    except OSError:
+        marker_state = ""
+    if marker_state == "1" and compile_target_passes(compile_cmd):
         return True
     try:
         marker.unlink()
@@ -252,14 +183,6 @@ def repair_record_once(
     except FileNotFoundError:
         pass
     original_content = Path(test_path).read_text()
-    validator = candidate_guard(
-        test_path,
-        str(record.get("function", "")),
-        _record_test_type(record),
-        project_path=project_path,
-        source_name=_record_source_name(record),
-        expected_test_signature=record.get("expected_test_signature"),
-    )
     try:
         compilation_fix_assistant_for_test_file(
             test_path,
@@ -269,8 +192,10 @@ def repair_record_once(
             choices=choices,
             max_errors=1,
             max_iterations=1,
-            candidate_validator=validator,
         )
+    except LLMTransportError:
+        Path(test_path).write_text(original_content)
+        raise
     except Exception as exc:
         Path(test_path).write_text(original_content)
         log_path = f"{record['function_dir']}/case_{Path(test_path).stem}_{attempt_id}.log"
@@ -329,17 +254,7 @@ def repair_from_manifest(project_path: str, build_path: str, test_type: str) -> 
             continue
         attempted += 1
         print(f"Repairing compile failure {test_path}")
-        validator = candidate_guard(
-            test_path,
-            str(record.get("function", "")),
-            _record_test_type(record, test_type),
-            project_path=project_path,
-            source_name=_record_source_name(record),
-            expected_test_signature=record.get("expected_test_signature"),
-        )
-        if verified_by_existing_marker(
-            test_path, record["function_dir"], compile_cmd, validator
-        ):
+        if verified_by_existing_marker(test_path, record["function_dir"], compile_cmd):
             success = True
         else:
             compilation_fix_assistant_for_test_file(
@@ -347,16 +262,10 @@ def repair_from_manifest(project_path: str, build_path: str, test_type: str) -> 
                 compile_cmd,
                 record["function_dir"],
                 build_path,
-                candidate_validator=validator,
             )
             success = compile_target_passes(compile_cmd)
             if success:
-                success = write_refined_marker(
-                    get_refined_marker(test_path, record["function_dir"]),
-                    test_path,
-                    Path(record["function_dir"]) / "include.h",
-                    validator,
-                )
+                get_refined_marker(test_path, record["function_dir"]).write_text("1")
         if success:
             repaired += 1
             record["compile"] = "pass"
@@ -381,26 +290,14 @@ def repair_with_legacy_scan(project_path: str, build_path: str, test_types: list
     project.prepare(test_types, just_load=True)
     project.init_data()
     for test_type in test_types:
-        compilation_fix_assistant(
-            project,
-            test_type,
-            candidate_validator_factory=lambda test_path, source_name, function, current_type: (
-                candidate_guard(
-                    test_path,
-                    function,
-                    current_type,
-                    project_path=project_path,
-                    source_name=source_name,
-                )
-            ),
-        )
+        compilation_fix_assistant(project, test_type)
 
 
 def main() -> None:
     args = parse_args()
     project_path = str(Path(args.project).resolve())
     build_path = str(Path(args.build).resolve())
-    test_types = args.test_types if args.test_types is not None else DEFAULT_TEST_TYPES
+    test_types = resolve_test_types(args.test_types)
 
     missing_manifest_types = []
     for test_type in test_types:

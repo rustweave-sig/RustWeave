@@ -4,7 +4,6 @@ from utgen import (
     Project,
     Function,
     SourceFile,
-    MIN_CHAIN_NUM,
     MAX_MIN_COVER,
     extract_functions_index,
     remove_substrings_by_indices,
@@ -44,8 +43,7 @@ try:
 except ImportError:
     from config import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
 
-if LIBCLANG_PATH:
-    clang.cindex.Config.set_library_file(LIBCLANG_PATH)
+clang.cindex.Config.set_library_file(LIBCLANG_PATH)
 
 from prompt import (
     CAHTTESTER_INTENTION_PROMPT_FORMAT,
@@ -54,7 +52,6 @@ from prompt import (
     CAHTTESTER_ITERATIVE_WITH_INFORMATION_PROMPT_TAIL,
 )
 
-MIN_CHAIN_NUM = 2
 MAX_MIN_COVER = 20
 import logging
 
@@ -168,7 +165,6 @@ def gen_chattester_tests_for_source_file(
     for sig, func in function_dict.items():
         if (
             not func.is_operator()
-            and func.cond_chain_num() > MIN_CHAIN_NUM
             and func.min_cover_num() <= MAX_MIN_COVER
         ):
             """
@@ -261,7 +257,7 @@ def write_cmake_file(
         return False
     path = Path(test_dir)
     rela_path = ""
-    if not is_header(source_file.get_path()):
+    if not is_header(source_file.get_path()) and is_header(func._Function__decl_file):
         rela_path = os.path.relpath(source_file.get_path(), test_dir)
     if not test_file_list or len(test_file_list) == 0:
         with open(f"{test_dir}/.notest", "w"):

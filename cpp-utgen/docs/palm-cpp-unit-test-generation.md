@@ -25,7 +25,7 @@ PALM 的整体思路是把程序分析结果纳入 Prompt 构建过程：先用 
 1. 测试需求提取：`brinfo` 基于 Clang AST 构建被测函数 CFG，遍历分支和循环路径，提取路径条件链、返回值和 Mock 需求，输出 `llm_reqs/*_req.json`。
 2. 上下文构建：`focxt` 分析项目中的类型、函数、宏、include、全局变量、构造函数、方法和调用依赖，输出 `project_cxt.json`。
 3. Prompt 设计与生成：`utgen` 读取条件链和上下文，将其填充到 Prompt 模板中，形成无需求、上下文增强、需求增强、需求+上下文增强四类生成配置。
-4. 单元测试生成、筛选与修复：`utgen` 每生成一个 GoogleTest 文件，就立即为该文件建立独立目标并执行编译、编译修复、运行和测试修复；单测试默认最多共享 10 轮修复，每轮最多一次逻辑 LLM 请求。状态逐轮写入 `filter_manifest.json`，最终只保留编译和运行均通过且实际执行了测试的文件统计覆盖率并导出到 `filtered_tests*`。
+4. 单元测试生成、筛选与修复：`utgen` 每生成一个 GoogleTest 文件，就立即为该文件建立独立目标并执行编译、编译修复、运行和测试修复；单测试默认最多共享 10 轮修复，每轮最多按需请求并验证 3 个候选。处理中状态原子写入临时 checkpoint，终态合并到 `filter_manifest.json`；最终只保留编译和运行均通过且实际执行了测试的文件统计覆盖率并导出到 `filtered_tests*`。
 
 ```mermaid
 flowchart LR
@@ -44,14 +44,14 @@ flowchart LR
     K --> L["写入单个 test_*.cpp"]
     L --> M["单用例 CMake 编译与链接"]
     M -->|"通过"| N["立即运行当前测试"]
-    M -->|"失败"| O["LLM 编译错误修复一轮（一次请求）"]
+    M -->|"失败"| O["LLM 编译错误修复一轮（按需候选）"]
     O --> M
-    N -->|"失败"| Q["LLM 测试失败修复一轮（一次请求）"]
+    N -->|"失败"| Q["LLM 测试失败修复一轮（按需候选）"]
     Q --> M
     N -->|"通过"| T["kept=true"]
     M -->|"达到上限"| U["kept=false"]
     N -->|"达到上限"| U
-    T --> R["仅 kept=true 覆盖率"]
+    T --> R["仅 kept=true 覆盖率 + 函数 checkpoint"]
     U --> R
     R --> P["result*.csv + filter_manifest.json"]
     P --> S["filtered_tests*"]
@@ -101,14 +101,13 @@ flowchart LR
 
 ![路径集合最小化算法](assets/palm-cpp-path-minimization.png)
 
-在 Python 主流程中，只有 `mincover = true` 的条件链会被用于按路径生成测试。为了控制成本和噪音，当前实现还会跳过条件链过少或最小覆盖路径过多的函数：
+在 Python 主流程中，只有 `mincover = true` 的条件链会被用于按路径生成测试。当前实现不限制函数的条件链总数，但仍会跳过最小覆盖路径过多的函数：
 
 ```python
-MIN_CHAIN_NUM = 2
 MAX_MIN_COVER = 20
 ```
 
-也就是说，主流程只处理非重载运算符、条件链数量大于 2、最小覆盖路径数量不超过 20 的函数。
+也就是说，主流程处理最小覆盖路径数量不超过 20 的非重载运算符函数；条件链较少的简单函数也会进入生成流程。
 
 ### 3.3 Mock 需求
 
@@ -184,6 +183,11 @@ TEST(SomeClassTest, bool_SomeClass_find_int_int_001)
 // Expected result: a bool value: true.
 ```
 
+每条条件链的 Prompt 明确要求一次只返回一个测试。主流程先请求并立即检查第一个候选；
+只有该候选被过滤时才请求下一个，通过后立即停止，因此每条条件链实际生成 1 至 3 个
+候选，硬上限为 `MAX_TESTS_PER_CONDITION_CHAIN = 3`。这个生成上限与修复阶段的
+`--repair-choices` 是两个独立概念。
+
 对不含 `req` 的类型，模型会被要求尽可能生成覆盖行和分支的多个测试；随后 `utgen` 会用 libclang 解析模型返回内容，将多个 `TEST` 函数拆分成多个独立 `.cpp` 文件。
 
 ### 3.6 编译错误修复
@@ -195,6 +199,13 @@ TEST(SomeClassTest, bool_SomeClass_find_int_int_001)
 - `chattester.py`：借鉴 ChatTester 思路，先让模型推断函数意图并生成基础测试，再用编译错误中的 `<Buggy Line>` 迭代生成完整修复版测试文件。
 - `rust_assistant.py`：名称是历史遗留，实际用于 C/C++ GoogleTest 编译错误修复。它读取编译器 JSON 错误、抽取相关源码片段，要求模型返回 `ChangeLog`，再验证并应用修改。
 - `compile_repair.py`：面向当前流程新增的命令行入口，优先读取 `filter_manifest.json` 并只修复 `compile=fail` 的测试；缺少 manifest 时会退回到 `rust_assistant.py` 的全量扫描逻辑。脚本会重新执行编译命令确认结果，避免把历史 `.refined` 标记误当作真实修复成功。
+
+当前 ChangeLog Prompt 要求首行、文件名、行号和 OriginalCode/FixedCode 顺序明确。
+解析器可以容忍代码围栏、空白、大小写和常见连字符差异，但不会猜测修改：目标文件
+必须匹配，原始代码必须仍与磁盘内容一致，尾部插入必须连续。每轮修复按需请求候选，
+解析或安全校验失败时会把格式原因反馈给下一次请求；只有可安全应用的候选才触发构建，
+已经验证过的重复修改会跳过。编译器 error/note 的可读源码位置会连同末行加入 Prompt；
+`<scratch space>` 等不可读取的 Clang 伪路径会跳过，不再中断修复。
 
 `rust_assistant.py` 需要目标项目启用编译错误 JSON 输出：
 
@@ -215,7 +226,7 @@ add_compile_options(-fdiagnostics-format=json-file)
 - 原测试文件中嵌入的条件链需求注释。
 - 上一轮候选修复失败日志。
 
-Prompt 明确要求模型只修改当前 `test_*.cpp`，并禁止删除 `TEST`、删除被测函数调用、使用 `GTEST_SKIP`、替换为空断言、吞掉异常或屏蔽崩溃。模型仍然使用 `ChangeLog` 格式返回修改；脚本会先确认 ChangeLog 目标文件就是当前测试，再做静态规则检查，然后临时写入候选、重新构建并运行。只有候选满足 `compile pass && run pass` 时才会写回原测试并标记 `kept=true`，失败候选或验证异常会回滚并记录到 `repair_log`。
+Prompt 明确要求模型只修改当前 `test_*.cpp`，并禁止删除 `TEST`、删除被测函数调用、使用 `GTEST_SKIP`、替换为空断言、吞掉异常或屏蔽崩溃。模型仍然使用 `ChangeLog` 格式返回修改；脚本会先确认 ChangeLog 目标文件就是当前测试，再做静态规则检查，然后临时写入候选、重新构建并运行。每轮最多按 `--repair-choices` 逐个请求候选，前一候选不通过才请求下一个。只有候选满足 `compile pass && run pass` 时才会写回原测试并标记 `kept=true`，失败候选或验证异常会回滚并记录到 `repair_log`。
 
 ## 4. Workspace 结构
 
@@ -224,11 +235,12 @@ Prompt 明确要求模型只修改当前 `test_*.cpp`，并禁止删除 `TEST`�
 | `README.md` | 项目顶层使用流程概述。 |
 | `基于大模型的C_C++单元测试生成v2.pptx` | 技术方案和实验汇报 PPT；本文只抽取技术方案图片。 |
 | `docs/` | 本次生成的中文说明文档和图片资产。 |
-| `llvm-project/` | LLVM 17.0.6 中 `clang-tools-extra` 的局部工具源码，需要合入完整 LLVM 源码后构建。 |
-| `llvm-project/clang-tools-extra/brinfo/` | 条件链、路径约束、返回值和 Mock 需求提取工具。 |
-| `llvm-project/clang-tools-extra/focxt/` | 上下文构建工具，提取类型、函数、宏、include 和依赖代码。 |
-| `llvm-project/clang-tools-extra/include-finder/` | 项目内 include 提取工具，输出 `includes.json`。 |
+| `analysis-tools/` | 可直接链接已安装 LLVM/Clang 17 开发包的独立 CMake 工程，不需要完整 LLVM 源码树。 |
+| `analysis-tools/brinfo/` | 条件链、路径约束、返回值和 Mock 需求提取工具。 |
+| `analysis-tools/focxt/` | 上下文构建工具，提取类型、函数、宏、include 和依赖代码。 |
+| `analysis-tools/include-finder/` | 项目内 include 提取工具，输出 `includes.json`。 |
 | `utgen/` | Python 编排层，负责项目预处理、分析调用、Prompt 构建、测试生成、CMake 写入、编译和覆盖率统计。 |
+| `pyproject.toml`、`uv.lock` | Python 3.12 运行环境和完整依赖锁。 |
 | `utgen/main.py` | 项目级主入口。 |
 | `utgen/decldef.py` | 基于 `clang-scan-deps` 和 `clangd-indexer` 构建源文件依赖关系。 |
 | `utgen/utgen.py` | 核心 Project/SourceFile/Function 对象和测试生成逻辑。 |
@@ -251,7 +263,7 @@ Prompt 明确要求模型只修改当前 `test_*.cpp`，并禁止删除 `TEST`�
 
 ### 5.1 入口和命令行
 
-入口文件是 `llvm-project/clang-tools-extra/brinfo/BrInfo.cpp`。主要参数包括：
+入口文件是 `analysis-tools/brinfo/BrInfo.cpp`。主要参数包括：
 
 ```text
 brinfo --project <project-path> -p <build-path> [--cfg] [-f <function>] [-c <class>] <source>
@@ -333,7 +345,7 @@ brinfo --project <project-path> -p <build-path> [--cfg] [-f <function>] [-c <cla
 
 ### 6.1 入口流程
 
-入口文件是 `llvm-project/clang-tools-extra/focxt/Focxt.cpp`。主要参数包括：
+入口文件是 `analysis-tools/focxt/Focxt.cpp`。主要参数包括：
 
 ```text
 focxt --project <project-path> --build <build-path> [--file <source>] [--class <class>] [--function <function>] [--may-test] [--must-test <test-name>]
@@ -342,8 +354,8 @@ focxt --project <project-path> --build <build-path> [--file <source>] [--class <
 项目级运行流程：
 
 1. 解析 `--project` 和 `--build` 的真实路径。
-2. 遍历项目目录下的 C/C++ 源文件和头文件。
-3. 排除 `build`、`llm_tests`、`llm_coverage`、`leetcode` 等目录。
+2. 从 `compile_commands.json` 读取实际翻译单元，并排除文件名或目录名包含 `test`、目录名包含 `build` 的条目，与 Python 主流程的源文件筛选保持一致。
+3. 若 `<project>/includes.json` 存在，合并 `include-finder` 收集的项目内头文件；所有路径会规范化、限制在项目根目录内并去重排序。不会递归分析仓库中未参与目标构建的示例或工具源码。
 4. `GetClassesAndFunctions` 扫描项目内类、结构体、枚举、函数、模板和调用依赖。
 5. `GetFileContext` 为每个文件构造函数级上下文。
 6. 输出 `project_cxt.json`。
@@ -379,6 +391,8 @@ focxt --project <project-path> --build <build-path> [--file <source>] [--class <
 - `get_context`：找出文件内函数和方法。
 - `get_j`：为每个函数构造 `focal` 上下文 JSON。
 
+正常项目级流程会先运行 `include-finder`，因此编译数据库未单独列出的项目头文件仍会进入上下文分析。直接运行 `focxt` 时若省略 `includes.json`，输出只覆盖编译数据库中的翻译单元。
+
 最终 `project_cxt.json` 的顶层结构是源文件绝对路径，每个源文件下按函数或 `Class::method` 分组，每个分组下包含 `focal` 字段：
 
 ```json
@@ -408,13 +422,12 @@ focxt --project <project-path> --build <build-path> [--file <source>] [--class <
 | 输出 | 说明 |
 | --- | --- |
 | `project_cxt.json` | 项目级上下文信息，供 Python 主流程加载。 |
-| `<file>_cxt.json` | 旧 README 中提到的文件级输出形式；当前项目级代码主要使用 `project_cxt.json`。 |
 
 ## 7. `include-finder` 模块说明
 
 `include-finder` 通过 Clang 预处理器回调收集项目内 include 文件。
 
-入口文件是 `llvm-project/clang-tools-extra/include-finder/IncludeFinder.cpp`。它监听 `InclusionDirective`，当 include 文件真实路径位于目标项目根目录下时，将其加入集合并输出：
+入口文件是 `analysis-tools/include-finder/IncludeFinder.cpp`。它监听 `InclusionDirective`，当 include 文件真实路径位于目标项目根目录下时，将其加入集合并输出：
 
 ```text
 <project>/includes.json
@@ -431,26 +444,31 @@ Python 层的 `utils.collect_includes` 会在 `Project.__get_source_files` 中�
 `utgen/main.py` 支持：
 
 ```text
-python main.py -p <project-path> -b <build-path> [--no-analysis] [--post-analysis] [--compile-only] [--test-only] [--export-only] [--batch-workflow] [--max-repair-rounds N] [--repair-choices N] [--test-timeout N] [-s <source>] [-c <class>] [-f <function>]
+uv run --frozen python utgen/main.py -p <project-path> -b <build-path> [-t <type>] [--no-analysis] [--post-analysis] [--compile-only] [--test-only] [--export-only] [--batch-workflow] [--max-repair-rounds N] [--repair-choices N] [--test-timeout N] [--coverage-sonarqube-only] [--coverage-unity] [-s <source>] [-c <class>] [-f <function>]
 ```
 
-默认启用逐用例在线流程。`--max-repair-rounds` 设置编译修复和测试修复共享的总轮数，默认 10；`--repair-choices` 设置每轮候选数，默认 3；`--test-timeout` 设置单测试运行超时，默认 600 秒。`--batch-workflow` 可回退到历史的全部生成后统一检查流程。`-s/-c/-f` 会进入参数对象，但当前 `main.py` 没有基于它们切换单文件或单函数流程；单函数分析应直接调用底层 `brinfo` 和 `focxt`。
+默认启用逐用例在线流程。`--max-repair-rounds` 设置编译修复和测试修复共享的总轮数，默认 10；`--repair-choices` 设置每轮最多按需请求并验证的候选数，默认 3；`--test-timeout` 设置单测试运行超时，默认 600 秒。`--coverage-sonarqube-only` 省略逐函数 lcov info/HTML，只保留统计所需 SonarQube XML；`--coverage-unity` 尝试把符合安全条件的同函数测试合并编译，并自动回退逐文件目标。`--batch-workflow` 可回退到历史的全部生成后统一检查流程。`-s/-c/-f` 会进入参数对象，但当前 `main.py` 没有基于它们切换单文件或单函数流程；单函数分析应直接调用底层 `brinfo` 和 `focxt`。
 
-主流程中的四类测试类型固定为：
+`-t/--test-type` 可重复指定，命令行名称与内部目录后缀的映射为：
 
-```python
-test_types = ["", "_cxt", "_req", "_req_cxt"]
-```
+| 参数值 | 内部后缀 | 测试目录 |
+| --- | --- | --- |
+| `base` | 空字符串 | `llm_tests` |
+| `cxt` | `_cxt` | `llm_tests_cxt` |
+| `req` | `_req` | `llm_tests_req` |
+| `req-cxt` | `_req_cxt` | `llm_tests_req_cxt` |
+
+省略 `-t` 时处理全部四类。例如，`-t req -t req-cxt` 只处理需求增强和需求与上下文增强两类。
 
 正常运行时流程如下：
 
 1. `project.prepare(test_types, just_load=False)`
 2. 如未指定 `--no-analysis`，执行 `project.analyze()`
 3. `project.init_data()`
-4. 对四类测试类型分别串行生成函数测试；每写出一个 `test_*.cpp`，立即调用 `CaseWorkflow.process_generated_test`
+4. 对选中的测试类型分别串行生成函数测试；每写出一个 `test_*.cpp`，立即调用 `CaseWorkflow.process_generated_test`
 5. 单测试执行“构建、编译修复、运行、测试修复”，达到通过状态或总轮数上限后才继续下一个测试
-6. 对四类测试类型分别 `write_cmake_file`
-7. 以 `kept_only=True` 执行最终复验、覆盖率统计和 `filtered_tests*` 自动导出
+6. 对选中的测试类型分别 `write_cmake_file`
+7. 以 `kept_only=True` 执行最终复验、可恢复的函数级覆盖率统计和 `filtered_tests*` 自动导出
 
 指定 `--post-analysis` 时，只加载已有产物并重新统计结果，不重新分析和生成测试。指定 `--compile-only`、`--test-only` 或 `--export-only` 时，会自动进入 post-analysis 模式，只执行对应阶段。指定 `--batch-workflow` 时使用原有的 `gen_unit_test_concurrent` 和全量 post-analysis。
 
@@ -459,7 +477,7 @@ test_types = ["", "_cxt", "_req", "_req_cxt"]
 `Project.prepare` 会：
 
 - 创建 `llm_coverage`。
-- 创建 `llm_tests`、`llm_tests_cxt`、`llm_tests_req`、`llm_tests_req_cxt`。
+- 重置 `-t` 选中目录的 `CMakeLists.txt`；同时为其余标准类型补齐 CMake 所需的空目录，但不改动其中已有文件。未指定 `-t` 时准备全部四类目录。
 - 运行 CMake 配置，生成或刷新 `compile_commands.json`。
 - 从 `compile_commands.json` 和 `file_list.json` 收集源文件。
 - 调用 `comment_out` 注释源文件中的 `main`、`test`、`tests` 函数。
@@ -481,13 +499,13 @@ test_types = ["", "_cxt", "_req", "_req_cxt"]
 
 核心实现在 `Function.gen_unit_test`：
 
-- 如果测试类型包含 `req`，则按每条 `mincover` 条件链生成一个 Prompt，并让 LLM 一次返回 2 个候选测试。
+- 如果测试类型包含 `req`，则按每条 `mincover` 条件链生成一个 Prompt；每次只向 LLM 请求一个候选，候选通过后停止，否则继续请求，最多 3 个。
 - 如果测试类型不包含 `req`，则构造一个面向全函数覆盖的 Prompt，并让 LLM 一次返回完整测试集合。
 - 如果测试类型包含 `cxt`，则在 Prompt 中加入 `FocalCxt`。
 - 如果路径需求中包含 Mock，则加入 `TEST_CXT` 中的 gMock 示例。
 - LLM 返回结果会去掉 Markdown 代码块标记。
 - 使用 libclang 解析返回代码，提取 `TEST` 函数并拆分为单独文件。
-- `*_req*` 模式会先保存本轮两个原始响应，再逐个处理对应测试；两个测试检查完成后才发起下一条条件链请求。
+- `*_req*` 模式会把每个候选响应保存为 `prompt/<条件链>_response_<候选>.txt`，写出测试后立即进入 `CaseWorkflow`；只有当前候选被过滤时才生成下一个，最多 3 个，随后进入下一条条件链。
 - 非 `req` 模式会先完整拆分一次响应、写入 `.generated`，再逐个检查拆分后的测试。
 - LLM 响应和拆分测试通过临时文件加 `os.replace` 原子写入；重启时会复用有效缓存，空文件、截断文件或只有注释而没有测试宏的文件会重新生成。
 - `.generated` 只在至少产生一个有效 `test_*.cpp` 后创建；已有有效测试不会被覆盖，从而保留已经完成的修复。
@@ -531,14 +549,14 @@ test_types = ["", "_cxt", "_req", "_req_cxt"]
             └── CMakeLists.txt
 ```
 
-其中 `<type>` 可以为空、`_cxt`、`_req` 或 `_req_cxt`。`llm_tests*` 保存原始生成文件、修复结果和失败记录；`filtered_tests*` 只保存最终满足保留条件的测试，是后续集成和 C2Rust 流程应优先使用的目录。
+其中 `<type>` 可以为空、`_cxt`、`_req` 或 `_req_cxt`。`llm_tests*` 保存原始生成文件、修复结果和失败记录；`filtered_tests*` 只保存最终满足保留条件的测试，是后续集成应优先使用的目录。
 
 测试文件命名规则如下：
 
 | 生成模式 | 文件名示例 | 含义 |
 | --- | --- | --- |
 | 非 `req` | `test_001.cpp` | 模型一次返回多个测试，按拆分顺序使用三位编号。 |
-| `req` | `test_001_1.cpp`、`test_001_2.cpp` | 第一段数字是条件链编号，第二段数字是同一条件链的候选编号。 |
+| `req` | `test_001_1.cpp` 至 `test_001_3.cpp` | 第一段数字是条件链编号，第二段数字是按需生成的候选编号；通过后停止，所以通常不会出现全部三个。 |
 
 源文件目录保留源文件名；函数目录由 `format_sig()` 把函数签名中的空格、指针、引用和标点转换为可用于路径的形式。文件路径同时也是 manifest 中识别测试状态的主键，因此不建议在流程运行期间手工重命名 `test_*.cpp`。
 
@@ -705,6 +723,24 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 
 如果被测函数声明在头文件中，但需要链接对应 `.cpp` 定义文件，代码会根据情况追加相对源文件路径。外层源文件目录和测试类型目录也会写入 `add_subdirectory`。
 
+上面的函数级聚合目标在生成结束后写入，供批处理和后分析使用。默认在线生成/修复
+使用 `SingleTestSession`：它清理项目根下的临时 `llm_coverage/`，写入只包含当前
+`test_*.cpp`、必要被测源文件及依赖的 CMake 目标，再重新配置项目。目标名由测试路径
+稳定生成，同一测试的多个修复候选复用该 session；其他测试文件不会参与本次编译和
+运行。函数目录自己的聚合 `CMakeLists.txt` 不会被这一过程临时改写。
+
+最终覆盖率阶段使用独立的 `llm_coverage/CMakeLists.txt`。逐文件路径为每个保留测试
+创建独立目标，且 `add_executable` 直接引用原始生成测试的绝对路径，而不是复制后的
+临时路径，从而保留目标项目根据测试源目录施加的 include、宏或强制包含规则。函数内
+多个目标会先在一次 `cmake --build --target ...` 中批量构建，失败时再逐个构建以隔离
+问题。只清理当前覆盖率临时目录和计数输出，不删除整个构建目录，因此 Ninja/CMake
+缓存可以跨函数复用。
+
+当 `Project.post_analysis` 处于 `do_test=True, do_compile=False` 的覆盖率-only 路径时，
+`temporarily_disable_generated_test_targets` 会暂时把所选 `llm_tests*/CMakeLists.txt`
+顶层内容置空，使 CMake 不加载完整聚合测试树；上下文管理器的 `finally` 会在正常结束、
+异常或中断时恢复原文，不删除生成测试或函数级 CMake 文件。
+
 ### 8.7 编译、运行和覆盖率统计
 
 `expt.py` 负责统计：
@@ -722,13 +758,15 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 默认在线统计流程：
 
 1. `CaseWorkflow` 为当前测试创建或恢复 manifest 记录，并用 `SingleTestSession` 配置稳定的单测试目标。
-2. 首次构建不计入修复轮数；失败后调用现有编译修复能力。在线编译修复每轮只处理一个错误、只发起一次逻辑 LLM 请求，`--repair-choices` 控制该请求返回的候选数量。
+2. 首次构建不计入修复轮数；失败后调用现有编译修复能力。在线编译修复每轮只处理一个错误，并按需请求和验证候选；`--repair-choices` 是该轮候选上限，不要求接口一次返回多个回答。
 3. 测试对象编译成功但完整目标失败时，链接错误直接终止为 `link_failure_no_progress`；缺少测试编译命令、被测源文件或依赖编译失败则记为基础设施错误并等待重试，不消耗修复轮数，也不会错误过滤测试。
 4. 构建通过后立即运行；断言、Mock、异常、崩溃、超时或零有效测试失败会进入测试修复，每个候选重新经过完整构建和运行。运行前会删除旧 XML；进程返回 0 但本次 GoogleTest XML 缺失、损坏，或不包含至少一个非禁用、非跳过且已完成的测试时，都不会标记为通过。批处理与手动 `--test-only` 使用同一判定规则。
-5. 编译修复和测试修复共享 `repair_rounds`，默认总上限为 10；每轮最多一次逻辑 LLM 请求。通过时设置 `workflow_status=passed` 和 `kept=true`，耗尽上限时设置 `workflow_status=filtered` 和 `kept=false`。
-6. 每个状态变化都以临时文件加 `os.replace` 的方式原子写入 `filter_manifest.json`；最终后分析、编译修复和测试修复脚本使用同一原子写入实现，不会以普通覆盖写破坏可恢复清单。
-7. 全部测试完成后，`gen_covtest_result(..., kept_only=True)` 只复验 `kept=true` 测试；最终复验失败的测试会降级为 `filtered`。
-8. `load_coverage` 解析 SonarQube XML，`dump_to_csv` 输出 `result*.csv`，`export_filtered_tests` 自动生成 `filtered_tests*`。
+5. 编译修复和测试修复共享 `repair_rounds`，默认总上限为 10。通过时设置 `workflow_status=passed` 和 `kept=true`，耗尽上限时设置 `workflow_status=filtered` 和 `kept=false`；达到第 8 轮后，如果归一化失败指纹连续两次没有变化，会以 `repair_no_progress` 提前停止。
+6. 处理中状态先原子写入 `filter_manifest.checkpoint.json`，到达 `passed`、`filtered` 或明确中断状态时合并进 `filter_manifest.json` 并删除临时 checkpoint。重启会先恢复未合并记录；最终后分析和独立修复脚本也使用原子写入，不会以普通覆盖破坏清单。
+7. 全部测试完成后，`gen_covtest_result(..., kept_only=True)` 只复验 `kept=true` 测试；最终复验失败的测试会降级为 `filtered`。函数级覆盖率目标在 GCC、Clang 和 AppleClang 下自动添加目标作用域的 `-g0`，但保留覆盖率插桩。
+8. 同函数逐文件目标先批量构建、失败后逐个隔离。启用 `--coverage-unity` 时，满足资格的多个测试会先合并成临时源文件；不满足资格直接使用逐文件模式，合并后的配置、构建、逐测试过滤运行或 XML/覆盖率校验失败则记录 `unity_fallback.log` 并自动回退。
+9. 成功且全部选中测试通过的函数写入 `.coverage_checkpoint.json`。后续运行在被测源码、`include.h`、测试哈希和状态、`coverage.xml` 及 SonarQube-only 模式均匹配时直接恢复，否则只重跑该函数。
+10. `load_coverage` 解析 SonarQube XML，`dump_to_csv` 输出 `result*.csv`，`export_filtered_tests` 自动生成 `filtered_tests*`。
 
 手动 `--compile-only`、`--test-only` 和独立修复脚本仍保留原有批处理用途。
 
@@ -737,9 +775,9 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 | 字段 | 说明 |
 | --- | --- |
 | `workflow_status` | `pending`、`checking`、`passed`、`filtered` 或 `interrupted`。 |
-| `repair_rounds` | 当前测试已消耗的编译/运行共享修复轮数；每轮最多一次逻辑 LLM 请求。 |
+| `repair_rounds` | 当前测试已消耗的编译/运行共享修复轮数；每轮可按需尝试最多 `--repair-choices` 个候选。 |
 | `repair_stage` | 当前修复阶段，取 `compile`、`test` 或空字符串。 |
-| `terminal_reason` | `max_repair_rounds`、`missing_include`、`final_run_failure` 等终态原因。 |
+| `terminal_reason` | `max_repair_rounds`、`repair_no_progress`、`missing_include`、`final_run_failure` 等终态原因。 |
 | `content_hash` | 测试文件 SHA-256；hash 缺失或人工修改后会重置旧终态并重新检查，不能直接通过 `--export-only` 导出。 |
 
 输出 CSV 包含：
@@ -775,7 +813,7 @@ target_link_libraries(llm_test_req_cxt_<inode>_<function_sig> gmock_main)
 如果已经生成过 `deps.json` 和 `decl_def.yaml`，可使用 `--no-preprocess` 跳过工具调用，只重新生成字典：
 
 ```sh
-python decldef.py -p <project-path> -b <build-path> --no-preprocess
+uv run --frozen python utgen/decldef.py -p <project-path> -b <build-path> --no-preprocess
 ```
 
 ## 9. 数据流与目录依赖
@@ -792,7 +830,7 @@ python decldef.py -p <project-path> -b <build-path> --no-preprocess
 主流程会在目标项目下创建或更新：
 
 ```text
-llm_coverage/
+llm_coverage/                    # 最终覆盖率阶段的临时 CMake 源目录
 llm_tests/
 llm_tests_cxt/
 llm_tests_req/
@@ -812,6 +850,7 @@ result_req_cxt.csv
 ```text
 llm_tests_req_cxt/
   filter_manifest.json
+  filter_manifest.checkpoint.json  # 处理中短暂存在
   source.cpp/
     bool_Class_find_int_int/
       include.h
@@ -819,37 +858,41 @@ llm_tests_req_cxt/
         001.txt
         001_response_1.txt
         001_response_2.txt
+        001_response_3.txt          # 前两个均未通过时才可能生成
         002.txt
       test_001_1.cpp
       test_001_2.cpp
+      test_001_3.cpp                # 前两个均未通过时才可能生成
       CMakeLists.txt
       .generated
+      .coverage_checkpoint.json
       compile_err.log
       workflow_*.log
       test_repair_*.log
+      unity_fallback.log
       result.xml
       coverage.xml
       coverage/
       cov_cmake.txt
+      cov_unity_cmake.txt
 ```
+
+`.coverage_checkpoint.json` 只在该函数的最终覆盖率完整成功时出现；
+`unity_fallback.log` 和 `cov_unity_cmake.txt` 只在启用或尝试 Unity 路径时可能出现。
+`llm_coverage/` 会在不同函数之间重建，不是最终交付目录；应以函数目录中的 XML、
+`result*.csv`、`filter_manifest.json` 和 `filtered_tests*` 为准。
 
 ## 10. 运行说明
 
 ### 10.1 准备 Python 环境
 
-可以用 `uv` 创建虚拟环境：
+项目使用根目录的 `pyproject.toml`、`.python-version` 和 `uv.lock` 管理 Python 3.12 及依赖。在仓库根目录执行：
 
 ```sh
-uv venv .venv
-source .venv/bin/activate
-uv pip install requests libclang lxml pyyaml xmltodict matplotlib numpy
+uv sync --frozen
 ```
 
-注意：
-
-- `argparse` 是标准库，不需要安装。
-- 如果使用 conda，可安装 `python-clang`；如果使用 pip，通常安装 `libclang` 包。
-- `libclang.so` 和 Python clang 绑定版本需要一致，否则 `clang.cindex` 解析可能失败。
+uv 会创建或更新根目录下的 `.venv`，无需手动激活。后续命令统一写成 `uv run --frozen python utgen/<script>.py ...`，确保使用锁定环境，并防止本机 Python 索引配置改写 `uv.lock`。当前 Python `libclang` 绑定固定为 17.0.6；`LIBCLANG_PATH` 指向的动态库也应属于 LLVM 17 系列，否则 `clang.cindex` 解析可能失败。
 
 ### 10.2 配置 `config_private.py`
 
@@ -858,76 +901,130 @@ uv pip install requests libclang lxml pyyaml xmltodict matplotlib numpy
 ```python
 import os
 
-URL = "https://your-llm-endpoint/v1/chat/completions"
+URL = "https://your-llm-endpoint"
 API_KEY = "sk-..."
-LIBCLANG_PATH = "/path/to/libclang.so"
+MODEL = "your-model-name"
+LLM_API_STYLE = "chat_completions"  # 或 "responses"
+LLM_STREAM = True
+LLM_CONNECT_TIMEOUT = 15
+LLM_READ_TIMEOUT = 180
+LIBCLANG_PATH = "/path/to/libclang.so"  # macOS 使用 libclang.dylib
 BRINFO_PATH = "/path/to/brinfo"
 FOCXT_PATH = "/path/to/focxt"
 CPU_COUNT = os.cpu_count() or 4
-CLANG_SCAN_DEPS_PATH = "/path/to/clang-scan-deps-17"
+CLANG_SCAN_DEPS_PATH = "/path/to/clang-scan-deps"
 CLANGD_INDEXER_PATH = "/path/to/clangd-indexer"
 ```
 
-`utgen/.gitignore` 已经忽略 `config_private.py`。如果把配置文件放到其他目录，仍需确认不会把 API key、本机工具路径等敏感信息提交到版本库。
+`URL` 只填写服务基础地址。程序按照 `LLM_API_STYLE` 自动追加
+`/v1/chat/completions` 或 `/v1/responses`，同时兼容迁移前填写的完整端点。
+`LLM_STREAM` 控制 SSE 流式传输；连接超时和读取空闲超时分别由
+`LLM_CONNECT_TIMEOUT`、`LLM_READ_TIMEOUT` 控制。可重试的 HTTP、SSE/JSON
+协议或网络异常会先立即请求一次，并在失败后等待 5 秒和 10 秒各重试一次；
+URL/API 风格错误和不可重试 HTTP 状态属于配置错误，会立即返回。`MODEL` 会作为
+请求的 `model` 字段，用于选择接口提供的模型。`utgen/.gitignore` 已经忽略
+`config_private.py`。`brinfo` 和 `focxt` 使用这里配置的绝对路径；
+`include-finder` 由程序从 `PATH` 查找。如果把配置文件放到其他目录，仍需确认
+不会把 API Key、本机工具路径等敏感信息提交到版本库。
 
 ### 10.3 构建 Clang Tooling 工具
 
-`llvm-project/` 目录只包含 LLVM 17.0.6 中需要新增或修改的一小部分文件。构建时需要先下载完整 LLVM 17.0.6 源码，再把本仓库中的工具目录合入 `clang-tools-extra`。
-
-示例流程：
+`analysis-tools/` 已经是独立 CMake 工程，直接查找已安装的 LLVM/Clang 17 开发包，不再要求下载或构建完整 LLVM 源码树。在仓库根目录执行：
 
 ```sh
-git clone https://github.com/llvm/llvm-project.git
-cd llvm-project
-git checkout llvmorg-17.0.6
+cmake -S analysis-tools -B analysis-tools/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm \
+  -DClang_DIR=/path/to/llvm/lib/cmake/clang
+cmake --build analysis-tools/build
 ```
 
-将本仓库中的以下目录复制到完整 LLVM 源码对应位置：
+`LLVM_DIR` 和 `Clang_DIR` 必须分别包含 `LLVMConfig.cmake` 与 `ClangConfig.cmake`。项目在配置阶段检查 LLVM 主版本必须为 17。nlohmann/json 会优先从系统查找；缺失时 CMake 通过 `FetchContent` 下载并校验 3.11.3 归档。
+
+CMake 默认从 `${LLVM_LIBRARY_DIR}/clang/17` 识别 Clang 资源目录，并将 `-resource-dir` 注入三个工具的 LibTooling 调用。这样工具安装到独立前缀后仍能解析 `stdarg.h`、`stdalign.h` 和架构相关内建头文件。非标准布局可增加以下配置项：
+
+```sh
+-DCPP_UTGEN_CLANG_RESOURCE_DIR="$(/path/to/clang-17 -print-resource-dir)"
+```
+
+资源目录在构建时写入可执行文件；LLVM/Clang 安装位置变化后需要重新配置并构建。配置阶段会验证该目录下存在 `include/`，避免生成只能处理无系统头文件样例的分析工具。
+
+构建后运行实际工具冒烟测试：
+
+```sh
+ctest --test-dir analysis-tools/build --output-on-failure
+```
+
+测试会针对包含 C 内建头文件和 C++ 标准库的小型 fixture 实际运行 `brinfo`、`focxt` 和 `include-finder`，并校验需求 JSON、CFG DOT、上下文 JSON 和 include JSON。可执行文件位于：
 
 ```text
-clang-tools-extra/brinfo/
-clang-tools-extra/focxt/
-clang-tools-extra/include-finder/
-clang-tools-extra/CMakeLists.txt
+analysis-tools/build/brinfo/brinfo
+analysis-tools/build/focxt/focxt
+analysis-tools/build/include-finder/include-finder
 ```
 
-配置和构建：
+如需统一安装：
 
 ```sh
-cmake -S llvm -B build -G Ninja \
-  -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" \
+cmake --install analysis-tools/build --prefix "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+`brinfo` 的 CFG DOT 格式化扩展保存在 `analysis-tools/brinfo/CFGDOT.h`。该文件包含系统公开的 `clang/Analysis/CFG.h`，并调用 LLVM 17 的公共 `llvm::WriteGraph`；它不会替换或修改系统 LLVM 头文件，也不要求定制 LLVM 构建。
+
+#### 10.3.1 macOS
+
+确认 Xcode Command Line Tools 后，通过 Homebrew 安装 LLVM/Clang 17 开发包和构建依赖：
+
+```sh
+xcode-select -p
+brew install llvm@17 cmake ninja uv nlohmann-json lcov
+LLVM17="$(brew --prefix llvm@17)"
+```
+
+`llvm@17` 是 keg-only，无需强制链接。Apple Silicon 和 Intel Mac 的 Homebrew 前缀不同，应始终通过 `brew --prefix llvm@17` 获取。配置命令为：
+
+```sh
+LLVM17="$(brew --prefix llvm@17)"
+cmake -S analysis-tools -B analysis-tools/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DLLVM_TARGETS_TO_BUILD=host \
-  -DLLVM_ENABLE_DUMP=ON
-
-cmake --build build --target brinfo
-cmake --build build --target focxt
-cmake --build build --target include-finder
+  -DCMAKE_C_COMPILER="$LLVM17/bin/clang" \
+  -DCMAKE_CXX_COMPILER="$LLVM17/bin/clang++" \
+  -DLLVM_DIR="$LLVM17/lib/cmake/llvm" \
+  -DClang_DIR="$LLVM17/lib/cmake/clang"
+cmake --build analysis-tools/build
+ctest --test-dir analysis-tools/build --output-on-failure
 ```
 
-安装：
+Apple Silicon 常见配置路径如下；Intel Mac 应根据实际 Homebrew 前缀调整：
+
+```python
+LIBCLANG_PATH = "/opt/homebrew/opt/llvm@17/lib/libclang.dylib"
+CLANG_SCAN_DEPS_PATH = "/opt/homebrew/opt/llvm@17/bin/clang-scan-deps"
+```
+
+Homebrew 的 `llvm@17` 不包含 `clangd-indexer`。可安装 clangd 17.0.3 官方 macOS indexing tools：
 
 ```sh
-cmake --install build --component brinfo
-cmake --install build --component focxt
-cmake --install build --component include-finder
-cmake --install build --component clang-resource-headers
+curl -fLO https://github.com/clangd/clangd/releases/download/17.0.3/clangd_indexing_tools-mac-17.0.3.zip
+unzip clangd_indexing_tools-mac-17.0.3.zip
+mkdir -p "$HOME/.local/bin"
+install -m 0755 clangd_17.0.3/bin/clangd-indexer "$HOME/.local/bin/clangd-indexer"
+"$HOME/.local/bin/clangd-indexer" --help
 ```
 
-安装后确认：
+该二进制支持 arm64 和 x86_64，并提供当前预处理流程所需的 `--executor=all-TUs` 与 `--format=yaml`。建议 libclang、Python Clang 绑定、`clang-scan-deps` 和 `clangd-indexer` 都保持 LLVM 17 主版本。下载来源见 [clangd 17.0.3 官方发布页](https://github.com/clangd/clangd/releases/tag/17.0.3)。
 
-```sh
-brinfo --help
-focxt --help
-include-finder --help
-```
+构建静态分析工具不需要覆盖率工具。完整流程的覆盖率阶段会使用 `gcov`、`lcov` 和由 `uv.lock` 安装的 `gcovr`；默认完整报告链还需要 `genhtml`，使用 `--coverage-sonarqube-only` 时则不需要生成 HTML。macOS 上不同 Clang 与 gcov 实现的格式兼容性可能不同，应先用目标项目实际编译器在小型项目上验证覆盖率捕获和 SonarQube XML；需要 HTML 时再验证 lcov/genhtml 链路。
 
 ### 10.4 准备目标 C/C++ 项目
 
 目标项目需要能用 CMake 配置出 `compile_commands.json`：
 
 ```sh
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -S <target-project> -B <target-project>/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
 
 如果项目本身不使用 CMake，可以考虑用 Bear 生成编译数据库；如果是头文件为主的库，可能需要在项目根目录创建 `file_list.json`，写入需要分析文件的绝对路径：
@@ -986,10 +1083,10 @@ exit 0
 
 ### 10.5 生成文件依赖关系
 
-在本仓库 `utgen/` 目录下运行：
+在本仓库根目录运行：
 
 ```sh
-python decldef.py -p <target-project> -b <target-project>/build
+uv run --frozen python utgen/decldef.py -p <target-project> -b <target-project>/build
 ```
 
 生成结果位于：
@@ -1005,10 +1102,10 @@ python decldef.py -p <target-project> -b <target-project>/build
 
 ### 10.6 运行项目级分析、生成和统计
 
-在本仓库 `utgen/` 目录下运行：
+在本仓库根目录运行：
 
 ```sh
-python main.py -p <target-project> -b <target-project>/build
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build
 ```
 
 该命令会：
@@ -1020,14 +1117,14 @@ python main.py -p <target-project> -b <target-project>/build
 5. 并发调用 `brinfo` 为每个源文件生成 `llm_reqs/*_req.json`。
 6. 加载需求和上下文。
 7. 生成四类测试；每生成一个测试文件就立即编译、按需修复并运行。
-8. 单测试默认最多使用 10 轮编译/运行共享修复轮数，每轮最多一次逻辑 LLM 请求；失败测试保留原文件并标记为 `kept=false`。
-9. 写入 CMakeLists，只复验 `kept=true` 测试并收集覆盖率。
+8. 单测试默认最多使用 10 轮编译/运行共享修复轮数，每轮最多按需请求 3 个候选；重复候选不会重复构建，持续无进展可提前过滤。失败测试保留原文件并标记为 `kept=false`。
+9. 写入 CMakeLists，只复验 `kept=true` 测试并收集函数级覆盖率；复用构建缓存，并恢复输入仍匹配的成功 checkpoint。
 10. 输出 `result*.csv`、`filter_manifest.json` 和 `filtered_tests*`。
 
 可以调整在线流程参数：
 
 ```sh
-python main.py -p <target-project> -b <target-project>/build \
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build \
   --max-repair-rounds 10 \
   --repair-choices 3 \
   --test-timeout 600
@@ -1035,41 +1132,57 @@ python main.py -p <target-project> -b <target-project>/build \
 
 如果需要复现历史流程，可增加 `--batch-workflow`，改为先并发生成全部测试，再统一执行 post-analysis。
 
+大型项目只需要 XML/CSV 覆盖率时，可以在同一命令增加：
+
+```sh
+--coverage-sonarqube-only --coverage-unity
+```
+
+前者跳过逐函数 lcov HTML 链，后者只对满足安全条件的函数尝试合并编译，并自动
+回退逐文件模式。这两个参数不会改变逐测试生成和修复阶段。
+
 如果已经有 `llm_reqs/` 和 `project_cxt.json`，只想重新生成测试和统计：
 
 ```sh
-python main.py -p <target-project> -b <target-project>/build --no-analysis
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --no-analysis
 ```
 
 如果测试已经生成，只想重新统计编译、运行和覆盖率：
 
 ```sh
-python main.py -p <target-project> -b <target-project>/build --post-analysis
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --post-analysis
 ```
 
 默认流程已经自动执行修复和导出。如果处理的是旧批处理产物，或希望在阶段之间人工介入，可以使用轻量阶段参数：
 
 ```sh
 # 只做编译检查并写入 llm_tests*/filter_manifest.json
-python main.py -p <target-project> -b <target-project>/build --compile-only
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --compile-only
 
 # 只运行 compile=pass 的测试，只用 run=pass 的测试统计覆盖率
-python main.py -p <target-project> -b <target-project>/build --test-only
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --test-only
 
 # 只导出 kept=true 的测试到 filtered_tests*
-python main.py -p <target-project> -b <target-project>/build --export-only
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --export-only
 ```
 
 `--compile-only`、`--test-only` 和 `--export-only` 会自动进入 post-analysis 模式，不会重新调用 LLM 生成测试。加载 manifest 时会比较测试文件 SHA-256；hash 缺失或内容已变化的记录不会恢复旧 `kept=true`，应先重新执行编译和测试检查，再运行导出。
 
 ### 10.7 单独运行底层分析工具
 
-分析单个源文件所有函数：
+使用 `brinfo` 分析单个源文件中的全部函数：
 
 ```sh
 brinfo --project <target-project> -p <target-project>/build <source-file>
-focxt --project <target-project> --build <target-project>/build --file <source-file>
 ```
+
+使用 `focxt` 生成项目级上下文：
+
+```sh
+focxt --project <target-project> --build <target-project>/build
+```
+
+`focxt` 当前以 `project_cxt.json` 为稳定输出接口，不应依赖 `--file`、`--class` 或 `--function` 产生独立输出。
 
 分析单个自由函数：
 
@@ -1100,21 +1213,21 @@ add_compile_options(-fdiagnostics-format=json-file)
 示例命令：
 
 ```sh
-python compile_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
+uv run --frozen python utgen/compile_repair.py -p <target-project> -b <target-project>/build -t req-cxt
 ```
 
 运行失败修复使用 `test_repair.py`。它读取 `filter_manifest.json`，只处理 `compile=pass` 且 `run=fail` 或 `run=timeout` 的测试：
 
 ```sh
-python test_repair.py -p <target-project> -b <target-project>/build -t _req_cxt
+uv run --frozen python utgen/test_repair.py -p <target-project> -b <target-project>/build -t req-cxt
 ```
 
 这些独立脚本主要用于旧产物和人工补跑。修复后建议重新运行对应阶段：
 
 ```sh
-python main.py -p <target-project> -b <target-project>/build --compile-only
-python main.py -p <target-project> -b <target-project>/build --test-only
-python main.py -p <target-project> -b <target-project>/build --export-only
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --compile-only
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --test-only
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build --export-only
 ```
 
 ## 11. 常见问题与注意事项
@@ -1129,11 +1242,11 @@ python main.py -p <target-project> -b <target-project>/build --export-only
 
 ### 11.3 `libclang` 版本需要一致
 
-Python 层使用 `clang.cindex` 解析模型返回的测试和目标源码。`LIBCLANG_PATH` 指向的 `libclang.so` 应与 Python binding 版本一致。
+Python 层使用 `clang.cindex` 解析模型返回的测试和目标源码。`LIBCLANG_PATH` 指向的 `libclang.so`（Linux）或 `libclang.dylib`（macOS）应与 Python binding 保持 LLVM 17 主版本一致。
 
 ### 11.4 LLM 调用成本较高
 
-项目级生成会对许多函数和路径请求模型。`Function.gen_unit_test` 会原子保存响应和测试，并通过 `.generated` 避免重复生成；无效或截断缓存不会被当作完成结果。在线修复每轮最多一次逻辑 LLM 请求，但网络层在请求异常时仍可能执行一次传输重试。
+项目级生成会对许多函数和路径请求模型。`Function.gen_unit_test` 会原子保存响应和测试，并通过 `.generated` 避免重复生成；无效或截断缓存不会被当作完成结果。`*_req*` 每条条件链一次只请求一个候选，通过后停止，最多 3 个。在线修复每轮也按需逐个请求候选，最多为 `--repair-choices`，不会为了凑满候选预先请求。每个 API 请求遇到可重试异常时会在 5 秒和 10 秒后重试，总计最多 3 次传输；仍失败会作为 `LLMTransportError` 中断项目，避免后续函数快速级联失败，并保留可续跑状态。
 
 ### 11.5 不是所有函数都会生成测试
 
@@ -1168,36 +1281,48 @@ README 中建议加入 `-fno-exceptions` 和覆盖率配置，但某些项目依
 
 ### 11.10 断点续跑
 
-在线流程每轮都会原子更新 manifest。重新运行同一命令时：
+在线流程把当前记录原子写入 `filter_manifest.checkpoint.json`，到达终态或明确中断时
+再合并进 `filter_manifest.json`。重新运行同一命令时：
 
 - 文件内容未变化且状态为 `passed` 或 `filtered` 的测试会跳过。
 - `checking` 或 `interrupted` 测试会从已有 `repair_rounds` 继续。
 - 修改过的测试因 `content_hash` 变化会重新从初始检查开始。
 - 如果旧记录因 `max_repair_rounds` 被过滤，提高新的轮数上限后会继续使用新增轮数。
+- 已成功完成最终覆盖率的函数会从 `.coverage_checkpoint.json` 恢复。checkpoint 会核对被测源码和 `include.h` 的时间戳/大小、选中测试的哈希/状态/文件戳、`coverage.xml` 以及 SonarQube-only 模式；任何一项不一致都会只重跑该函数。
+- Unity 和逐文件只是可互换的构建策略，因此切换 `--coverage-unity` 不会使已有有效覆盖率 checkpoint 失效；切换 `--coverage-sonarqube-only` 会失效。
+
+### 11.11 最终覆盖率优化的边界
+
+- `--coverage-unity` 要求同函数至少两个可读文件，每个文件恰有一个启用且名称唯一的普通 `TEST`/`TEST_F`，本地 include 顺序一致，并且没有自定义 `main`/GoogleTest 运行时、`extern "C"`/asm 或除字面量 `#include` 外的预处理指令。
+- Unity 可用时，每个测试仍通过独立 `--gtest_filter` 运行并验证恰好执行一个测试。资格不符直接使用逐文件模式；配置、构建、运行或覆盖率/XML 校验失败会写 `unity_fallback.log` 后自动回退。
+- 所有最终覆盖率目标会对 GCC、Clang 和 AppleClang 自动添加目标作用域的 `-g0`。它只省略调试符号，不关闭覆盖率插桩，也不改变生成/修复阶段目标。
+- `--coverage-sonarqube-only` 保留 SonarQube XML、函数目录 `coverage.xml` 和 CSV 统计，但不生成 lcov info 与 HTML。需要可浏览的逐函数 HTML 时不要使用该选项。
 
 ## 12. 推荐运行顺序
 
 最小完整流程如下：
 
 ```sh
-# 1. 准备 Python 环境
-uv venv .venv
-source .venv/bin/activate
-uv pip install requests libclang lxml pyyaml xmltodict matplotlib numpy
+# 1. 在 cpp-utgen 仓库根目录同步锁定环境
+uv sync --frozen
 
 # 2. 配置目标项目
-cmake -B <target-project>/build -G Ninja \
+cmake -S <target-project> -B <target-project>/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 # 3. 生成跨文件依赖
-cd /path/to/cpp-utgen/utgen
-python decldef.py -p <target-project> -b <target-project>/build
+uv run --frozen python utgen/decldef.py \
+  -p <target-project> \
+  -b <target-project>/build
 
 # 4. 分析、逐用例生成/检查/修复、kept-only 覆盖率和导出
-python main.py -p <target-project> -b <target-project>/build \
+uv run --frozen python utgen/main.py -p <target-project> -b <target-project>/build \
   --max-repair-rounds 10 --repair-choices 3 --test-timeout 600
 ```
+
+若最终只交付 XML/CSV 覆盖率，可在最后一条命令追加
+`--coverage-sonarqube-only --coverage-unity`；需要逐函数 HTML 时只省略前一个参数。
 
 推荐优先查看最终四个 CSV 和四类 manifest：
 

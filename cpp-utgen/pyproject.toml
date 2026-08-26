@@ -1,0 +1,18 @@
+[project]
+name = "cpp-utgen"
+version = "0.1.0"
+description = "LLM-assisted C and C++ unit test generation tools"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "gcovr>=8.6",
+  "libclang==17.0.6",
+  "matplotlib>=3.8,<4",
+  "numpy>=1.26,<3",
+  "pyyaml>=6,<7",
+  "requests>=2.31,<3",
+  "xmltodict>=0.13,<1",
+]
+
+[tool.uv]
+package = false

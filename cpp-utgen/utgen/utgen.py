@@ -2,6 +2,7 @@ import json
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -13,8 +14,10 @@ from context import FocalCxt, TestCxt
 from expt import Expt
 from funccommenter import comment_out
 from utils import (
+    TEST_TYPE_SUFFIXES,
     ExptFileData,
     ExptFuncData,
+    LLMTransportError,
     cmake_config,
     collect_includes,
     create_dir_with_cmake,
@@ -23,24 +26,22 @@ from utils import (
     get_test_from_LLM,
     is_header,
     is_test_or_build_file,
+    remove_macros,
     run_command,
     write_text_best_effort,
 )
-
-from c_test_format import sanitize_generated_test_source
 
 try:
     from config_private import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
 except ImportError:
     from config import LIBCLANG_PATH, BRINFO_PATH, FOCXT_PATH, CPU_COUNT
 
-if LIBCLANG_PATH:
-    clang.cindex.Config.set_library_file(LIBCLANG_PATH)
+clang.cindex.Config.set_library_file(LIBCLANG_PATH)
 
 from prompt import NOREQ, PROMPT, TEST_CXT, TEST_INCLUDE
 
-MIN_CHAIN_NUM = 2
 MAX_MIN_COVER = 20
+MAX_TESTS_PER_CONDITION_CHAIN = 3
 TEST_FUNCTION_PATTERN = re.compile(
     r"\b(?:TEST(?:_F|_P)?|TYPED_TEST(?:_P)?)\s*\("
 )
@@ -63,6 +64,25 @@ def atomic_write_text(file_path: str, content: str) -> None:
             os.remove(temp_path)
 
 
+@contextmanager
+def temporarily_disable_generated_test_targets(
+    project_path: str, test_types: list[str], enabled: bool
+):
+    """Avoid loading the full generated-test CMake tree during coverage-only runs."""
+    original_contents: dict[str, str] = {}
+    try:
+        if enabled:
+            for test_type in test_types:
+                cmake_path = f"{project_path}/llm_tests{test_type}/CMakeLists.txt"
+                if os.path.isfile(cmake_path):
+                    original_contents[cmake_path] = Path(cmake_path).read_text()
+                    Path(cmake_path).write_text("")
+        yield
+    finally:
+        for cmake_path, content in original_contents.items():
+            Path(cmake_path).write_text(content)
+
+
 def is_valid_test_content(content: str) -> bool:
     code = COMMENT_PATTERN.sub("", content)
     return bool(code.strip() and TEST_FUNCTION_PATTERN.search(code))
@@ -83,7 +103,14 @@ def log_include_failure(test_dir: str, exc: Exception) -> None:
 def extract_functions_index(node, cpp_code: str) -> list[tuple[int, int]]:
     functions: list[tuple[int, int]] = []
     for child in node.get_children():
-        if child.kind == clang.cindex.CursorKind.FUNCTION_DECL:  # type: ignore
+        try:
+            child_kind = child.kind
+        except ValueError:
+            # A newer libclang can expose cursor kinds that the installed
+            # Python bindings do not know yet. Skip only the kind comparison;
+            # the cursor may still contain TEST functions in its subtree.
+            child_kind = None
+        if child_kind == clang.cindex.CursorKind.FUNCTION_DECL:  # type: ignore
             start = child.extent.start.offset
             end = child.extent.end.offset
             if cpp_code[start:end].startswith("TEST"):
@@ -129,15 +156,6 @@ class Function:
 
     def set_test_cxt(self, test_cxt: TestCxt | None) -> None:
         self.__test_cxt = test_cxt
-
-    def get_name(self) -> str:
-        return self.__name
-
-    def get_sig(self) -> str:
-        return self.__sig
-
-    def get_decl_file(self) -> str:
-        return self.__decl_file
 
     def is_operator(self) -> bool:
         return self.__operator
@@ -206,7 +224,11 @@ class Function:
                 prompt = ""
                 prompt += "You should keep the signature, output it and use correct constructor provided to create the object:\n"
                 prompt += "Do not use gmock when the requirements do not mention it.\n"
-                prompt += "Only generate one unit test function.\n"
+                prompt += (
+                    "Only generate one unit test function in this response. "
+                    f"At most {MAX_TESTS_PER_CONDITION_CHAIN} candidates will be "
+                    "requested for this condition chain.\n"
+                )
                 prompt += (
                     "Assuming the context is implemented and is already correctly included.\n"
                 )
@@ -263,28 +285,11 @@ class Function:
                 )
                 include_set = self.get_includes()
                 for include in include_set:
-                    if Path(include).suffix.lower() in {
-                        ".c",
-                        ".cc",
-                        ".cpp",
-                        ".cxx",
-                        ".c++",
-                    }:
-                        continue
                     if "/" in include:
                         file.write(f'#include "{include}"\n')
                     else:
                         file.write(f"#include <{include}>\n")
-                if is_header(self.__decl_file):
-                    file.write(f'#include "{self.__decl_file}"\n')
-                else:
-                    declaration = self.__standalone_declaration()
-                    if declaration is None:
-                        raise ValueError(
-                            "Cannot safely declare headerless focal function "
-                            f"{self.__sig}"
-                        )
-                    file.write(f'extern "C" {{ {declaration} }}\n')
+                file.write(f'#include "{self.__decl_file}"\n')
                 if self.__namespace:
                     file.write("\n")
                     file.write(self.gen_namespaces())
@@ -292,28 +297,6 @@ class Function:
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
-
-    def __standalone_declaration(self) -> str | None:
-        if (
-            Path(self.__decl_file).suffix.lower() != ".c"
-            or self.__body is None
-            or self.__namespace
-            or self.__class_name
-            or self.__operator
-        ):
-            return None
-        body_start = self.__body.find("{")
-        if body_start < 0:
-            return None
-        declaration = self.__body[:body_start].strip().rstrip(";")
-        if not declaration or any(marker in declaration for marker in ("#", "}", "=")):
-            return None
-        if re.search(r"\b(?:static|inline)\b", declaration):
-            return None
-        name_match = re.search(rf"\b{re.escape(self.__name)}\s*\(", declaration)
-        if name_match is None or declaration.count("(") != declaration.count(")"):
-            return None
-        return declaration + ";"
 
     def ensure_include_file(self, parent_test_dir: str) -> bool:
         if self.__focal_cxt is None:
@@ -332,17 +315,18 @@ class Function:
         self,
         test_type: str,
         parent_test_dir: str,
-        on_test_generated: Callable[[str], None] | None = None,
+        on_test_generated: Callable[[str], str | None] | None = None,
     ) -> list[str]:
         if self.__focal_cxt is None:
             return []
         test_dir = f"{parent_test_dir}/{format_sig(self.__sig)}"
         generated_tests: list[str] = []
 
-        def notify(test_path: str) -> None:
+        def notify(test_path: str) -> str | None:
             generated_tests.append(test_path)
             if on_test_generated is not None:
-                on_test_generated(test_path)
+                return on_test_generated(test_path)
+            return None
 
         if os.path.exists(f"{test_dir}/.generated"):
             cached_tests = sorted(Path(test_dir).glob("test_*.cpp"))
@@ -396,27 +380,42 @@ class Function:
                 prompt += last_result + require + "\n"
                 with open(f"{prompt_dir}/{num:0>3}.txt", "w") as file:
                     file.write(prompt)
-                response_paths = [
-                    f"{prompt_dir}/{num:0>3}_response_{i}.txt" for i in (1, 2)
-                ]
-                expected_tests = [f"{test_dir}/test_{num:0>3}_{i}.cpp" for i in (1, 2)]
-                if all(is_valid_test_file(path) for path in response_paths):
-                    test_func_list = [Path(path).read_text() for path in response_paths]
-                elif all(is_valid_test_file(path) for path in expected_tests):
-                    test_func_list = [Path(path).read_text() for path in expected_tests]
-                else:
-                    test_func_list = get_test_from_LLM(prompt, 2)
-                    if len(test_func_list) != 2 or not all(
-                        is_valid_test_content(content) for content in test_func_list
-                    ):
-                        atomic_write_text(
-                            f"{test_dir}/generation_error.log",
-                            f"Invalid LLM response for requirement {num}.\n",
-                        )
-                        return generated_tests
-                    for response_path, test_func in zip(response_paths, test_func_list):
+                passed_test = ""
+                valid_candidate_seen = False
+                for candidate in range(1, MAX_TESTS_PER_CONDITION_CHAIN + 1):
+                    response_path = (
+                        f"{prompt_dir}/{num:0>3}_response_{candidate}.txt"
+                    )
+                    test_file_path = (
+                        f"{test_dir}/test_{num:0>3}_{candidate}.cpp"
+                    )
+                    if is_valid_test_file(response_path):
+                        test_func = Path(response_path).read_text()
+                    elif is_valid_test_file(test_file_path):
+                        test_func = Path(test_file_path).read_text()
+                    else:
+                        try:
+                            test_func_list = get_test_from_LLM(prompt, 1)
+                        except LLMTransportError:
+                            # A repeated transport or HTTP failure is systemic.
+                            # Stop the run so later functions are not skipped in
+                            # a rapid cascade of generation errors.
+                            raise
+                        except Exception as exc:
+                            write_text_best_effort(
+                                f"{test_dir}/generation_error.log",
+                                "LLM request failed for requirement "
+                                f"{num}, candidate {candidate}: "
+                                f"{type(exc).__name__}: {exc}\n",
+                            )
+                            return generated_tests
+                        if len(test_func_list) != 1 or not is_valid_test_content(
+                            test_func_list[0]
+                        ):
+                            continue
+                        test_func = test_func_list[0]
                         atomic_write_text(response_path, test_func)
-                for i, test_func in enumerate(test_func_list, start=1):
+                    valid_candidate_seen = True
                     with tempfile.NamedTemporaryFile(
                         suffix=".cpp", delete=False
                     ) as temp_file:
@@ -431,18 +430,29 @@ class Function:
                     if len(indices) > 1:
                         end = indices[0][1]
                         test_func = test_func[:end]
-                    test_file_path = f"{test_dir}/test_{num:0>3}_{i}.cpp"
                     if not is_valid_test_file(test_file_path):
                         atomic_write_text(
                             test_file_path,
                             f'#include "include.h"\n/*\n{require}*/\n\n'
-                            + sanitize_generated_test_source(
-                                test_func, forbidden_headers={self.__decl_file}
-                            ),
+                            + remove_macros(test_func),
                         )
-                    os.unlink(temp_file_name)
-                    notify(test_file_path)
-                last_result = f"Below are some example test cases, you should generate your own class if needed:\n{test_func_list[0]}\n{test_func_list[1]}\n"
+                    outcome = notify(test_file_path)
+                    if outcome in {None, "passed"}:
+                        passed_test = test_func
+                        break
+                    if outcome != "filtered":
+                        return generated_tests
+                if not valid_candidate_seen:
+                    atomic_write_text(
+                        f"{test_dir}/generation_error.log",
+                        f"No valid LLM response for requirement {num}.\n",
+                    )
+                    return generated_tests
+                if passed_test:
+                    last_result = (
+                        "Below is an example test case; generate your own class if "
+                        f"needed:\n{passed_test}\n"
+                    )
                 # last_result = ""
         else:
             prompt = NOREQ
@@ -487,14 +497,10 @@ class Function:
                 if not is_valid_test_file(test_file_path):
                     atomic_write_text(
                         test_file_path,
-                        '#include "include.h"\n\n'
-                        + sanitize_generated_test_source(
-                            func, forbidden_headers={self.__decl_file}
-                        ),
+                        '#include "include.h"\n\n' + remove_macros(func),
                     )
                 generated_tests.append(test_file_path)
                 i += 1
-            os.unlink(temp_file_name)
         if "req" not in test_type:
             if not generated_tests or not all(
                 is_valid_test_file(test_path) for test_path in generated_tests
@@ -537,7 +543,7 @@ class Function:
             return False
         path = Path(test_dir)
         rela_path = ""
-        if not is_header(file_path):
+        if not is_header(file_path) and is_header(self.__decl_file):
             rela_path = os.path.relpath(file_path, test_dir)
         test_file_list = [
             file.name
@@ -707,7 +713,7 @@ class SourceFile:
         self,
         test_type: str,
         parent_test_dir: str,
-        on_test_generated: Callable[[str, "SourceFile", Function, str], None]
+        on_test_generated: Callable[[str, "SourceFile", Function, str], str | None]
         | None = None,
     ) -> None:
         test_dir = f"{parent_test_dir}/{self.__name}"
@@ -715,10 +721,9 @@ class SourceFile:
         # print(f"  Generating unit tests for {self.__name} ...")
         for sig in self.__functions:
             function = self.__functions[sig]
-            # skip overloaded operators or no branch
+            # Skip overloaded operators and functions with excessive path sets.
             if (
                 not function.is_operator()
-                and function.cond_chain_num() > MIN_CHAIN_NUM
                 and function.min_cover_num() <= MAX_MIN_COVER
             ):
                 callback = None
@@ -746,14 +751,11 @@ class SourceFile:
         test_dir = f"{parent_test_dir}/{self.__name}"
         if not os.path.exists(test_dir):
             return False
-        # skip overloaded operators or no branch
         fmt_sig_list = []
         for sig in self.__functions:
             function = self.__functions[sig]
-            # skip overloaded operators or no branch
             if (
                 not function.is_operator()
-                and function.cond_chain_num() > MIN_CHAIN_NUM
                 and function.min_cover_num() <= MAX_MIN_COVER
             ):
                 res = function.write_cmake_file(
@@ -821,7 +823,7 @@ class Project:
             with open(database_path, "r") as file:
                 database = json.load(file)
             for item in database:
-                if is_test_or_build_file(item["file"], self.__project_path):
+                if is_test_or_build_file(item["file"]):
                     continue
                 file_list_set.add(item["file"])
             if len(file_list_set) > 0:
@@ -877,29 +879,29 @@ class Project:
         self.__set_expt_dict()
         self.__load_cxt_file()
 
-    def prepare(
-        self,
-        test_types: list[str],
-        just_load: bool,
-        modify_sources: bool = True,
-    ) -> None:
+    def prepare(self, test_types: list[str], just_load: bool) -> None:
         print("Preparing the project ...")
         if just_load:
             self.__get_source_files()
         else:
             # create_dir_with_cmake(self.__project_path, "llm_compile")
             create_dir_with_cmake(self.__project_path, "llm_coverage")
-            for test_type in test_types:
-                create_dir_with_cmake(self.__project_path, f"llm_tests{test_type}")
+            known_test_types = list(TEST_TYPE_SUFFIXES.values())
+            all_test_types = dict.fromkeys([*known_test_types, *test_types])
+            for test_type in all_test_types:
+                create_dir_with_cmake(
+                    self.__project_path,
+                    f"llm_tests{test_type}",
+                    reset_cmake=test_type in test_types,
+                )
             cmake_config(self.__project_path, self.__build_path)
             source_files = self.__get_source_files()
-            if modify_sources:
-                comment_out(source_files, ["main", "test", "tests"])
+            comment_out(source_files, ["main", "test", "tests"])
 
     def gen_unit_test(
         self,
         test_type: str,
-        on_test_generated: Callable[[str, SourceFile, Function, str], None]
+        on_test_generated: Callable[[str, SourceFile, Function, str], str | None]
         | None = None,
     ) -> None:
         test_dir = f"{self.__project_path}/llm_tests{test_type}"
@@ -925,10 +927,8 @@ class Project:
             functions_dict = source_file.get_functions()
             for sig in functions_dict:
                 function = functions_dict[sig]
-                # skip overloaded operators or no branch
                 if (
                     not function.is_operator()
-                    and function.cond_chain_num() > MIN_CHAIN_NUM
                     and function.min_cover_num() <= MAX_MIN_COVER
                 ):
                     workers.append(function)
@@ -962,32 +962,44 @@ class Project:
         do_test: bool = True,
         do_export: bool = False,
         kept_only: bool = False,
+        coverage_sonarqube_only: bool = False,
+        coverage_unity: bool = False,
     ) -> None:
         for test_type in test_types:
             test_dir = f"{self.__project_path}/llm_tests{test_type}"
             for source_file in self.__source_files:
                 source_file.ensure_test_includes(test_dir)
         self.__expts = [
-            Expt(test_type, self.__project_path) for test_type in test_types
+            Expt(
+                test_type,
+                self.__project_path,
+                coverage_sonarqube_only=coverage_sonarqube_only,
+                coverage_unity=coverage_unity,
+            )
+            for test_type in test_types
         ]
-        cmake_config(self.__project_path, self.__build_path)
-        for expt in self.__expts:
-            print(f"Running experiment for llm_tests{expt.get_type()} ...")
-            expt.init(self.__expt_dict)
-            expt.load_manifest()
-            if do_compile:
-                # expt.gen_compile_result(self.__build_path)
-                expt.gen_compile_result_concurrent(self.__build_path)
-                expt.dump_manifest()
-            if do_test:
-                expt.gen_covtest_result(
-                    self.__project_path, self.__build_path, kept_only
-                )
-                expt.dump_manifest()
-            if do_export:
-                expt.export_filtered_tests()
-                expt.dump_manifest()
-            # dump result to csv
-            if do_compile or do_test:
-                print(f"Dumping result for llm_tests{expt.get_type()} ...")
-                expt.dump_to_csv(self.__project_path)
+        coverage_only = do_test and not do_compile
+        with temporarily_disable_generated_test_targets(
+            self.__project_path, test_types, coverage_only
+        ):
+            cmake_config(self.__project_path, self.__build_path)
+            for expt in self.__expts:
+                print(f"Running experiment for llm_tests{expt.get_type()} ...")
+                expt.init(self.__expt_dict)
+                expt.load_manifest()
+                if do_compile:
+                    # expt.gen_compile_result(self.__build_path)
+                    expt.gen_compile_result_concurrent(self.__build_path)
+                    expt.dump_manifest()
+                if do_test:
+                    expt.gen_covtest_result(
+                        self.__project_path, self.__build_path, kept_only
+                    )
+                    expt.dump_manifest()
+                if do_export:
+                    expt.export_filtered_tests()
+                    expt.dump_manifest()
+                # dump result to csv
+                if do_compile or do_test:
+                    print(f"Dumping result for llm_tests{expt.get_type()} ...")
+                    expt.dump_to_csv(self.__project_path)

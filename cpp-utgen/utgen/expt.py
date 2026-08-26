@@ -2,6 +2,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -12,20 +13,14 @@ from typing import Any
 
 import xmltodict
 
-from c_test_format import (
-    validate_c_test_artifact,
-    validate_c_test_format,
-    validate_c_test_path,
-    validate_include_header_format,
-)
 from linecounter import count_code_lines
 from utils import (
-    SETUP_COV,
     ExptFileData,
     atomic_write_json,
     clear_directory,
     cmake_config,
     count_executed_tests,
+    coverage_setup,
     format_sig,
     is_header,
     run_command,
@@ -36,6 +31,36 @@ try:
     from config_private import CPU_COUNT
 except ImportError:
     from config import CPU_COUNT
+
+
+COVERAGE_CHECKPOINT_VERSION = 1
+COVERAGE_CHECKPOINT_NAME = ".coverage_checkpoint.json"
+UNITY_COVERAGE_SOURCE_NAME = ".utgen_coverage_unity.cpp"
+UNITY_TEST_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:TEST|TEST_F)\s*\(\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\)"
+)
+UNITY_UNSUPPORTED_GTEST_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:TEST_P|TYPED_TEST|TYPED_TEST_P|GTEST_TEST|GTEST_TEST_F|"
+    r"REGISTER_TYPED_TEST_SUITE_P|REGISTER_TYPED_TEST_CASE_P|"
+    r"INSTANTIATE_TEST_SUITE_P|INSTANTIATE_TEST_CASE_P)\s*\("
+)
+UNITY_CUSTOM_RUNTIME_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:InitGoogleTest|RUN_ALL_TESTS|RegisterTest|"
+    r"AddGlobalTestEnvironment)\s*\("
+)
+UNITY_MAIN_RE = re.compile(r"(?<![A-Za-z0-9_])main\s*\(")
+UNITY_NAMESPACE_ESCAPE_RE = re.compile(
+    r'(?<![A-Za-z0-9_])(?:extern\s+"C"|asm\s*\(|__asm__\s*\()'
+)
+UNITY_DIRECTIVE_RE = re.compile(
+    r"^\s*#\s*([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
+)
+UNITY_INCLUDE_RE = re.compile(
+    r'^\s*#\s*include\s+(?P<header><[^>\n]+>|"[^"\n]+")\s*$',
+    re.MULTILINE,
+)
 
 # def get_deps_set(file_path: str, deps_dict: dict[str, list[str]]) -> set[str]:
 #     res_set = set()
@@ -69,9 +94,102 @@ def safe_target_name(prefix: str, key: str) -> str:
     return f"{prefix}_{digest}_{safe_stem}"
 
 
+def strip_cpp_comments(source: str) -> str:
+    """Remove generated comments before simple Unity safety checks."""
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", source)
+
+
+def analyze_unity_test_files(
+    test_dir: str, test_file_list: list[str]
+) -> tuple[list[tuple[str, str]], list[str], str]:
+    """Return per-file GoogleTest filters and global includes for safe Unity use.
+
+    The check is intentionally explicit and small: Unity is used only for two or
+    more readable files containing one enabled ordinary TEST/TEST_F each, unique
+    test names, consistent local includes, literal-only preprocessing, and no
+    custom runtime or namespace-escaping linkage. Runtime/build failures still
+    fall back to the existing per-file path.
+    """
+    if len(test_file_list) < 2:
+        return [], [], "fewer_than_two_tests"
+
+    tests: list[tuple[str, str]] = []
+    includes: list[str] = []
+    local_includes: list[str] = []
+    seen_includes: set[str] = set()
+    seen_tests: set[str] = set()
+    for test_file_name in test_file_list:
+        try:
+            source = Path(test_dir, test_file_name).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return [], [], f"unreadable_source:{test_file_name}"
+        source_without_comments = strip_cpp_comments(source)
+        if UNITY_UNSUPPORTED_GTEST_RE.search(source_without_comments):
+            return [], [], f"unsupported_gtest_macro:{test_file_name}"
+        if UNITY_CUSTOM_RUNTIME_RE.search(source_without_comments):
+            return [], [], f"custom_gtest_runtime:{test_file_name}"
+        if UNITY_MAIN_RE.search(source_without_comments):
+            return [], [], f"custom_main:{test_file_name}"
+        if UNITY_NAMESPACE_ESCAPE_RE.search(source_without_comments):
+            return [], [], f"namespace_escape:{test_file_name}"
+        directives = UNITY_DIRECTIVE_RE.findall(source_without_comments)
+        unsupported = [name for name in directives if name != "include"]
+        if unsupported:
+            return [], [], f"preprocessor_directive:{unsupported[0]}"
+
+        include_matches = list(UNITY_INCLUDE_RE.finditer(source))
+        if len(include_matches) != len(directives):
+            return [], [], f"unsupported_include:{test_file_name}"
+        file_includes = [match.group("header") for match in include_matches]
+        file_local_includes = [
+            include for include in file_includes if include.startswith('"')
+        ]
+        if not tests:
+            local_includes = file_local_includes
+        elif file_local_includes != local_includes:
+            return [], [], f"inconsistent_local_includes:{test_file_name}"
+        for include in file_includes:
+            if include not in seen_includes:
+                seen_includes.add(include)
+                includes.append(include)
+
+        test_matches = UNITY_TEST_RE.findall(source_without_comments)
+        if len(test_matches) != 1:
+            return [], [], f"expected_one_plain_test:{test_file_name}"
+        suite, name = test_matches[0]
+        if suite.startswith("DISABLED_") or name.startswith("DISABLED_"):
+            return [], [], f"disabled_test:{test_file_name}"
+        test_filter = f"{suite}.{name}"
+        if test_filter in seen_tests:
+            return [], [], f"duplicate_test:{test_filter}"
+        seen_tests.add(test_filter)
+        tests.append((test_file_name, test_filter))
+
+    return tests, includes, ""
+
+
 def write_text_file(file_path: str, content: str) -> None:
     with open(file_path, "w") as file:
         file.write(content)
+
+
+def reset_coverage_build_outputs(build: str) -> None:
+    """Clear per-function coverage outputs while preserving the build cache."""
+    clear_directory(f"{build}/llm_coverage")
+    clear_directory(f"{build}/coverage")
+    for filename in (
+        "coverage.base",
+        "coverage.capture",
+        "coverage.total",
+        "coverage.info",
+        "coverage_sonarqube.xml",
+        "test_result.xml",
+    ):
+        try:
+            os.remove(f"{build}/{filename}")
+        except FileNotFoundError:
+            pass
 
 
 def classify_failure(output: str, returncode: int, timeout: bool = False) -> str:
@@ -195,6 +313,8 @@ class FunctionData:
         parent_dir_path: str,
         loc: tuple[int, int],
         file_line: dict[str, int],
+        coverage_sonarqube_only: bool = False,
+        coverage_unity: bool = False,
     ):
         self.__sig = sig
         self.__file_path = file_path
@@ -202,6 +322,8 @@ class FunctionData:
         self.__test_dir_path = f"{parent_dir_path}/{format_sig(sig)}"
         self.__loc = loc
         self.__file_line = file_line
+        self.__coverage_sonarqube_only = coverage_sonarqube_only
+        self.__coverage_unity = coverage_unity
         self.__tests_num = len(file_line)
         self.__can_compile: list[str] = []
         self.__coverage: CovResult = CovResult()
@@ -253,19 +375,6 @@ class FunctionData:
         can_compile_set = set(can_compile)
         compile_log = f"{self.__test_dir_path}/compile_err.log"
         for test_file_name, record in self.__test_records.items():
-            if record.get("format_status") == "fail":
-                record.update(
-                    {
-                        "compile": "not_run",
-                        "coverage_build": "not_run",
-                        "run": "not_run",
-                        "kept": False,
-                        "exported": False,
-                        "workflow_status": "filtered",
-                        "terminal_reason": "format_failure",
-                    }
-                )
-                continue
             if test_file_name in can_compile_set:
                 record["compile"] = "pass"
                 record["compile_log"] = ""
@@ -303,6 +412,132 @@ class FunctionData:
     def get_test_records(self) -> dict[str, dict[str, Any]]:
         return self.__test_records
 
+    def __coverage_test_files(self, kept_only: bool) -> list[str]:
+        path = Path(self.__test_dir_path)
+        return sorted(
+            test_file.name
+            for test_file in path.iterdir()
+            if test_file.is_file()
+            and test_file.suffix == ".cpp"
+            and test_file.name not in {"origin.cpp", UNITY_COVERAGE_SOURCE_NAME}
+            and (
+                self.__test_records.get(test_file.name, {}).get("kept", False)
+                if kept_only
+                else test_file.name in self.__can_compile
+            )
+        )
+
+    @staticmethod
+    def __file_stamp(path: str) -> list[int] | None:
+        try:
+            stat = os.stat(path)
+            return [stat.st_mtime_ns, stat.st_size]
+        except OSError:
+            return None
+
+    def __coverage_checkpoint_inputs(self) -> tuple[dict[str, Any], list[str]]:
+        """Describe the stable, manifest-validated inputs for final coverage."""
+        test_file_list = self.__coverage_test_files(True)
+        inputs = {
+            "source_stamp": self.__file_stamp(self.__file_path),
+            "include_stamp": self.__file_stamp(
+                f"{self.__test_dir_path}/include.h"
+            ),
+            "coverage_sonarqube_only": self.__coverage_sonarqube_only,
+            "selected_tests": [
+                [
+                    test_file_name,
+                    self.__test_records[test_file_name].get("content_hash"),
+                    self.__test_records[test_file_name].get("workflow_status"),
+                    self.__file_stamp(
+                        self.__test_records[test_file_name]["test_path"]
+                    ),
+                ]
+                for test_file_name in test_file_list
+            ],
+        }
+        return inputs, test_file_list
+
+    def __restore_coverage_checkpoint(
+        self,
+        project: str,
+        current_inputs: dict[str, Any],
+        test_file_list: list[str],
+    ) -> bool:
+        """Restore one successful final-coverage result or request a rerun."""
+        checkpoint_path = Path(self.__test_dir_path) / COVERAGE_CHECKPOINT_NAME
+        try:
+            with checkpoint_path.open("r") as checkpoint_file:
+                checkpoint = json.load(checkpoint_file)
+            if checkpoint.get("version") != COVERAGE_CHECKPOINT_VERSION:
+                return False
+            if checkpoint.get("inputs") != current_inputs:
+                return False
+
+            coverage_path = Path(self.__test_dir_path) / "coverage.xml"
+            if checkpoint.get("coverage_stamp") != self.__file_stamp(
+                str(coverage_path)
+            ):
+                return False
+            ET.parse(coverage_path)
+            coverage = CovResult()
+            if test_file_list:
+                coverage.set_real()
+            previous_coverage = self.__coverage
+            self.__coverage = coverage
+            try:
+                self.load_coverage(project, str(coverage_path))
+            except (OSError, ValueError, TypeError, KeyError):
+                self.__coverage = previous_coverage
+                return False
+        except (OSError, ValueError, TypeError, ET.ParseError, KeyError):
+            return False
+
+        self.__test_result = TestResult(len(test_file_list), 0)
+        return True
+
+    def __write_coverage_checkpoint(
+        self,
+        inputs: dict[str, Any],
+        test_file_list: list[str],
+        previous_coverage_stamp: list[int] | None,
+    ) -> None:
+        """Checkpoint only complete, passing final-coverage results."""
+        coverage_path = Path(self.__test_dir_path) / "coverage.xml"
+        current_coverage_stamp = self.__file_stamp(str(coverage_path))
+        if (
+            self.__test_result is None
+            or current_coverage_stamp is None
+            or current_coverage_stamp == previous_coverage_stamp
+        ):
+            return
+        if self.__test_result.get_result() != (len(test_file_list), 0):
+            return
+        if test_file_list and not self.__coverage.is_real():
+            return
+        if any(
+            self.__test_records[test_file_name].get("coverage_build") != "pass"
+            or self.__test_records[test_file_name].get("run") != "pass"
+            or not self.__test_records[test_file_name].get("kept", False)
+            for test_file_name in test_file_list
+        ):
+            return
+        try:
+            checkpoint = {
+                "version": COVERAGE_CHECKPOINT_VERSION,
+                "inputs": inputs,
+                "coverage_stamp": current_coverage_stamp,
+            }
+            atomic_write_json(
+                str(Path(self.__test_dir_path) / COVERAGE_CHECKPOINT_NAME),
+                checkpoint,
+            )
+        except (OSError, ValueError, TypeError) as error:
+            write_text_best_effort(
+                f"{self.__test_dir_path}/coverage_checkpoint_failed.log",
+                f"Failed to write coverage checkpoint: {type(error).__name__}\n",
+            )
+
     @staticmethod
     def __content_hash(record: dict[str, Any]) -> str:
         try:
@@ -332,9 +567,6 @@ class FunctionData:
                 "repair_stage": "",
                 "terminal_reason": reason,
                 "content_hash": content_hash,
-                "format_status": "not_run",
-                "format_errors": [],
-                "format_log": "",
             }
         )
 
@@ -347,7 +579,6 @@ class FunctionData:
         for record in self.__test_records.values():
             record["compile"] = "fail"
             record["coverage_build"] = "fail"
-            record["compile"] = "fail"
             record["run"] = "not_run"
             record["kept"] = False
             record["failure_type"] = "missing_include"
@@ -375,12 +606,6 @@ class FunctionData:
 
     def load_manifest_records(self, records_by_path: dict[str, dict[str, Any]]) -> None:
         can_compile = []
-        include_path = Path(self.__test_dir_path) / "include.h"
-        current_include_hash = (
-            hashlib.sha256(include_path.read_bytes()).hexdigest()
-            if include_path.is_file()
-            else ""
-        )
         for test_file_name, record in self.__test_records.items():
             old_record = records_by_path.get(record["test_path"])
             if old_record is None:
@@ -390,14 +615,6 @@ class FunctionData:
                 "content_hash"
             ) != current_hash:
                 self.__invalidate_changed_record(record, current_hash)
-                continue
-            if old_record.get("include_hash") and old_record.get(
-                "include_hash"
-            ) != current_include_hash:
-                self.__invalidate_changed_record(
-                    record, current_hash, "include_content_changed"
-                )
-                record["include_hash"] = current_include_hash
                 continue
             for key in (
                 "compile",
@@ -418,82 +635,17 @@ class FunctionData:
                 "terminal_reason",
                 "content_hash",
                 "run_command",
-                "test_type",
-                "decl_file",
-                "function_body",
-                "requirement",
-                "expected_test_signature",
-                "format_status",
-                "format_errors",
-                "format_log",
-                "include_hash",
-                "metadata",
             ):
                 if key in old_record:
                     record[key] = old_record[key]
-            record["include_hash"] = current_include_hash
             if record["compile"] == "pass":
                 can_compile.append(test_file_name)
         self.__can_compile = can_compile
-
-    def validate_formats(
-        self, project: str, test_type: str, source_name: str
-    ) -> None:
-        include_path = Path(self.__test_dir_path) / "include.h"
-        try:
-            include_source = include_path.read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError as exc:
-            errors = [f"unable to read generated include.h: {exc}"]
-            for record in self.__test_records.values():
-                self.__mark_format_failure(record, errors)
-            self.__can_compile = []
-            return
-
-        valid_files: list[str] = []
-        for test_file_name, record in self.__test_records.items():
-            try:
-                source = Path(record["test_path"]).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-            except OSError as exc:
-                errors = [f"unable to read generated test: {exc}"]
-            else:
-                errors = validate_c_test_artifact(
-                    source,
-                    test_path=record["test_path"],
-                    include_source=include_source,
-                    project=project,
-                    test_type=test_type,
-                    source_name=source_name,
-                    function_signature=self.__sig,
-                    expected_test_signature=record.get("expected_test_signature")
-                    or None,
-                )
-            if errors:
-                self.__mark_format_failure(record, errors)
-                continue
-            record["format_status"] = "pass"
-            record["format_errors"] = []
-            record["format_log"] = ""
-            valid_files.append(test_file_name)
-        self.__can_compile = [
-            name for name in self.__can_compile if name in set(valid_files)
-        ]
 
     def gen_manifest_records(
         self, source_name: str, source_path: str, test_root: str
     ) -> list[dict[str, Any]]:
         records = []
-        root_name = Path(test_root).name
-        test_type = root_name[len("llm_tests") :] if root_name.startswith("llm_tests") else ""
-        include_path = Path(self.__test_dir_path) / "include.h"
-        include_hash = (
-            hashlib.sha256(include_path.read_bytes()).hexdigest()
-            if include_path.is_file()
-            else ""
-        )
         for test_file_name in sorted(self.__test_records):
             source_record = self.__test_records[test_file_name]
             if os.path.isfile(source_record["test_path"]):
@@ -511,8 +663,6 @@ class FunctionData:
                     "relative_path": os.path.relpath(record["test_path"], test_root),
                     "decl_in_header": self.__decl_in_header,
                     "loc": self.__loc,
-                    "test_type": source_record.get("test_type", test_type),
-                    "include_hash": include_hash,
                 }
             )
             records.append(record)
@@ -525,112 +675,43 @@ class FunctionData:
             return False
         if not self.__has_include():
             return False
-        include_path = Path(self.__test_dir_path) / "include.h"
-        include_errors = validate_include_header_format(
-            include_path.read_text(encoding="utf-8", errors="replace")
-        )
-        if include_errors:
-            for record in self.__test_records.values():
-                if record["kept"]:
-                    self.__mark_format_failure(record, include_errors)
-            return False
         kept_files = []
         for test_file_name, record in self.__test_records.items():
             if not record["kept"]:
                 continue
             current_hash = self.__content_hash(record)
             if (
-                record["compile"] != "pass"
-                or record["run"] != "pass"
-                or not record.get("content_hash")
-                or record["content_hash"] != current_hash
+                record["compile"] == "pass"
+                and record["run"] == "pass"
+                and record.get("content_hash")
+                and record["content_hash"] == current_hash
             ):
-                reason = (
-                    "content_changed"
-                    if not record.get("content_hash")
-                    or record["content_hash"] != current_hash
-                    else "unverified_state"
-                )
-                self.__invalidate_changed_record(record, current_hash, reason)
+                kept_files.append(test_file_name)
                 continue
-            test_root_name = Path(self.__test_dir_path).parents[1].name
-            inferred_test_type = (
-                test_root_name[len("llm_tests") :]
-                if test_root_name.startswith("llm_tests")
-                else ""
+            reason = (
+                "content_changed"
+                if not record.get("content_hash")
+                or record["content_hash"] != current_hash
+                else "unverified_state"
             )
-            test_type = str(record.get("test_type", inferred_test_type))
-            format_errors = validate_c_test_path(
-                record["test_path"],
-                project=project,
-                test_type=test_type,
-                source_name=Path(self.__file_path).name,
-                function_signature=self.__sig,
-            )
-            try:
-                test_source = Path(record["test_path"]).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-            except OSError as exc:
-                format_errors.append(f"unable to read generated test: {exc}")
-                test_source = ""
-            format_errors.extend(
-                validate_c_test_format(
-                    test_source,
-                    filename=test_file_name,
-                    test_type=test_type,
-                    focal_function=self.__sig,
-                    expected_test_signature=record.get("expected_test_signature")
-                    or None,
-                )
-            )
-            if format_errors:
-                self.__mark_format_failure(record, format_errors)
-                continue
-            record["format_status"] = "pass"
-            record["format_errors"] = []
-            kept_files.append(test_file_name)
+            self.__invalidate_changed_record(record, current_hash, reason)
         if len(kept_files) == 0:
             return False
         export_dir = f"{export_parent_dir}/{Path(self.__test_dir_path).name}"
         os.makedirs(export_dir, exist_ok=True)
-        exported_include = Path(export_dir) / "include.h"
-        shutil.copy2(include_path, exported_include)
-        if hashlib.sha256(include_path.read_bytes()).digest() != hashlib.sha256(
-            exported_include.read_bytes()
-        ).digest():
-            for test_file_name in kept_files:
-                self.__mark_format_failure(
-                    self.__test_records[test_file_name],
-                    ["exported include.h content hash does not match source"],
-                )
-            shutil.rmtree(export_dir, ignore_errors=True)
-            return False
-        exported_files: list[str] = []
+        shutil.copy(f"{self.__test_dir_path}/include.h", f"{export_dir}/include.h")
         for test_file_name in kept_files:
-            source_test = Path(self.__test_dir_path) / test_file_name
-            exported_test = Path(export_dir) / test_file_name
-            shutil.copy2(source_test, exported_test)
-            if hashlib.sha256(source_test.read_bytes()).digest() != hashlib.sha256(
-                exported_test.read_bytes()
-            ).digest():
-                self.__mark_format_failure(
-                    self.__test_records[test_file_name],
-                    ["exported test content hash does not match source"],
-                )
-                exported_test.unlink(missing_ok=True)
-                continue
+            shutil.copy(
+                f"{self.__test_dir_path}/{test_file_name}",
+                f"{export_dir}/{test_file_name}",
+            )
             self.__test_records[test_file_name]["exported"] = True
-            exported_files.append(test_file_name)
-        if not exported_files:
-            shutil.rmtree(export_dir, ignore_errors=True)
-            return False
         rela_path, deps_list = self.__get_relative_source_and_deps(project, export_dir)
         deps = " ".join(deps_list)
         target_name = safe_target_name("filtered_test", self.__test_dir_path)
         with open(f"{export_dir}/CMakeLists.txt", "w") as cmake_file:
             cmake_file.write('set(SOURCE_FILES "")\n')
-            for test_file_name in exported_files:
+            for test_file_name in kept_files:
                 cmake_file.write(
                     f"set(SOURCE_FILES ${{SOURCE_FILES}} {test_file_name})\n"
                 )
@@ -639,34 +720,6 @@ class FunctionData:
             )
             cmake_file.write(f"target_link_libraries({target_name} gmock_main)\n")
         return True
-
-    def __mark_format_failure(
-        self, record: dict[str, Any], errors: list[str]
-    ) -> None:
-        log_path = (
-            f"{self.__test_dir_path}/format_{Path(record['test_file']).stem}.log"
-        )
-        write_text_file(
-            log_path,
-            "Generated test violates section 8.5:\n- "
-            + "\n- ".join(errors)
-            + "\n",
-        )
-        record.update(
-            {
-                "format_status": "fail",
-                "format_errors": errors,
-                "format_log": log_path,
-                "failure_type": "format_failure",
-                "compile": "not_run",
-                "coverage_build": "not_run",
-                "run": "not_run",
-                "kept": False,
-                "exported": False,
-                "workflow_status": "filtered",
-                "terminal_reason": "format_failure",
-            }
-        )
 
     def get_test_result(self) -> TestResult | None:
         return self.__test_result
@@ -692,11 +745,7 @@ class FunctionData:
     ) -> tuple[int, int]:
         success = 0
         failed = 0
-        compile_cmd_dict = {
-            name: command
-            for name, command in compile_cmds[self.__test_dir_path].items()
-            if self.__test_records.get(name, {}).get("format_status") != "fail"
-        }
+        compile_cmd_dict = compile_cmds[self.__test_dir_path]
         if os.path.exists(f"{self.__test_dir_path}/compile_err.log"):
             os.remove(f"{self.__test_dir_path}/compile_err.log")
         for test_file_name in compile_cmd_dict:
@@ -714,13 +763,8 @@ class FunctionData:
         success = 0
         failed = 0
         can_compile = []
-        compile_cmds = {
-            name: command
-            for name, command in compile_cmds.items()
-            if self.__test_records.get(name, {}).get("format_status") != "fail"
-        }
         if len(compile_cmds) == 0:
-            return 0, 0, []
+            return 0, len(self.__test_records), []
         if os.path.exists(f"{self.__test_dir_path}/compile_err.log"):
             os.remove(f"{self.__test_dir_path}/compile_err.log")
         for test_file_name in compile_cmds:
@@ -822,7 +866,7 @@ class FunctionData:
             os.remove(f"{self.__test_dir_path}/build_empty_test_err.log")
         build_cov_dir = f"{build}/coverage"
         rela_path = ""
-        if not is_header(self.__file_path):
+        if not is_header(self.__file_path) and self.__decl_in_header:
             rela_path = os.path.relpath(self.__file_path, llm_cov_dir)
         work_dir = f"{project}/project_info"
         deps_set = set()
@@ -845,10 +889,11 @@ class FunctionData:
             cmake_file.write(
                 f"target_link_libraries(llm_test gmock_main)\n"
             )
+            self.__write_coverage_compile_options(cmake_file, "llm_test")
             cmake_file.write(
                 f'gtest_discover_tests(llm_test TEST_PREFIX "llm_test.")\n\n'
             )
-            cmake_file.write(SETUP_COV)
+            cmake_file.write(coverage_setup(self.__coverage_sonarqube_only))
         shutil.copy(
             f"{llm_cov_dir}/CMakeLists.txt", f"{self.__test_dir_path}/cov_empty_cmake.txt"
         )
@@ -856,7 +901,7 @@ class FunctionData:
         with open(f"{llm_cov_dir}/test.cpp", "w") as test_file:
             test_file.write("#include \"include.h\"\n\n")
             test_file.write("TEST(TEST, test) {}\n")
-        clear_directory(build, exclude_dirs=["_deps"])
+        reset_coverage_build_outputs(build)
         cmake_config(project, build)
         target_build_cmd = ["cmake", "--build", build, "--target", "llm_test"]
         res = run_command(target_build_cmd)
@@ -870,19 +915,30 @@ class FunctionData:
         cov_cmd = ["cmake", "--build", build, "--target", "coverage"]
         result = run_command(cov_cmd)
         if result.returncode == 0:
-            shutil.copytree(
-                build_cov_dir, f"{self.__test_dir_path}/coverage", dirs_exist_ok=True
-            )
+            if os.path.isdir(build_cov_dir):
+                shutil.copytree(
+                    build_cov_dir,
+                    f"{self.__test_dir_path}/coverage",
+                    dirs_exist_ok=True,
+                )
             cov_xml_file = f"{self.__test_dir_path}/coverage.xml"
             if os.path.exists(f"{build}/coverage_sonarqube.xml"):
                 shutil.copy(f"{build}/coverage_sonarqube.xml", cov_xml_file)
                 self.load_coverage(project, cov_xml_file)
 
+    def __write_coverage_compile_options(self, cmake_file, target: str) -> None:
+        cmake_file.write(
+            f"target_compile_options({target} PRIVATE\n"
+            '  "$<$<COMPILE_LANG_AND_ID:C,GNU,Clang,AppleClang>:-g0>"\n'
+            '  "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-g0>"\n'
+            ")\n"
+        )
+
     def __get_relative_source_and_deps(
         self, project: str, base_dir: str
     ) -> tuple[str, list[str]]:
         rela_path = ""
-        if not is_header(self.__file_path):
+        if not is_header(self.__file_path) and self.__decl_in_header:
             rela_path = os.path.relpath(self.__file_path, base_dir)
         deps_set = set()
         deps_file_path = f"{project}/project_info/deps_dict.json"
@@ -903,18 +959,26 @@ class FunctionData:
         target_list = []
         with open(f"{llm_cov_dir}/CMakeLists.txt", "w") as cmake_file:
             for test_file_name in test_file_list:
+                # Preserve the source location used by the initial workflow so
+                # local includes and project CMake source rules still apply.
+                test_source = (
+                    Path(self.__test_dir_path, test_file_name)
+                    .resolve()
+                    .as_posix()
+                )
                 target_name = safe_target_name(
                     "llm_test", f"{self.__test_dir_path}/{test_file_name}"
                 )
                 target_list.append((test_file_name, target_name))
                 cmake_file.write(
-                    f"add_executable({target_name} {test_file_name} {rela_path} {deps})\n"
+                    f'add_executable({target_name} "{test_source}" {rela_path} {deps})\n'
                 )
                 cmake_file.write(f"target_link_libraries({target_name} gmock_main)\n")
+                self.__write_coverage_compile_options(cmake_file, target_name)
                 cmake_file.write(
                     f'gtest_discover_tests({target_name} TEST_PREFIX "llm_test.")\n\n'
                 )
-            cmake_file.write(SETUP_COV)
+            cmake_file.write(coverage_setup(self.__coverage_sonarqube_only))
         return target_list
 
     def __prepare_coverage_dir(
@@ -931,9 +995,256 @@ class FunctionData:
                 f"{self.__test_dir_path}/{test_file_name}",
                 f"{llm_cov_dir}/{test_file_name}",
             )
-        clear_directory(build, exclude_dirs=["_deps"])
+        reset_coverage_build_outputs(build)
         cmake_config(project, build)
         return target_list
+
+    def __write_unity_source(
+        self,
+        test_plan: list[tuple[str, str]],
+        includes: list[str],
+    ) -> Path:
+        unity_source = Path(self.__test_dir_path, UNITY_COVERAGE_SOURCE_NAME)
+        lines = [f"#include {include}" for include in includes]
+        lines.append("")
+        for index, (test_file_name, _) in enumerate(test_plan, start=1):
+            test_path = Path(self.__test_dir_path, test_file_name).resolve()
+            test_source = test_path.read_text(encoding="utf-8")
+            test_body = UNITY_INCLUDE_RE.sub("", test_source).rstrip()
+            source_label = test_path.as_posix().replace('"', '\\"')
+            lines.extend(
+                (
+                    f"namespace cpp_utgen_unity_{index} {{",
+                    f'#line 1 "{source_label}"',
+                    test_body,
+                    "}",
+                    "",
+                )
+            )
+        unity_source.write_text("\n".join(lines), encoding="utf-8")
+        return unity_source
+
+    def __prepare_unity_coverage_dir(
+        self,
+        project: str,
+        build: str,
+        llm_cov_dir: str,
+        test_plan: list[tuple[str, str]],
+        includes: list[str],
+    ) -> tuple[Path, str]:
+        clear_directory(llm_cov_dir)
+        unity_source = self.__write_unity_source(test_plan, includes)
+        rela_path, deps_list = self.__get_relative_source_and_deps(
+            project, llm_cov_dir
+        )
+        deps = " ".join(deps_list)
+        target_name = safe_target_name("llm_unity", self.__test_dir_path)
+        with open(f"{llm_cov_dir}/CMakeLists.txt", "w") as cmake_file:
+            cmake_file.write(
+                f'add_executable({target_name} "{unity_source.resolve().as_posix()}" '
+                f"{rela_path} {deps})\n"
+            )
+            cmake_file.write(f"target_link_libraries({target_name} gmock_main)\n")
+            self.__write_coverage_compile_options(cmake_file, target_name)
+            cmake_file.write(
+                f'gtest_discover_tests({target_name} TEST_PREFIX "llm_test.")\n\n'
+            )
+            cmake_file.write(coverage_setup(self.__coverage_sonarqube_only))
+        shutil.copy(
+            f"{llm_cov_dir}/CMakeLists.txt",
+            f"{self.__test_dir_path}/cov_unity_cmake.txt",
+        )
+        shutil.copy(f"{self.__test_dir_path}/include.h", f"{llm_cov_dir}/include.h")
+        reset_coverage_build_outputs(build)
+        cmake_config(project, build)
+        return unity_source, target_name
+
+    def __write_unity_fallback(self, reason: str, details: str = "") -> None:
+        content = f"Unity coverage fallback: {reason}\n"
+        if details:
+            content += f"\n{details[-12000:]}"
+        write_text_best_effort(
+            f"{self.__test_dir_path}/unity_fallback.log", content
+        )
+
+    def __run_unity_target(
+        self,
+        build: str,
+        target: str,
+        test_plan: list[tuple[str, str]],
+    ) -> tuple[bool, str]:
+        exe_path = f"{build}/llm_coverage/{target}"
+        if os.name == "nt":
+            exe_path += ".exe"
+        if not os.path.exists(exe_path):
+            return False, f"Executable not found: {exe_path}\n"
+
+        for test_file_name, test_filter in test_plan:
+            log_path = (
+                f"{self.__test_dir_path}/"
+                f"run_unity_{Path(test_file_name).stem}.log"
+            )
+            xml_path = (
+                f"{self.__test_dir_path}/result_{Path(test_file_name).stem}.xml"
+            )
+            try:
+                os.remove(xml_path)
+            except FileNotFoundError:
+                pass
+            run_cmd = [
+                exe_path,
+                f"--gtest_filter={test_filter}",
+                f"--gtest_output=xml:{xml_path}",
+            ]
+            try:
+                result = subprocess.run(
+                    run_cmd,
+                    cwd=build,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    errors="backslashreplace",
+                    timeout=600,
+                )
+            except subprocess.TimeoutExpired as exc:
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                details = (
+                    f"Command: {' '.join(run_cmd)}\n"
+                    "Timed out after 600 seconds.\n\n"
+                    f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}\n"
+                )
+                write_text_file(log_path, details)
+                return False, details
+
+            details = (
+                f"Command: {' '.join(run_cmd)}\n"
+                f"Return code: {result.returncode}\n\n"
+                f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}\n"
+            )
+            write_text_file(log_path, details)
+            if result.returncode != 0:
+                return False, details
+            try:
+                tests_run = count_executed_tests(xml_path)
+            except (OSError, ET.ParseError) as exc:
+                return False, f"Invalid GoogleTest XML for {test_filter}: {exc}\n"
+            if tests_run != 1:
+                return (
+                    False,
+                    f"Expected one executed test for {test_filter}, got {tests_run}.\n",
+                )
+        return True, ""
+
+    def __try_unity_covtest_result(
+        self,
+        project: str,
+        build: str,
+        llm_cov_dir: str,
+        test_file_list: list[str],
+    ) -> bool:
+        fallback_log = Path(self.__test_dir_path, "unity_fallback.log")
+        try:
+            fallback_log.unlink(missing_ok=True)
+        except OSError:
+            pass
+        test_plan, includes, ineligible_reason = analyze_unity_test_files(
+            self.__test_dir_path, test_file_list
+        )
+        if ineligible_reason:
+            return False
+
+        unity_source = Path(self.__test_dir_path, UNITY_COVERAGE_SOURCE_NAME)
+        previous_coverage = self.__coverage
+        try:
+            unity_source, target_name = self.__prepare_unity_coverage_dir(
+                project, build, llm_cov_dir, test_plan, includes
+            )
+            build_cmd = ["cmake", "--build", build, "--target", target_name]
+            build_result = run_command(build_cmd)
+            if build_result.returncode != 0:
+                self.__write_unity_fallback(
+                    "build_failure",
+                    f"Command: {' '.join(build_cmd)}\n"
+                    f"{build_result.stdout}{build_result.stderr}",
+                )
+                return False
+
+            run_passed, run_details = self.__run_unity_target(
+                build, target_name, test_plan
+            )
+            if not run_passed:
+                self.__write_unity_fallback("run_failure", run_details)
+                return False
+
+            coverage_cmd = ["cmake", "--build", build, "--target", "coverage"]
+            coverage_result = run_command(coverage_cmd)
+            coverage_source = Path(build, "coverage_sonarqube.xml")
+            if coverage_result.returncode != 0 or not coverage_source.is_file():
+                self.__write_unity_fallback(
+                    "coverage_failure",
+                    f"Command: {' '.join(coverage_cmd)}\n"
+                    f"{coverage_result.stdout}{coverage_result.stderr}",
+                )
+                return False
+            try:
+                ET.parse(coverage_source)
+            except (OSError, ET.ParseError) as exc:
+                self.__write_unity_fallback("invalid_coverage_xml", str(exc))
+                return False
+
+            build_cov_dir = Path(build, "coverage")
+            if build_cov_dir.is_dir():
+                shutil.copytree(
+                    build_cov_dir,
+                    f"{self.__test_dir_path}/coverage",
+                    dirs_exist_ok=True,
+                )
+            result_source = Path(build, "test_result.xml")
+            if result_source.is_file():
+                shutil.copy(result_source, f"{self.__test_dir_path}/result.xml")
+            coverage_path = Path(self.__test_dir_path, "coverage.xml")
+            shutil.copy(coverage_source, coverage_path)
+
+            self.__coverage = CovResult()
+            self.__coverage.set_real()
+            try:
+                self.load_coverage(project, str(coverage_path))
+            except (OSError, ValueError, TypeError, KeyError):
+                self.__coverage = previous_coverage
+                self.__write_unity_fallback(
+                    "coverage_load_failure", "Failed to load coverage XML."
+                )
+                return False
+
+            for test_file_name, _ in test_plan:
+                record = self.__test_records[test_file_name]
+                record["coverage_build"] = "pass"
+                record["build_log"] = ""
+                record["run"] = "pass"
+                record["run_log"] = (
+                    f"{self.__test_dir_path}/"
+                    f"run_unity_{Path(test_file_name).stem}.log"
+                )
+                record["kept"] = True
+                record["failure_type"] = ""
+            self.__test_result = TestResult(len(test_plan), 0)
+            try:
+                fallback_log.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return True
+        except Exception as exc:
+            self.__coverage = previous_coverage
+            self.__write_unity_fallback(
+                f"{type(exc).__name__}", str(exc)
+            )
+            return False
+        finally:
+            try:
+                unity_source.unlink(missing_ok=True)
+            except OSError as exc:
+                self.__write_unity_fallback("cleanup_failure", str(exc))
 
     def __build_test_target(self, build: str, test_file_name: str, target: str) -> bool:
         target_build_cmd = ["cmake", "--build", build, "--target", target]
@@ -957,9 +1268,40 @@ class FunctionData:
             record["failure_type"] = "build_failure"
             return False
         record["coverage_build"] = "pass"
-        record["compile"] = "pass"
         record["build_log"] = ""
         return True
+
+    def __build_test_targets(
+        self, build: str, target_list: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Build all coverage targets together, then isolate failures if needed."""
+        if len(target_list) <= 1:
+            return [
+                (test_file_name, target_name)
+                for test_file_name, target_name in target_list
+                if self.__build_test_target(build, test_file_name, target_name)
+            ]
+
+        target_build_cmd = [
+            "cmake",
+            "--build",
+            build,
+            "--target",
+            *(target_name for _, target_name in target_list),
+        ]
+        res = run_command(target_build_cmd)
+        if res.returncode == 0:
+            for test_file_name, _ in target_list:
+                record = self.__test_records[test_file_name]
+                record["coverage_build"] = "pass"
+                record["build_log"] = ""
+            return list(target_list)
+
+        return [
+            (test_file_name, target_name)
+            for test_file_name, target_name in target_list
+            if self.__build_test_target(build, test_file_name, target_name)
+        ]
 
     def __run_test_target(self, build: str, test_file_name: str, target: str) -> bool:
         exe_path = f"{build}/llm_coverage/{target}"
@@ -1018,9 +1360,6 @@ class FunctionData:
                 record["run"] = "pass"
                 record["kept"] = True
                 record["failure_type"] = ""
-                record["workflow_status"] = "passed"
-                record["terminal_reason"] = ""
-                record["content_hash"] = self.__content_hash(record)
                 return True
             record["run"] = "fail"
             record["kept"] = False
@@ -1047,6 +1386,38 @@ class FunctionData:
         build: str,
         llm_cov_dir: str,
         kept_only: bool = False,
+    ) -> bool:
+        if not kept_only:
+            self.__gen_covtest_result(
+                project,
+                build,
+                llm_cov_dir,
+                self.__coverage_test_files(False),
+                False,
+            )
+            return False
+        inputs, test_file_list = self.__coverage_checkpoint_inputs()
+        if self.__restore_coverage_checkpoint(project, inputs, test_file_list):
+            return True
+        coverage_path = f"{self.__test_dir_path}/coverage.xml"
+        previous_coverage_stamp = self.__file_stamp(coverage_path)
+        self.__gen_covtest_result(
+            project, build, llm_cov_dir, test_file_list, True
+        )
+        self.__write_coverage_checkpoint(
+            inputs,
+            test_file_list,
+            previous_coverage_stamp,
+        )
+        return False
+
+    def __gen_covtest_result(
+        self,
+        project: str,
+        build: str,
+        llm_cov_dir: str,
+        test_file_list: list[str],
+        kept_only: bool,
     ) -> None:
         # print(f"  Generating coverage and test result for {self.__sig} ...")
         if not self.__has_include():
@@ -1056,31 +1427,28 @@ class FunctionData:
             os.remove(f"{self.__test_dir_path}/coverage_failed.log")
         if os.path.exists(f"{self.__test_dir_path}/build_test_err.log"):
             os.remove(f"{self.__test_dir_path}/build_test_err.log")
-        path = Path(self.__test_dir_path)
-        test_file_list = [
-            test_file.name
-            for test_file in path.iterdir()
-            if test_file.is_file()
-            and test_file.suffix == ".cpp"
-            and (
-                self.__test_records.get(test_file.name, {}).get("kept", False)
-                if kept_only
-                else test_file.name in self.__can_compile
-            )
-        ]
         if len(test_file_list) == 0:
             self.collect_line_branch(project, build, llm_cov_dir)
             self.__test_result = TestResult(0, 0)
+            return
+        if (
+            kept_only
+            and self.__coverage_unity
+            and self.__try_unity_covtest_result(
+                project, build, llm_cov_dir, test_file_list
+            )
+        ):
             return
         build_cov_dir = f"{build}/coverage"
         target_list = self.__prepare_coverage_dir(
             project, build, llm_cov_dir, test_file_list
         )
-        build_pass_targets = []
+        build_pass_targets = self.__build_test_targets(build, target_list)
+        build_pass_target_set = set(build_pass_targets)
         for test_file_name, target_name in target_list:
-            if self.__build_test_target(build, test_file_name, target_name):
-                build_pass_targets.append((test_file_name, target_name))
-            elif kept_only:
+            if (test_file_name, target_name) in build_pass_target_set:
+                continue
+            if kept_only:
                 record = self.__test_records[test_file_name]
                 record["kept"] = False
                 record["workflow_status"] = "filtered"
@@ -1098,6 +1466,10 @@ class FunctionData:
         for test_file_name, target_name in build_pass_targets:
             if self.__run_test_target(build, test_file_name, target_name):
                 run_pass_files.append(test_file_name)
+                if not kept_only:
+                    record = self.__test_records[test_file_name]
+                    record["workflow_status"] = "passed"
+                    record["terminal_reason"] = ""
             else:
                 run_failed += 1
                 if kept_only:
@@ -1117,21 +1489,22 @@ class FunctionData:
             target_list = self.__prepare_coverage_dir(
                 project, build, llm_cov_dir, run_pass_files
             )
+            coverage_build_targets = self.__build_test_targets(build, target_list)
+            coverage_build_target_set = set(coverage_build_targets)
             for test_file_name, target_name in target_list:
-                if not self.__build_test_target(build, test_file_name, target_name):
-                    self.__test_records[test_file_name]["kept"] = False
-                    if kept_only:
-                        record = self.__test_records[test_file_name]
-                        record["workflow_status"] = "filtered"
-                        record["terminal_reason"] = "final_coverage_build_failure"
-                    else:
-                        record = self.__test_records[test_file_name]
-                        record["workflow_status"] = "interrupted"
-                        record["terminal_reason"] = "coverage_build_failure"
+                if (test_file_name, target_name) in coverage_build_target_set:
+                    continue
+                self.__test_records[test_file_name]["kept"] = False
+                if kept_only:
+                    record = self.__test_records[test_file_name]
+                    record["workflow_status"] = "filtered"
+                    record["terminal_reason"] = "final_coverage_build_failure"
+                else:
+                    record = self.__test_records[test_file_name]
+                    record["workflow_status"] = "interrupted"
+                    record["terminal_reason"] = "coverage_build_failure"
             run_pass_files = [
-                test_file_name
-                for test_file_name in run_pass_files
-                if self.__test_records[test_file_name]["coverage_build"] == "pass"
+                test_file_name for test_file_name, _ in coverage_build_targets
             ]
             if len(run_pass_files) == 0:
                 self.collect_line_branch(project, build, llm_cov_dir)
@@ -1144,9 +1517,12 @@ class FunctionData:
             shutil.copy(f"{build}/test_result.xml", result_xml_file)
         # load coverage result
         if result.returncode == 0:
-            shutil.copytree(
-                build_cov_dir, f"{self.__test_dir_path}/coverage", dirs_exist_ok=True
-            )
+            if os.path.isdir(build_cov_dir):
+                shutil.copytree(
+                    build_cov_dir,
+                    f"{self.__test_dir_path}/coverage",
+                    dirs_exist_ok=True,
+                )
             cov_xml_file = f"{self.__test_dir_path}/coverage.xml"
             if os.path.exists(f"{build}/coverage_sonarqube.xml"):
                 shutil.copy(f"{build}/coverage_sonarqube.xml", cov_xml_file)
@@ -1190,10 +1566,6 @@ class FileData:
         for func_data in self.__data:
             func_data.load_manifest_records(records_by_path)
 
-    def validate_formats(self, project: str, test_type: str) -> None:
-        for func_data in self.__data:
-            func_data.validate_formats(project, test_type, self.__name)
-
     def gen_manifest_records(self, test_root: str) -> list[dict[str, Any]]:
         records = []
         for func_data in self.__data:
@@ -1221,10 +1593,16 @@ class FileData:
         build: str,
         llm_cov_dir: str,
         kept_only: bool = False,
-    ) -> None:
+    ) -> int:
         # print(f"Generating coverage result for {self.__name}")
+        restored = 0
         for func_data in self.__data:
-            func_data.gen_covtest_result(project, build, llm_cov_dir, kept_only)
+            restored += int(
+                func_data.gen_covtest_result(
+                    project, build, llm_cov_dir, kept_only
+                )
+            )
+        return restored
 
     def export_filtered_tests(self, project: str, export_root: str) -> bool:
         export_file_dir = f"{export_root}/{self.__name}"
@@ -1242,12 +1620,20 @@ class FileData:
 
 
 class Expt:
-    def __init__(self, expt_type: str, project: str):
+    def __init__(
+        self,
+        expt_type: str,
+        project: str,
+        coverage_sonarqube_only: bool = False,
+        coverage_unity: bool = False,
+    ):
         self.__type = expt_type
         self.__test_dir_path = f"{project}/llm_tests{expt_type}"
         # self.__llm_compile_dir = f"{project}/llm_compile"
         self.__llm_cov_dir = f"{project}/llm_coverage"
         self.__project = project
+        self.__coverage_sonarqube_only = coverage_sonarqube_only
+        self.__coverage_unity = coverage_unity
         self.__compile_result: CompileResult | None = None
         self.__data: list[FileData] = []
         self.__compile_cmds: dict[str, dict[str, list[str]]] = {}
@@ -1276,10 +1662,6 @@ class Expt:
                 records_by_path[record["test_path"]] = record
         for file_data in self.__data:
             file_data.load_manifest_records(records_by_path)
-
-    def validate_formats(self) -> None:
-        for file_data in self.__data:
-            file_data.validate_formats(self.__project, self.__type)
 
     def gen_manifest_data(self) -> dict[str, Any]:
         tests = []
@@ -1346,7 +1728,14 @@ class Expt:
                 if os.path.exists(notest_path):
                     continue
                 # count lines of code in test files
-                test_file_list = [file for file in fmt_sig_dir.iterdir() if file.is_file() and file.suffix == ".cpp" and not file.name == "origin.cpp"]
+                test_file_list = [
+                    file
+                    for file in fmt_sig_dir.iterdir()
+                    if file.is_file()
+                    and file.suffix == ".cpp"
+                    and file.name
+                    not in {"origin.cpp", UNITY_COVERAGE_SOURCE_NAME}
+                ]
                 file_line_map = {}
                 for test_file in test_file_list:
                     lines_of_code = count_code_lines(str(test_file))
@@ -1359,6 +1748,8 @@ class Expt:
                     file_data.get_test_dir(),
                     expt_func_data.loc,
                     file_line_map,
+                    coverage_sonarqube_only=self.__coverage_sonarqube_only,
+                    coverage_unity=self.__coverage_unity,
                 )
                 file_data.add_function_data(func_data)
             self.add_file_data(file_data)
@@ -1382,7 +1773,6 @@ class Expt:
         return cmds
 
     def gen_compile_result(self, build: str) -> None:
-        self.validate_formats()
         success = 0
         failed = 0
         self.__compile_cmds = self.get_compile_cmds(build)
@@ -1400,7 +1790,6 @@ class Expt:
         return func_data.get_compile_result_concurrent(compile_cmds)
 
     def gen_compile_result_concurrent(self, build: str) -> None:
-        self.validate_formats()
         success = 0
         failed = 0
         self.__compile_cmds = self.get_compile_cmds(build)
@@ -1425,13 +1814,15 @@ class Expt:
     def gen_covtest_result(
         self, project: str, build: str, kept_only: bool = False
     ) -> None:
-        self.validate_formats()
         cmake_config(project, build)
         print(f"Generating coverage and test result for llm_tests{self.__type} ...")
+        restored = 0
         for file_data in self.__data:
-            file_data.gen_covtest_result(
+            restored += file_data.gen_covtest_result(
                 project, build, self.__llm_cov_dir, kept_only
             )
+        if restored:
+            print(f"Resumed coverage for {restored} function(s) from checkpoints.")
 
     def export_filtered_tests(self) -> None:
         export_root = f"{self.__project}/filtered_tests{self.__type}"

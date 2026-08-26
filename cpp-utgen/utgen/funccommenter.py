@@ -7,12 +7,18 @@ try:
 except ImportError:
     from config import LIBCLANG_PATH
 
-if LIBCLANG_PATH:
-    clang.cindex.Config.set_library_file(LIBCLANG_PATH)
+clang.cindex.Config.set_library_file(LIBCLANG_PATH)
 
 
 def find_function(node, name: str):
-    if node.kind == clang.cindex.CursorKind.FUNCTION_DECL and node.spelling == name:  # type: ignore
+    try:
+        node_kind = node.kind
+    except ValueError:
+        # Newer libclang versions can expose cursor kinds that the installed
+        # Python bindings do not know yet. The cursor can still have children,
+        # so skip only the kind comparison and keep traversing its subtree.
+        node_kind = None
+    if node_kind == clang.cindex.CursorKind.FUNCTION_DECL and node.spelling == name:  # type: ignore
         return node
     for child in node.get_children():
         result = find_function(child, name)

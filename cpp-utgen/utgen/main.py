@@ -3,7 +3,7 @@ from pathlib import Path
 
 from utgen import Project
 from case_workflow import CaseWorkflow
-from utils import UtgenArgs
+from utils import TEST_TYPE_SUFFIXES, UtgenArgs, resolve_test_types
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -19,6 +19,18 @@ parser.add_argument(
     help="the directory of compile command database",
     required=True,
     dest="build",
+)
+parser.add_argument(
+    "-t",
+    "--test-type",
+    action="append",
+    choices=tuple(TEST_TYPE_SUFFIXES),
+    dest="test_types",
+    metavar="TYPE",
+    help=(
+        "test type: base, cxt, req, or req-cxt; repeat to select multiple; "
+        "default: all"
+    ),
 )
 parser.add_argument(
     "--no-analysis",
@@ -78,6 +90,21 @@ parser.add_argument(
     dest="test_timeout",
 )
 parser.add_argument(
+    "--coverage-sonarqube-only",
+    help="generate SonarQube XML coverage without per-function lcov HTML reports",
+    action="store_true",
+    dest="coverage_sonarqube_only",
+)
+parser.add_argument(
+    "--coverage-unity",
+    help=(
+        "combine eligible final-coverage tests per function, with automatic "
+        "fallback to per-file targets"
+    ),
+    action="store_true",
+    dest="coverage_unity",
+)
+parser.add_argument(
     "-s", "--source", help="the path of the source file", required=False, dest="source"
 )
 parser.add_argument(
@@ -123,11 +150,12 @@ if __name__ == "__main__":
         raw_args.max_repair_rounds,
         raw_args.repair_choices,
         raw_args.test_timeout,
+        raw_args.coverage_sonarqube_only,
+        raw_args.coverage_unity,
     )
     project_name = Path(project_path).name
     project = Project(project_name, project_path, build)
-    test_types = ["", "_cxt", "_req", "_req_cxt"]
-    # test_types = ["_req_cxt"]
+    test_types = resolve_test_types(raw_args.test_types)
     if utgen_args.post_analysis:
         project.prepare(test_types, just_load=True)
         project.init_data()
@@ -164,6 +192,8 @@ if __name__ == "__main__":
             do_compile=utgen_args.compile_only,
             do_test=utgen_args.test_only,
             do_export=utgen_args.export_only,
+            coverage_sonarqube_only=utgen_args.coverage_sonarqube_only,
+            coverage_unity=utgen_args.coverage_unity,
         )
     elif not utgen_args.post_analysis and not utgen_args.batch_workflow:
         project.post_analysis(
@@ -172,6 +202,12 @@ if __name__ == "__main__":
             do_test=True,
             do_export=True,
             kept_only=True,
+            coverage_sonarqube_only=utgen_args.coverage_sonarqube_only,
+            coverage_unity=utgen_args.coverage_unity,
         )
     else:
-        project.post_analysis(test_types)
+        project.post_analysis(
+            test_types,
+            coverage_sonarqube_only=utgen_args.coverage_sonarqube_only,
+            coverage_unity=utgen_args.coverage_unity,
+        )
